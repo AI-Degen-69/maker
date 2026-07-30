@@ -1,0 +1,12 @@
+.venv/
+**/__pycache__/
+*.pyc
+.env
+.env.*
+maker.db
+maker.db-*
+logs/
+archive/
+*.pid
+.git/
+research/

@@ -1,0 +1,145 @@
+"""Capital allocation by marginal return.
+
+`quote_shares` was a flat 120 on every market, so every market got the same
+~$115 whether it returned 27.58%/day or 0.28%/day -- a 98x spread, measured
+live on 2026-07-29.
+
+Why the spread is that wide is worth stating plainly, because it is the
+opposite of the intuition: income is `pot x share`, and share is
+`ours / (ours + theirs)`. Pot size barely matters; competition does. Big pots
+are big precisely because the venue is paying up for liquidity nobody wants to
+provide cheaply, so makers crowd in. Measured, the $100 and $74 pots sat near
+the BOTTOM of the return table while a $50 pot paid 27x better on identical
+capital.
+
+Nothing here does I/O. It is a pure function of measured state, so it can be
+tested against the real numbers the fleet reported.
+"""
+from __future__ import annotations
+
+
+def competitor_depth(capital: float, share: float) -> float:
+    """Invert `share = C/(C+T)` to recover T -- everyone else's resting depth,
+    expressed in the same units as our own committed capital.
+
+    A zero share means the competition is effectively unbounded (we scored
+    nothing against them), so this returns infinity and the caller's marginal
+    return collapses to zero. That is the correct reading, not an error.
+    """
+    if share <= 0.0:
+        return float("inf")
+    if share >= 1.0:
+        return 0.0
+    return capital * (1.0 - share) / share
+
+
+def income(capital: float, daily: float, T: float) -> float:
+    """Rent per day at this commitment. Asymptotes to `daily` -- a market can
+    never pay more than its pot, however much we push in."""
+    if capital <= 0:
+        return 0.0
+    return daily * capital / (capital + T)
+
+
+def marginal(capital: float, daily: float, T: float) -> float:
+    """d(income)/d(capital): what the next dollar earns per day.
+
+    This is the whole reason the allocator does not simply empty the budget
+    into the best market -- our own size dilutes our share, so the return on
+    each extra dollar falls as we commit more.
+
+    T == 0 means we are the entire book and take the whole pot at any size.
+    The derivative is then a step, not a curve: the first dollar is worth the
+    whole `daily`, every dollar after it is worth nothing. Evaluating the
+    formula naively at capital == 0 gives 0/0 -- which crashed the live fleet
+    at 13:40 on 2026-07-29, killing the bot mid-sweep and costing 3.5 hours of
+    collection. Both branches are now answered explicitly.
+    """
+    if T <= 0:
+        return daily if capital <= 0 else 0.0
+    return daily * T / ((capital + T) ** 2)
+
+
+def shares_for(dollars: float, min_size: int) -> int:
+    """Turn an allocation in dollars into a per-side quote size.
+
+    A pair costs about $1 by construction -- one UP at p plus one DOWN at
+    roughly (1-p) -- so N dollars of committed capital buys about N shares on
+    each side. No division by price is needed, and doing one would be wrong.
+
+    Returns 0 below the market's minimum: quoting under min_size scores
+    exactly zero at the venue, so a sub-minimum allocation is strictly worse
+    than not quoting at all -- it ties up capital and earns nothing.
+    """
+    n = int(dollars)
+    return n if n >= min_size else 0
+
+
+def allocate(markets: list[dict], budget: float, floor: float,
+             step: float = 5.0) -> dict[str, float]:
+    """Water-fill: hand each increment to whichever market currently has the
+    highest marginal return, until the budget is exhausted or no market clears
+    the floor.
+
+    Leftover budget is deliberately NOT forced out. Capital earning under the
+    floor is worse than idle capital, which at least stays available for
+    something better -- and every extra market carries its own fill risk.
+
+    `markets` items need `cid`, `daily`, `capital`, `share`; `capital` and
+    `share` are the CURRENT observation, used only to infer the competition.
+    Returns dollars per market.
+    """
+    T = {m["cid"]: competitor_depth(m["capital"], m["share"]) for m in markets}
+    daily = {m["cid"]: m["daily"] for m in markets}
+    out = {m["cid"]: 0.0 for m in markets}
+
+    spent = 0.0
+    while spent < budget:
+        best, best_marginal = None, floor
+        for cid in out:
+            mg = marginal(out[cid], daily[cid], T[cid])
+            if mg > best_marginal:
+                best, best_marginal = cid, mg
+        if best is None:
+            break          # nothing left worth funding
+        out[best] += step
+        spent += step
+    return out
+
+
+def capital_scarcity(markets: list[dict], allocation: dict[str, float],
+                     budget: float, floor: float,
+                     multiple: float = 2.0) -> bool:
+    """Is the budget the binding constraint on a market still worth funding?
+
+    Two distinct reasons `allocate` stops, and only one of them is scarcity:
+
+      * Nothing cleared the floor. The budget is intact and idle by choice --
+        there is nowhere good to put it. Not scarce.
+      * The budget ran out while a market was still returning well above the
+        floor. That market is underfunded, and the next dollar it does not get
+        is a real loss. Scarce.
+
+    `multiple` is what separates "above the floor" from "well above it". At 1.0
+    every fully spent budget would read as scarce, since the water-fill only
+    exhausts the budget while something is still over the floor -- the relaxed
+    profit-take threshold would become the normal case rather than the
+    exception it is meant to be.
+
+    Measured on the same numbers that motivated this module: returns spanning
+    27.58%/day to 0.28%/day across markets means a dollar sitting in a stagnant
+    pair is not neutral, it is the 27%/day market going unfunded.
+
+    Pure, like everything else here -- the caller decides what to do about it.
+    """
+    if budget <= 0 or not markets:
+        return False
+    if sum(allocation.values()) < budget - 1e-9:
+        return False        # budget survived: the floor stopped us, not scarcity
+
+    threshold = floor * multiple
+    for m in markets:
+        T = competitor_depth(m["capital"], m["share"])
+        if marginal(allocation.get(m["cid"], 0.0), m["daily"], T) >= threshold:
+            return True
+    return False

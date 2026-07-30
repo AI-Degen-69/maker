@@ -1,0 +1,27 @@
+# secrets
+.env
+.env.*
+!.env.example
+
+# runtime
+maker.db
+maker.db-*
+# live fleet state: a 2MB binary that churns every sweep, plus the state
+# snapshot the dashboard reads. Both are run output, not source.
+# run/markets.json (fleet input) and run/live_test_*.json (pre-registered
+# predictions) are deliberately NOT ignored -- they are source of truth.
+run/*.db
+run/*.db-*
+run/fleet_state.json
+# recorded market data + backfilled tape (scripts/record_books.py,
+# scripts/fetch_trades.py). Regenerable, and large after a long run.
+books.db
+books.db-*
+*.pid
+logs/
+archive/
+
+# python
+.venv/
+__pycache__/
+*.pyc

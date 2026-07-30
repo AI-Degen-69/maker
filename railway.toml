@@ -1,0 +1,12 @@
+# Railway config for the maker sim.
+# REGION: set the service region to a NON-US one (europe-west). Binance
+# returns 451 to US IPs and preflight will refuse to start there.
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/api/health"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

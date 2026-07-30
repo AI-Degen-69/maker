@@ -1,0 +1,5 @@
+requests>=2.31
+websocket-client>=1.7
+python-dotenv>=1.0
+fastapi>=0.110
+uvicorn[standard]>=0.27

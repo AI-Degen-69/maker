@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Refuse a commit that changes strategy or server code without also updating
+# research/. Research that is only written when someone remembers gets written
+# rarely -- this makes the rule agent-agnostic and survives across sessions.
+#
+# Escape hatch:  git commit --no-verify   (typos, formatting, non-substantive)
+set -e
+
+staged=$(git diff --cached --name-only)
+code=$(echo "$staged" | grep -E '^(strategy|server)/' || true)
+research=$(echo "$staged" | grep -E '^research/' || true)
+
+if [ -n "$code" ] && [ -z "$research" ]; then
+  cat >&2 <<'MSG'
+
+  COMMIT BLOCKED -- code changed but research/ did not.
+
+  This repo keeps a running lab notebook. Add an entry describing what you
+  changed and what you learned, in BOTH languages:
+
+      research/RESEARCH_LOG.md         Question -> Method -> Result -> Verdict
+      research/RESEARCH_SUMMARY.md     one dated bullet
+      research/he_RESEARCH_LOG.md      Hebrew mirror
+      research/he_RESEARCH_SUMMARY.md  Hebrew mirror
+
+  Verdict vocabulary: DEAD / PARKED / LIVE / OPEN
+
+  Non-substantive change (typo, formatting)?  git commit --no-verify
+
+MSG
+  exit 1
+fi
+exit 0

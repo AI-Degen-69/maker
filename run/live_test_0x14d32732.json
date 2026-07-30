@@ -1,0 +1,35 @@
+{
+  "ts": 1785335698.8393717,
+  "utc": "2026-07-29T14:34:58.839371+00:00",
+  "slug": "will-avengers-doomsday-have-the-best-domestic-opening-weekend-in-2026",
+  "condition_id": "0x14d327328063504ab74b2ab11fe68ad305525fafc70effcd5ba5c5c688971988",
+  "title": "Will Avengers: Doomsday have the best domestic opening weekend in 2026?",
+  "order": {
+    "price_up": 0.55,
+    "price_down": 0.41,
+    "size_each_side": 20.0,
+    "capital_committed": 19.2,
+    "pair_cost": 0.96
+  },
+  "book_at_prediction": {
+    "up_bid": 0.56,
+    "up_ask": 0.58,
+    "dn_bid": 0.42,
+    "dn_ask": 0.44,
+    "mid_up": 0.5700000000000001,
+    "mid_down": 0.43
+  },
+  "model": {
+    "daily_pot_usd": 50,
+    "their_score": 347.826419753086,
+    "our_score": 6.1728395061728305,
+    "our_share": 0.017437436222577013,
+    "predicted_usd_per_day": 0.8718718111288506
+  },
+  "payout_expected_at": "00:00 UTC, once, in USDC",
+  "assumptions_that_will_probably_break": [
+    "Competing score stays as observed. It will not -- other makers react to new size, and our share is the figure most likely to shrink on contact.",
+    "The order rests inside the reward band the whole time. Any minute outside it earns zero for that minute.",
+    "Rent is sampled per minute, so a partial day earns pro rata; pass --hours when reconciling or the comparison is unfair."
+  ]
+}
