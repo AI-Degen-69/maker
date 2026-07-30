@@ -197,15 +197,32 @@ CREATE TABLE IF NOT EXISTS markouts (
 );
 CREATE INDEX IF NOT EXISTS idx_mk_done ON markouts(done, ts);
 
--- One row per profit-taking close. Kept separate from `fills` because a close
--- is the only row in this database that books REALIZED money -- everything
--- else is an estimate or an open position. Blending the two is how a
--- projection turns into a reported profit.
+-- One row per early exit. Kept separate from `fills` because these are the
+-- only rows in this database that book REALIZED money -- everything else is an
+-- estimate or an open position. Blending the two is how a projection turns
+-- into a reported profit.
+--
+-- U2 (KTD2c): one table, discriminated by `method`, rather than a second
+-- `merges` table. A merge and a sell are the same event -- capital released
+-- early -- differing only in mechanism, price and cost. Two tables carrying
+-- near-identical columns drift the moment one gains a field the other does
+-- not, and every P&L query then has to remember to union them.
+--
+-- Columns that apply to one method only are nullable rather than zero:
+--   sell  -> up_price / dn_price (achieved averages), fee (two taker fees)
+--   merge -> gas (one transaction, whatever the size); price is always
+--            parity, so there is no achieved average to record.
 CREATE TABLE IF NOT EXISTS closes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
     condition_id TEXT,
     market_slug TEXT,
+    -- 'sell' (crossed the book, strategy/profit_take.py) or 'merge'
+    -- (redeemed a complete set at parity, strategy/merge.py). Defaults to
+    -- 'sell' so rows written before U2 keep their true meaning without a
+    -- backfill.
+    method TEXT DEFAULT 'sell',
+    gas REAL,                  -- merge only; NULL for a sell
     shares REAL,               -- pairs closed
     -- Size-weighted AVERAGE price actually achieved selling this leg, not the
     -- top-of-book tick: a close can walk past the best bid into worse levels,
@@ -258,7 +275,10 @@ CREATE TABLE IF NOT EXISTS market_gate (
 _MIGRATIONS = {
     "fills": {"crossed": "INTEGER DEFAULT 0", "reason": "TEXT DEFAULT 'queue'"},
     "closes": {"up_cost_removed": "REAL", "dn_cost_removed": "REAL",
-               "forgone_vs_settlement": "REAL"},
+               "forgone_vs_settlement": "REAL",
+               # U2. Existing rows predate merge, so 'sell' is the correct
+               # value for every one of them -- the default backfills itself.
+               "method": "TEXT DEFAULT 'sell'", "gas": "REAL"},
 }
 
 
@@ -385,16 +405,25 @@ def log_markout_open(**kw) -> int:
 
 
 def log_close(**kw) -> None:
-    """A profit-taking close. Realized money -- never blended into estimates."""
+    """An early exit. Realized money -- never blended into estimates.
+
+    `method` discriminates a sell from a merge (KTD2c). It defaults to 'sell'
+    so existing callers, and every row written before U2, keep their meaning
+    unchanged. A merge passes method='merge' and `gas`, and leaves up_price /
+    dn_price / fee unset: there is no achieved average price when the payout is
+    parity, and no taker fee when nothing crossed a book.
+    """
     with db() as c:
         c.execute(
-            "INSERT INTO closes (ts, condition_id, market_slug, shares, "
-            "up_price, dn_price, cost_basis, proceeds, fee, realized_pnl, "
-            "forgone_vs_settlement, up_cost_removed, dn_cost_removed) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (time.time(), kw["condition_id"], kw["market_slug"], kw["shares"],
-             kw["up_price"], kw["dn_price"], kw["cost_basis"], kw["proceeds"],
-             kw["fee"], kw["realized_pnl"], kw.get("forgone_vs_settlement"),
+            "INSERT INTO closes (ts, condition_id, market_slug, method, gas, "
+            "shares, up_price, dn_price, cost_basis, proceeds, fee, "
+            "realized_pnl, forgone_vs_settlement, up_cost_removed, "
+            "dn_cost_removed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (time.time(), kw["condition_id"], kw["market_slug"],
+             kw.get("method") or "sell", kw.get("gas"), kw["shares"],
+             kw.get("up_price"), kw.get("dn_price"), kw["cost_basis"],
+             kw["proceeds"], kw.get("fee"), kw["realized_pnl"],
+             kw.get("forgone_vs_settlement"),
              kw["up_cost_removed"], kw["dn_cost_removed"]))
 
 

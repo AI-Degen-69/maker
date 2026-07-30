@@ -24,7 +24,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from strategy import gate, markout, profit_take, rewards, store
+from strategy import gate, markout, merge, profit_take, rewards, store
 from strategy.allocate import allocate, capital_scarcity, shares_for
 from strategy.config import load as load_cfg
 from strategy.fills import QueueFillEngine
@@ -152,6 +152,10 @@ class MarketState:
         self.inv = _inventory_from_db(self.cid)
         self.seen_trades: set = set()
         self.tape_primed = False
+        # Pairs merged back to collateral this process. Session-scoped on
+        # purpose: it feeds the pairing rate against fills observed in the same
+        # window, and the durable record is the `closes` table.
+        self.merged_shares = 0.0
         self.err = ""
         # Rehydrate an EXITED verdict, and only an EXITED verdict.
         #
@@ -380,6 +384,49 @@ def visit(st: MarketState, bot_cfg, now: float,
     cfg = replace(cfg, gate_state=st.gate,
                   fleet_naked_usd=fleet_naked_usd)
 
+    # MERGE FIRST, then consider selling. A matched pair redeems for exactly
+    # 1.00 through the collateral adapter with no spread and no taker fee, so
+    # whenever both exits are available merge strictly dominates: selling the
+    # same pair pays 3.4c of fees into a bid sum bounded by 1.00. Running the
+    # sell path first would occasionally book a worse exit for no reason.
+    #
+    # Simulation only in Phase A -- the on-chain executor is U6, and fleet.py
+    # deliberately does not import it. What this records is what a merge WOULD
+    # realize, on the same terms the real one will.
+    try:
+        mg = merge.should_merge(st.inv, cfg, gas_cost=cfg.merge_gas_usd)
+        if mg["take"]:
+            n = mg["shares"]
+            up_removed, dn_removed = mg["up_cost_removed"], mg["dn_cost_removed"]
+
+            # Ledger first, memory second -- same ordering discipline as the
+            # sell path below, and for the same reason: _inventory_from_db
+            # rebuilds from this table on restart, so a merge must never exist
+            # in memory without also existing on disk.
+            store.log_close(
+                condition_id=m.condition_id, market_slug=m.market_slug,
+                method="merge", gas=mg["gas"], shares=n,
+                cost_basis=mg["cost_basis"], proceeds=mg["proceeds"],
+                realized_pnl=mg["realized_pnl"],
+                # Merging forgoes nothing: parity IS the settlement value, so
+                # there is no concession against holding, only the gas.
+                forgone_vs_settlement=0.0,
+                up_cost_removed=up_removed, dn_cost_removed=dn_removed)
+
+            # Cost before shares: avg() divides by the share count, so
+            # decrementing shares first would rewrite the basis of the residue.
+            st.inv.up_cost -= up_removed
+            st.inv.down_cost -= dn_removed
+            st.inv.up_shares -= n
+            st.inv.down_shares -= n
+            st.merged_shares += n
+            log.info("MERGE %-28s %.0f pairs realized $%+.2f | %s",
+                     st.title[:28], n, mg["realized_pnl"], mg["why"])
+    except Exception as e:
+        log.warning("merge failed on %s: %s: %s",
+                    st.title[:30], type(e).__name__, e)
+        mg = {"take": False, "why": f"error: {e}"}
+
     # Take profit on the paired portion, if the market has moved far enough to
     # cover selling both legs and still pay. Wrapped for the same reason
     # `reallocate` is: a bug in a money-making refinement must not stop the
@@ -554,6 +601,16 @@ def visit(st: MarketState, bot_cfg, now: float,
         "markout": st.markout.get("mean_per_share"),
         "markout_n": st.markout.get("n", 0),
         "close_why": pt.get("why", ""),
+        # Merge, reported separately from the sell path. Recycled capital is
+        # the number that distinguishes this strategy from a carry trade: it
+        # is money that went back to work rather than sitting until 2027.
+        "merge_why": mg.get("why", ""),
+        "merged_shares": st.merged_shares,
+        "recycled_usd": st.merged_shares * merge.PARITY,
+        # Merged pairs against shares filled -- the assumption merge economics
+        # rest on. None until something fills; no observation is not a zero.
+        "pairing_rate": merge.pairing_rate(
+            st.merged_shares, st.engine.filled_shares(include_crossed=False)),
         "fills": st.inv.fills, "err": st.err, "ts": now,
         "up_bid": up_bid, "up_ask": up_ask,
         "dn_bid": dn_bid, "dn_ask": dn_ask,

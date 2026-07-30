@@ -132,6 +132,22 @@ class MakerConfig:
     # Selling means crossing the spread, so BOTH legs pay the taker fee. The
     # move therefore has to clear two fees before it clears anything else.
     profit_take_fee_per_share: float = 0.017
+
+    # MERGE (U2). Total cost of one mergePositions transaction, in dollars --
+    # per TRANSACTION, not per share, because a merge costs the same whether it
+    # redeems ten pairs or ten thousand. That is why the economic floor is on
+    # total gain rather than per-share gain.
+    #
+    # A seeded estimate, not a measurement. Polygon gas for a CTF merge is
+    # cents, and this is deliberately set high enough to be conservative in
+    # Phase A, where no transaction has been sent and nothing on-chain has been
+    # verified. U6's verify_merge.py replaces it with the real figure from an
+    # actual transaction, and U5 reads it to compute the minimum economic size.
+    #
+    # Never set this to 0. Zero-cost gas makes every merge look profitable,
+    # including ones that lose money -- `strategy/merge.py` treats None as
+    # blocking for the same reason.
+    merge_gas_usd: float = 0.05
     # Required profit per share AFTER both fees. Set at roughly one fee's
     # width again, so a close is only taken on a move clearly larger than the
     # cost of taking it -- at 1c the threshold sits inside the noise of a

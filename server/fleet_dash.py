@@ -310,6 +310,14 @@ def fleet():
             "closed_pnl": h.get("closed_pnl", 0.0),
             "closed_forgone": h.get("closed_forgone", 0.0),
             "close_why": live.get("close_why") or "",
+            # U2. Merge is the exit that actually fires -- the sell path's
+            # ceiling is -0.007/share against a +0.020 threshold, which is why
+            # `closes` sat at zero for 18.7 hours. Reported separately so a
+            # reader can see which mechanism released the capital.
+            "merge_why": live.get("merge_why") or "",
+            "merged_shares": live.get("merged_shares", 0.0),
+            "recycled_usd": live.get("recycled_usd", 0.0),
+            "pairing_rate": live.get("pairing_rate"),
         })
     rows.sort(key=lambda r: -r["income"])
 
@@ -318,6 +326,15 @@ def fleet():
     inc = sum(r["income"] for r in rows)
     total_collected_rent = sum(r["collected_rent"] for r in rows)
     rz = _realized()
+
+    merged_total = sum(r["merged_shares"] for r in rows)
+    try:
+        vr = store.verified_ratio()
+    except Exception:
+        # A dashboard that cannot read one metric must still render the rest.
+        vr = {"verified_fills": 0, "verified_shares": 0.0,
+              "unverified_fills": 0, "unverified_shares": 0.0,
+              "unverified_sweep_shares": 0.0, "ratio": None}
 
     locked = sum((r["paired"] or 0) * 1.0 - (r["pair_paid"] or 0) for r in rows)
     at_risk = sum(r["naked_cost"] or 0 for r in rows)
@@ -362,7 +379,25 @@ def fleet():
             "exited": len([r for r in rows if r["gate"] == "EXITED"]),
             "widened": len([r for r in rows if r["gate"] == "WIDENED"]),
             "capital": cap,
+            # NOTE: `cap` counts money resting in UNFILLED offers only, so this
+            # answers "what do my resting offers earn", not "what does my
+            # bankroll earn". Measured 2026-07-30: 1.80%/day on $1,369 of
+            # offers while $9,588 had actually left the wallet -- 0.256%/day
+            # against the real denominator. U3 bounds that total; until it
+            # does, read this ratio for what it is.
             "return_pct_day": (100 * inc / cap) if cap else 0.0,
+            # U2. Capital that went back to work instead of sitting until 2027.
+            "merged_shares": merged_total,
+            "recycled_usd": sum(r["recycled_usd"] for r in rows),
+            # Fleet-wide pairing rate: merged pairs over shares actually
+            # filled. Deliberately NOT over `fills`, which is a count of fill
+            # events -- dividing shares by events would produce a ratio with no
+            # meaning that still looks plausible. None until something fills.
+            "pairing_rate": ((merged_total / vr["verified_shares"])
+                             if vr["verified_shares"] > 1e-9 else None),
+            # U1. The Phase A decision-gate number, on the dashboard because a
+            # figure that lives only in the database is a figure nobody reads.
+            "verified": vr,
             "funded_total": sum(r["daily"] for r in rows),
             "fills": sum(r["fills"] for r in rows),
             "uptime": (sum(r["uptime"] for r in rows) / len(rows)) if rows else 0,
