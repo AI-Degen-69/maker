@@ -426,3 +426,13 @@ def test_one_fill_below_the_cap_still_quotes():
     inv = Inventory(fills=24)
     intents, _ = _rw_quote(_rw(max_fills_per_market=25), inv=inv)
     assert intents
+
+
+def test_a_zero_allocation_actually_stops_quoting():
+    """REGRESSION. reallocate has always documented that an unfunded market
+    'gets 0 and stops quoting', and it never did -- `max(quote_shares,
+    min_quote_shares)` promoted the 0 back to the venue minimum, so a
+    deliberately defunded market kept posting 50-share orders."""
+    intents, why = _rw_quote(_rw(quote_shares=0))
+    assert intents == []
+    assert "unfunded" in why

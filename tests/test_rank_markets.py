@@ -69,6 +69,21 @@ def test_the_floor_carries_headroom_above_the_bare_minimum():
     assert base.reward_min_payout_usd * base.reward_floor_multiple > 1.0
 
 
+def test_an_ineligible_market_is_sized_to_zero_not_left_at_startup_size():
+    """REGRESSION. Excluding a market from allocation is not the same as
+    defunding it: absent from `dollars` also describes a market we have not
+    measured yet, which correctly keeps its size. An ineligible one HAS been
+    measured and cannot pay, so it must be zeroed explicitly.
+
+    Caught by a smoke run, not by tests: 17 markets kept quoting 120 shares
+    while 4 were funded, so offers alone reached $2,108 against a $2,000
+    committed cap before a single share was bought."""
+    base = load_cfg()
+    poor = _state(cid="poor", income=0.25, base=base)
+    assert reallocate([poor], base)["poor"] == 0
+    assert poor.cfg.quote_shares == 0
+
+
 def test_an_unfunded_market_is_still_tracked_not_dropped():
     """Unfunded means stop quoting, never stop tending. Its inventory still
     needs merging, marking out and reconciling."""

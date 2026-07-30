@@ -128,6 +128,19 @@ def _decide_quotes_rewards(
     if inv.fills >= cfg.max_fills_per_market:
         return [], f"hit {cfg.max_fills_per_market} fills for this market"
 
+    # ZERO ALLOCATION MEANS QUOTE NOTHING. `reallocate` has always documented
+    # that an unfunded market "gets 0 and stops quoting", and it never did:
+    # `size = max(quote_shares, min_quote_shares)` below silently promoted a 0
+    # back to the venue minimum, so a market the allocator had deliberately
+    # defunded carried on posting 50-share orders.
+    #
+    # Harmless while every market was fundable. Not harmless once U4 defunds
+    # markets that cannot clear the payout floor -- measured on the first
+    # smoke run, 17 markets kept quoting while 4 were funded, putting $2,108
+    # of offers against a $2,000 committed cap before a share was bought.
+    if cfg.quote_shares <= 0:
+        return [], "unfunded by the allocator -- quoting nothing"
+
     out: list[QuoteIntent] = []
     blocked: list[str] = []
     for side, book in (("UP", up_book), ("DOWN", down_book)):

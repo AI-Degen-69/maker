@@ -162,25 +162,6 @@ class MarketState:
         # top-ranked market delivered $0.25/day against $18.96 projected.
         self.theirs_samples: list[tuple[float, float]] = []
         self.err = ""
-
-    def observe_theirs(self, ts: float, theirs: float, window_sec: float) -> None:
-        """Add one competitor-depth reading and drop anything past the window."""
-        self.theirs_samples.append((ts, theirs))
-        cutoff = ts - window_sec
-        self.theirs_samples = [(t, v) for t, v in self.theirs_samples
-                               if t >= cutoff]
-
-    def avg_theirs(self) -> float | None:
-        """Mean competing depth over the window, or None with no samples.
-
-        None rather than 0.0: no observation is not an empty book, and an
-        empty book is the single most attractive-looking input the allocator
-        can receive. Guessing it would concentrate capital into exactly the
-        markets we know least about.
-        """
-        if not self.theirs_samples:
-            return None
-        return sum(v for _, v in self.theirs_samples) / len(self.theirs_samples)
         # Rehydrate an EXITED verdict, and only an EXITED verdict.
         #
         # This used to start every market at NORMAL on the argument that a
@@ -200,6 +181,25 @@ class MarketState:
         self.gate = _gate_from_db(self.cid)
         self.markout: dict = {"verdict": "insufficient_sample",
                               "mean_per_share": None, "n": 0}
+
+    def observe_theirs(self, ts: float, theirs: float, window_sec: float) -> None:
+        """Add one competitor-depth reading and drop anything past the window."""
+        self.theirs_samples.append((ts, theirs))
+        cutoff = ts - window_sec
+        self.theirs_samples = [(t, v) for t, v in self.theirs_samples
+                               if t >= cutoff]
+
+    def avg_theirs(self) -> float | None:
+        """Mean competing depth over the window, or None with no samples.
+
+        None rather than 0.0: no observation is not an empty book, and an
+        empty book is the single most attractive-looking input the allocator
+        can receive. Guessing it would concentrate capital into exactly the
+        markets we know least about.
+        """
+        if not self.theirs_samples:
+            return None
+        return sum(v for _, v in self.theirs_samples) / len(self.theirs_samples)
 
 
 def load_specs() -> list[dict]:
@@ -267,6 +267,7 @@ def reallocate(states, base) -> dict:
     worse than capital sitting idle.
     """
     obs = []
+    ineligible: set[str] = set()
     floor = base.reward_min_payout_usd * base.reward_floor_multiple
     for s in states:
         live = s.spec.get("_live") or {}
@@ -284,6 +285,7 @@ def reallocate(states, base) -> dict:
         # is still merged, marked out and reconciled. Removing it here would
         # strand a real position with nothing tending it.
         if (live.get("income") or 0.0) < floor:
+            ineligible.add(s.cid)
             continue
 
         # Averaged competing depth, not the instantaneous reading. A single
@@ -298,11 +300,16 @@ def reallocate(states, base) -> dict:
 
         obs.append({"cid": s.cid, "daily": s.daily,
                     "capital": capital, "share": share})
-    if not obs:
+
+    # Defund the ineligible even when NOTHING is fundable. Returning early on
+    # an empty `obs` would skip the zeroing loop below, so a fleet where every
+    # market had fallen under the payout floor would keep quoting all of them
+    # -- the exact case the floor exists for.
+    if not obs and not ineligible:
         return {}
 
-    dollars = allocate(obs, base.allocation_budget,
-                       base.marginal_return_floor)
+    dollars = (allocate(obs, base.allocation_budget,
+                        base.marginal_return_floor) if obs else {})
 
     # Whether the BUDGET, rather than the floor, is what stopped the water-fill
     # while a market was still returning well above the floor. That is the only
@@ -320,6 +327,21 @@ def reallocate(states, base) -> dict:
         # allocator did not fund this sweep -- an unfunded market is precisely
         # one whose locked capital we most want released.
         s.cfg = replace(s.cfg, capital_scarce=scarce)
+
+        # Below the payout floor: quote NOTHING. Two different reasons a
+        # market is absent from `dollars` and they need opposite treatment.
+        # An unmeasured market keeps its current size (sizing it off a guess
+        # is worse than leaving it alone); an INELIGIBLE one has been measured
+        # and cannot pay, so leaving it at its startup size funds a market
+        # known to earn zero.
+        #
+        # Caught by the smoke run, not the tests: 17 markets kept quoting 120
+        # shares each while only 4 were funded, so offers alone reached $2,108
+        # against a $2,000 committed cap before a single share was bought.
+        if s.cid in ineligible:
+            out[s.cid] = 0
+            s.cfg = replace(s.cfg, quote_shares=0)
+            continue
         if s.cid not in dollars:
             continue
         n = shares_for(dollars[s.cid], int(s.spec["min_size"]))
