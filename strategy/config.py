@@ -148,6 +148,35 @@ class MakerConfig:
     # including ones that lose money -- `strategy/merge.py` treats None as
     # blocking for the same reason.
     merge_gas_usd: float = 0.05
+
+    # OVER-PARITY MERGES (U5, KTD2b). 4.5% of measured pairs cost more than
+    # 1.00, so merging them books an immediate loss. Holding is not obviously
+    # better: the pair pays exactly 1.00 either way, so the nominal comparison
+    # is a wash and the real question is what the freed capital earns in the
+    # meantime.
+    #
+    # The velocity test answers that -- merge when projected rent on the
+    # released capital over the remaining hold beats the concession plus gas.
+    # This is the hard bound around it. Checked BEFORE the velocity arithmetic
+    # runs, and never yielded to: without it, a large projected-rent figure
+    # would license an arbitrarily bad exit price, which is how a capital
+    # efficiency rule turns into an inventory fire sale.
+    #
+    # 1c/share. Roughly a third of what selling the same pair would pay in
+    # taker fees, so the exception stays cheaper than the alternative it
+    # replaces.
+    merge_max_loss_per_share: float = 0.01
+
+    # How long the freed capital is assumed to keep earning, in days, when
+    # pricing the velocity exception above. NOT the time to resolution --
+    # markets here settle in 2027, and crediting ~500 days of rent would make
+    # every over-parity pair mergeable regardless of price, which is precisely
+    # what merge_max_loss_per_share exists to stop.
+    #
+    # 30 days is deliberately short: long enough that freeing capital is worth
+    # something, short enough that the exception stays rare and the loss cap
+    # remains the binding constraint rather than a formality.
+    merge_velocity_hold_days: float = 30.0
     # Required profit per share AFTER both fees. Set at roughly one fee's
     # width again, so a close is only taken on a move clearly larger than the
     # cost of taking it -- at 1c the threshold sits inside the noise of a

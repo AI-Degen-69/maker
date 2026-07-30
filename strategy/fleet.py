@@ -418,7 +418,15 @@ def visit(st: MarketState, bot_cfg, now: float,
     # deliberately does not import it. What this records is what a merge WOULD
     # realize, on the same terms the real one will.
     try:
-        mg = merge.should_merge(st.inv, cfg, gas_cost=cfg.merge_gas_usd)
+        # Projected rent comes from this market's MEASURED income, not an
+        # assumed rate -- the velocity exception is only as honest as the
+        # number backing it. None when we have not scored here yet, which
+        # blocks the exception rather than assuming it favourable.
+        prev_live = st.spec.get("_live") or {}
+        mg = merge.should_merge(
+            st.inv, cfg, gas_cost=cfg.merge_gas_usd,
+            projected_rent_per_day=prev_live.get("income"),
+            hold_days=cfg.merge_velocity_hold_days)
         if mg["take"]:
             n = mg["shares"]
             up_removed, dn_removed = mg["up_cost_removed"], mg["dn_cost_removed"]

@@ -115,12 +115,76 @@ def test_negative_gas_is_rejected():
 # --- over-parity pairs (the U5 velocity exception refines this) --------------
 
 def test_a_pair_above_parity_does_not_merge_on_the_gas_rule_alone():
-    """4.5% of measured pairs cleared over 1.00. Under U2's rule they are held:
-    the gain is negative, so no gas figure can make the arithmetic work. U5
-    adds the bounded velocity exception that lets some of them through."""
+    """4.5% of measured pairs cleared over 1.00. Without a velocity case to
+    make, they are held -- the gain is negative, so no gas figure helps."""
     out = should_merge(_inv(up_px=0.51, dn_px=0.50), _cfg(), gas_cost=0.01)
     assert out["take"] is False
-    assert out["gain_per_share"] < 0
+    assert "over parity" in out["why"]
+
+
+def test_a_loss_exactly_at_the_cap_is_not_rejected_by_the_cap():
+    """Boundary. 1.01 is exactly 1c over parity against a 1c cap, so the cap
+    lets it through to the velocity test rather than rejecting it -- the cap
+    bounds how bad a price may be, and this one is not worse than allowed."""
+    at_cap = should_merge(_inv(up_px=0.51, dn_px=0.50), _cfg(), gas_cost=0.01,
+                          projected_rent_per_day=5.0, hold_days=30.0)
+    assert at_cap["take"] is True
+    assert at_cap["velocity_justified"] is True
+
+    just_over = should_merge(_inv(up_px=0.511, dn_px=0.50), _cfg(),
+                             gas_cost=0.01, projected_rent_per_day=5.0,
+                             hold_days=30.0)
+    assert just_over["take"] is False
+    assert "velocity not evaluated" in just_over["why"]
+
+
+def test_a_bounded_over_parity_merge_is_allowed_on_velocity(monkeypatch):
+    """Cost 1.005, so 0.5c/share over parity -- inside the 1c cap. Freeing
+    $100.50 to earn $2/day for 30 days beats a 50c concession, so the merge
+    proceeds and says why."""
+    out = should_merge(_inv(up_px=0.51, dn_px=0.495), _cfg(), gas_cost=0.01,
+                       projected_rent_per_day=2.0, hold_days=30.0)
+    assert out["take"] is True
+    assert out["velocity_justified"] is True
+    assert out["realized_pnl"] < 0            # a loss, taken deliberately
+    assert "velocity" in out["why"]
+
+
+def test_the_loss_cap_cannot_be_outvoted_by_a_huge_rent_projection():
+    """THE guard. Cost 1.05 is 5c/share over parity, far past the 1c cap, and
+    an absurd rent figure must not buy it. Order is load-bearing: the cap is
+    evaluated before the velocity arithmetic ever runs."""
+    out = should_merge(_inv(up_px=0.55, dn_px=0.50), _cfg(), gas_cost=0.01,
+                       projected_rent_per_day=1e9, hold_days=1e6)
+    assert out["take"] is False
+    assert "exceeds the" in out["why"]
+    assert "velocity not evaluated" in out["why"]
+
+
+def test_an_over_parity_pair_is_held_when_freed_capital_earns_too_little():
+    """Inside the cap, but the concession is not repaid: 0.5c x 100 shares
+    plus gas against 10c/day for 3 days."""
+    out = should_merge(_inv(up_px=0.51, dn_px=0.495), _cfg(), gas_cost=0.01,
+                       projected_rent_per_day=0.10, hold_days=3.0)
+    assert out["take"] is False
+    assert "under the" in out["why"]
+
+
+def test_unknown_rent_blocks_an_over_parity_merge():
+    """A missing figure is not a favourable one. Defaulting it would make
+    every over-parity pair mergeable on an assumption nobody measured."""
+    out = should_merge(_inv(up_px=0.51, dn_px=0.495), _cfg(), gas_cost=0.01,
+                       projected_rent_per_day=None, hold_days=30.0)
+    assert out["take"] is False
+    assert "unknown" in out["why"]
+
+
+def test_a_profitable_pair_needs_no_velocity_argument():
+    """The exception applies only below parity. A normal merge must not start
+    depending on a rent projection being available."""
+    out = should_merge(_inv(), _cfg(), gas_cost=0.02)
+    assert out["take"] is True
+    assert out["velocity_justified"] is False
 
 
 # --- purity ------------------------------------------------------------------

@@ -30,6 +30,7 @@ PARITY = 1.00
 
 NO: dict = {"take": False, "shares": 0.0, "cost_basis": 0.0, "proceeds": 0.0,
             "gas": 0.0, "realized_pnl": 0.0, "gain_per_share": 0.0,
+            "velocity_justified": False,
             "up_cost_removed": 0.0, "dn_cost_removed": 0.0, "why": ""}
 
 
@@ -37,7 +38,9 @@ def _no(why: str) -> dict:
     return dict(NO, why=why)
 
 
-def should_merge(inv, cfg, gas_cost: float | None = None) -> dict:
+def should_merge(inv, cfg, gas_cost: float | None = None,
+                 projected_rent_per_day: float | None = None,
+                 hold_days: float | None = None) -> dict:
     """Should the paired portion of this position be merged into collateral?
 
     Only `min(up_shares, down_shares)` is considered. The naked residue is left
@@ -80,8 +83,51 @@ def should_merge(inv, cfg, gas_cost: float | None = None) -> dict:
     proceeds = paired * PARITY
     realized_pnl = proceeds - cost_basis - gas_cost
 
+    # OVER-PARITY EXCEPTION (KTD2b). A pair costing more than 1.00 loses money
+    # on the merge, and holding it returns exactly the same 1.00 later -- so
+    # the nominal comparison is a wash and the only real question is what the
+    # freed capital earns in between.
+    #
+    # ORDER IS LOAD-BEARING: cap, then velocity, then gas. The cap is checked
+    # first and is never yielded to, so no projected-rent figure however large
+    # can license an arbitrarily bad exit price. Reversing these two would turn
+    # a capital-efficiency rule into an inventory fire sale, which is exactly
+    # the failure the bound exists to prevent.
+    velocity_justified = False
+    if gain_per_share < 0:
+        loss_per_share = -gain_per_share
+        cap = getattr(cfg, "merge_max_loss_per_share", 0.0)
+        # Tolerance, because prices are decimals stored as binary floats: a
+        # pair at 0.51 + 0.50 computes a loss of 0.010000000000000009, which a
+        # bare `>` reads as over a 0.01 cap. A pair exactly at the limit is
+        # inside it, and a rounding artifact must not be what decides a money
+        # rule. 1e-9 is far below one tick (0.001) so it cannot admit a price
+        # the venue could actually quote.
+        if loss_per_share > cap + 1e-9:
+            return _no(
+                f"hold: {100 * loss_per_share:.2f}c/sh over parity exceeds the "
+                f"{100 * cap:.2f}c cap -- velocity not evaluated")
+        # Unknown rent blocks, exactly as unknown gas does. A missing figure is
+        # not a favourable one, and defaulting it would make every over-parity
+        # pair mergeable on an assumption nobody measured.
+        if projected_rent_per_day is None or hold_days is None:
+            return _no(
+                f"hold: {100 * loss_per_share:.2f}c/sh over parity and the "
+                f"return on freed capital is unknown -- refusing to assume it")
+        freed_earnings = projected_rent_per_day * max(0.0, hold_days)
+        concession = paired * loss_per_share + gas_cost
+        if freed_earnings <= concession:
+            return _no(
+                f"hold: freeing ${cost_basis:.2f} earns ${freed_earnings:.2f} "
+                f"over {hold_days:.0f}d, under the ${concession:.2f} concession")
+        velocity_justified = True
+
     out = {
-        "take": realized_pnl > 0,
+        # A velocity-justified merge has a negative realized_pnl by
+        # construction; it passed a different test and must not be re-judged
+        # by the profitability one.
+        "take": velocity_justified or realized_pnl > 0,
+        "velocity_justified": velocity_justified,
         "shares": paired,
         "cost_basis": cost_basis,
         "proceeds": proceeds,
@@ -94,10 +140,14 @@ def should_merge(inv, cfg, gas_cost: float | None = None) -> dict:
         "up_cost_removed": paired * inv.avg("UP"),
         "dn_cost_removed": paired * inv.avg("DOWN"),
     }
+    # Name the test that decided it. A merge booked at -0.6c/sh is correct
+    # under velocity and a bug under the profitability rule, and the reader
+    # cannot tell which from the net alone.
     out["why"] = (
         f"merge {paired:.0f} pairs @ cost {cost_per_share:.4f} -> "
         f"{PARITY:.2f}, {100 * gain_per_share:.2f}c/sh gross, "
         f"gas ${gas_cost:.4f}, net ${realized_pnl:.2f}"
+        f"{' [velocity: freeing capital beats holding]' if velocity_justified else ''}"
         if out["take"] else
         f"hold: {paired:.0f} pairs @ cost {cost_per_share:.4f}, "
         f"{100 * gain_per_share:.2f}c/sh gross does not clear "
