@@ -340,3 +340,29 @@ except branch into an idempotent step at connect time — the old one only ran i
 a write failed first.
 
 **Verdict.** LIVE.
+
+### Archive commit — port-8788 single-bot pipeline parked
+
+**Question.** The fleet on port 8800 has rendered the legacy single-market
+pipeline on port 8788 (server/dashboard, server/kanban, strategy/main.py's
+single-bot loop, scripts/run_fleet.py, deploy/run_service.py) functionally
+dead on this host — the supervisor launches fleet + fleet_dash, and nothing
+else. Should this code stay on the live branch, or be parked?
+
+**Method.** Moved all five legacy files into `archive/legacy-bot-8788/`
+(preserving their original subpaths), and split `strategy/main.py` into:
+  (a) the full original, preserved at `archive/legacy-bot-8788/strategy/main.py`,
+  (b) a slim shim exposing only `full_book` + `recent_trades` — the two
+      functions `strategy.fleet` imports. `tests/test_dashboard_page.py`
+      drops the kanban-PAGE check (now archived). `.gitignore` opts the
+      `archive/legacy-bot-8788/` subtree back IN while keeping the rest of
+      `archive/` (DB snapshots, NEXT_SESSION notes) gitignored runtime
+      data.
+
+**Result.** Single commit. `feat/live-readiness` and the new
+`archive/legacy-bot-8788` git branch both point at this commit. Legacy
+code is git-recoverable from either branch via checkout into the archive
+subdirectory. The live fleet pipeline runs unchanged on port 8800.
+
+**Verdict.** PARKED — preserved, not deleted; not running on the live host;
+recoverable from the archive branch by checkout.

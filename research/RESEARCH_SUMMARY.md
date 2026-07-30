@@ -55,3 +55,19 @@ bottom. One bullet per concrete thing done, tried, found, or broken.
 * **Added powerwinner's two missing rules** — price band 0.30-0.70 and quoting only in the first 40% of the window — each behind its own switch so they can be measured one at a time.
 * **Dashboard now shows maker metrics:** fill rate vs queue depth, fill provenance (tape-confirmed vs inferred vs crossed), pair-cost distribution, quote uptime + top skip reasons, partial-fill exposure, taker fees, spread capture per share. `fills.reason` is persisted so provenance traces to a real row.
 * **Two bugs in this session's own tooling, caught before they produced a finding:** the replay harness stopped quoting a side after a complete fill (a filled order is done, not resting); the tape cursor advanced after `continue` paths and would have re-credited prints. Tests 8 -> 31; the harness is verified against scripted books with hand-computed answers before touching real data.
+
+## 31/07/2026
+* **Parked the port-8788 single-bot pipeline on a sibling git branch
+  (`archive/legacy-bot-8788`).** The fleet on port 8800 has rendered
+  the legacy single-market code (server/dashboard, server/kanban,
+  strategy/main.py's loop, scripts/run_fleet.py, deploy/run_service.py)
+  functionally dead on this host. All five moved to
+  `archive/legacy-bot-8788/<original subpath>`. `strategy/main.py` keeps
+  only `full_book` + `recent_trades` — the two helpers `strategy.fleet`
+  still imports; the dead tail is preserved at the archive path. The
+  fleet dashboard test now validates the live fleet page only.
+  `.gitignore` was loosened to track `archive/legacy-bot-8788/`; the rest
+  of `archive/` (DB snapshots, NEXT_SESSION notes) stays gitignored.
+  Both `feat/live-readiness` and `archive/legacy-bot-8788` point at this
+  single commit, so the live branch is clean and the historical version
+  is recoverable.
