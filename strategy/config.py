@@ -177,6 +177,33 @@ class MakerConfig:
     # something, short enough that the exception stays rare and the loss cap
     # remains the binding constraint rather than a formality.
     merge_velocity_hold_days: float = 30.0
+
+    # REWARD ELIGIBILITY (U4). Polymarket's published rule: "The minimum reward
+    # payout is $1; amounts below this will not be paid." A market projecting
+    # under a dollar a day does not pay a fraction of a dollar -- it pays zero.
+    #
+    # Measured 2026-07-30, only 4 of 20 fleet markets cleared it. The other 16
+    # held capital and earned exactly nothing, which makes spreading thin
+    # actively harmful rather than merely inefficient. Concentration is not a
+    # preference here, it is what the payout rule requires.
+    #
+    # Whether the threshold applies per-market or across a maker's aggregate is
+    # not settled by the docs. Per-market is the conservative reading and is
+    # safe under either; the first real payout settles it empirically.
+    reward_min_payout_usd: float = 1.0
+    # Multiple of the floor a market must clear to be funded. Projections are
+    # noisy and competitors arrive, so 1.0x would fund markets that cross below
+    # the line the moment anyone else quotes. 1.5x buys headroom.
+    reward_floor_multiple: float = 1.5
+
+    # How long to average competitor depth before sizing a position. One
+    # snapshot sized the whole fleet on 2026-07-29 and read a competing score
+    # of 35 for a market that measured 3,727 live -- a 100x error that put the
+    # top-ranked market at $0.25/day actual against $18.96 projected.
+    rank_sample_window_sec: float = 1800.0
+    # Re-rank cadence. run/markets.json was frozen from 2026-07-29 01:39 while
+    # the fleet ran against it for a day and a half.
+    rerank_interval_sec: float = 3600.0
     # Required profit per share AFTER both fees. Set at roughly one fee's
     # width again, so a close is only taken on a move clearly larger than the
     # cost of taking it -- at 1c the threshold sits inside the noise of a

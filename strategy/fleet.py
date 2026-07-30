@@ -156,7 +156,31 @@ class MarketState:
         # purpose: it feeds the pairing rate against fills observed in the same
         # window, and the durable record is the `closes` table.
         self.merged_shares = 0.0
+        # Rolling (ts, theirs) observations. One snapshot sized the entire
+        # fleet on 2026-07-29 and read a competing score of 35 for a market
+        # that measured 3,727 live -- a 100x error, and the reason the
+        # top-ranked market delivered $0.25/day against $18.96 projected.
+        self.theirs_samples: list[tuple[float, float]] = []
         self.err = ""
+
+    def observe_theirs(self, ts: float, theirs: float, window_sec: float) -> None:
+        """Add one competitor-depth reading and drop anything past the window."""
+        self.theirs_samples.append((ts, theirs))
+        cutoff = ts - window_sec
+        self.theirs_samples = [(t, v) for t, v in self.theirs_samples
+                               if t >= cutoff]
+
+    def avg_theirs(self) -> float | None:
+        """Mean competing depth over the window, or None with no samples.
+
+        None rather than 0.0: no observation is not an empty book, and an
+        empty book is the single most attractive-looking input the allocator
+        can receive. Guessing it would concentrate capital into exactly the
+        markets we know least about.
+        """
+        if not self.theirs_samples:
+            return None
+        return sum(v for _, v in self.theirs_samples) / len(self.theirs_samples)
         # Rehydrate an EXITED verdict, and only an EXITED verdict.
         #
         # This used to start every market at NORMAL on the argument that a
@@ -243,11 +267,35 @@ def reallocate(states, base) -> dict:
     worse than capital sitting idle.
     """
     obs = []
+    floor = base.reward_min_payout_usd * base.reward_floor_multiple
     for s in states:
         live = s.spec.get("_live") or {}
         share, capital = live.get("share"), live.get("capital")
         if not share or not capital:
             continue
+
+        # REWARD ELIGIBILITY. Polymarket pays nothing below $1 per
+        # distribution, so a market projecting under the floor is not a small
+        # earner -- it is committed capital earning exactly zero. 16 of 20
+        # markets were in that state on 2026-07-30 while the fleet kept funding
+        # every one of them.
+        #
+        # Unfunded, NOT dropped: the market stays in `states` so its inventory
+        # is still merged, marked out and reconciled. Removing it here would
+        # strand a real position with nothing tending it.
+        if (live.get("income") or 0.0) < floor:
+            continue
+
+        # Averaged competing depth, not the instantaneous reading. A single
+        # snapshot is what sized the fleet off a competing score of 35 for a
+        # market that measured 3,727. `share` is inverted back out of the
+        # average so the allocator's own competitor_depth() sees a stable
+        # number instead of whatever the book happened to be this second.
+        avg_theirs = s.avg_theirs()
+        ours = live.get("ours") or 0.0
+        if avg_theirs is not None and (ours + avg_theirs) > 0:
+            share = ours / (ours + avg_theirs)
+
         obs.append({"cid": s.cid, "daily": s.daily,
                     "capital": capital, "share": share})
     if not obs:
@@ -587,6 +635,9 @@ def visit(st: MarketState, bot_cfg, now: float,
     oq1, oq2 = rewards.our_scores(st.engine.open_orders(), up, dn,
                                   cfg.max_spread_from_mid, cfg.min_quote_shares)
     ours, theirs, share = rewards.share_of_pool(oq1, oq2, bq1, bq2)
+    # Feed the rolling window the allocator averages over, so sizing responds
+    # to the competition's typical depth rather than to one lucky snapshot.
+    st.observe_theirs(now, theirs, cfg.rank_sample_window_sec)
     store.log_reward_sample(
         ts=now, market_slug=m.market_slug, condition_id=m.condition_id,
         our_score=ours, market_score=theirs,
@@ -671,7 +722,45 @@ def main() -> None:
 
     gap = 2.0 / REQ_PER_SEC
     i = 0
+    last_rerank = time.time()
     while True:
+        # PERIODIC RE-RANK. run/markets.json was written 2026-07-29 01:39 and
+        # the fleet ran against it for a day and a half while competitors
+        # arrived and reward rates changed underneath it.
+        #
+        # Re-picking the candidate set means scoring hundreds of books, which
+        # does not belong inside the trading loop -- `scripts/rank_markets`
+        # owns that and writes the file. What happens here is adopting the
+        # result: any market the ranker has since added is picked up, and any
+        # market it dropped is retained if it still holds inventory, because
+        # dropping a live position strands it with nothing to merge or
+        # reconcile it.
+        now_ts = time.time()
+        if now_ts - last_rerank >= base.rerank_interval_sec:
+            last_rerank = now_ts
+            try:
+                fresh = {s["cid"]: s for s in load_specs()}
+                known = {s.cid for s in states}
+                for cid, spec in fresh.items():
+                    if cid not in known:
+                        states.append(MarketState(spec, base))
+                        log.info("RERANK + %s", spec["title"][:40])
+                held = [s for s in states if s.cid not in fresh
+                        and (s.inv.up_shares or s.inv.down_shares)]
+                dropped = [s for s in states
+                           if s.cid not in fresh and s not in held]
+                if dropped:
+                    for s in dropped:
+                        log.info("RERANK - %s", s.title[:40])
+                    states = [s for s in states if s not in dropped]
+                if held:
+                    log.info("RERANK %d dropped market(s) retained: still "
+                             "holding inventory", len(held))
+            except Exception as e:
+                # A stale market set is survivable; a dead fleet is not.
+                log.warning("rerank failed, keeping current markets: %s: %s",
+                            type(e).__name__, e)
+
         st = states[i % len(states)]
         i += 1
         try:

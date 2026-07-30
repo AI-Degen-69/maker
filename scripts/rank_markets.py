@@ -29,6 +29,14 @@ RUN = ROOT / "run"
 OFFSET = 0.020          # where we intend to quote, in price units
 C = 3.0                 # venue's one-sided penalty
 
+# Polymarket: "The minimum reward payout is $1; amounts below this will not be
+# paid." A market projecting under a dollar a day does not pay a fraction of a
+# dollar, it pays nothing -- so a sub-floor market is not a small position, it
+# is capital committed for zero income. Measured 2026-07-30, 16 of 20 fleet
+# markets were in exactly that state.
+MIN_PAYOUT = 1.0
+FLOOR_MULTIPLE = 1.5    # headroom: projections are noisy and rivals arrive
+
 
 def q_min(a: float, b: float) -> float:
     return max(min(a, b), max(a / C, b / C))
@@ -105,6 +113,10 @@ def evaluate(session: requests.Session, rate: float, m: dict) -> dict | None:
     income = rate * ours / (ours + theirs)
     capital = n * capital_per_share
     return {
+        # Below the payout floor this market pays exactly zero, however good
+        # its return_pct_day looks. Recorded rather than filtered here so the
+        # report can show what was rejected and why.
+        "eligible": income >= MIN_PAYOUT * FLOOR_MULTIPLE,
         "cid": m["condition_id"],
         "title": m.get("question", "")[:90],
         "slug": m.get("market_slug", ""),
@@ -143,15 +155,23 @@ def main() -> None:
         for r in ex.map(lambda a: evaluate(s, *a), cands[:250]):
             if r:
                 out.append(r)
-    out.sort(key=lambda r: -r["return_pct_day"])
-    picked = out[:top]
+    # Eligibility BEFORE ranking. Sorting on return_pct_day alone put the
+    # top-ranked market at $0.25/day actual against $18.96 projected, because a
+    # spectacular percentage return on an income of eleven cents is still
+    # eleven cents -- and under the payout floor it is zero.
+    eligible = [r for r in out if r["eligible"]]
+    rejected = len(out) - len(eligible)
+    eligible.sort(key=lambda r: -r["return_pct_day"])
+    picked = eligible[:top]
 
     RUN.mkdir(exist_ok=True)
     (RUN / "markets.json").write_text(json.dumps(picked, indent=1), encoding="utf-8")
 
     ti = sum(r["est_income"] for r in picked)
     tc = sum(r["est_capital"] for r in picked)
-    print(f"scored {len(out)}, wrote top {len(picked)} -> run/markets.json\n")
+    print(f"scored {len(out)}, {rejected} under the "
+          f"${MIN_PAYOUT * FLOOR_MULTIPLE:.2f}/day payout floor, "
+          f"wrote top {len(picked)} -> run/markets.json\n")
     print(f"{'market':<46}{'$/day':>7}{'capital':>9}{'ret%/d':>8}")
     for r in picked:
         # Windows consoles default to a legacy codepage; market titles carry
