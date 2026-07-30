@@ -194,6 +194,28 @@ class MakerConfig:
     # it has no fleet to be over budget.
     fleet_naked_usd: float = 0.0
 
+    # TOTAL COMMITTED CAPITAL (U3). Everything above bounds the UNHEDGED leg;
+    # nothing bounded the hedged one. A matched pair cannot lose -- it pays
+    # exactly $1 -- so it was treated as free, and it is not: until U2 it was
+    # frozen until 2027, and even with merge it is money that is committed
+    # right now and cannot be committed anywhere else.
+    #
+    # The real ceiling was max_cost_per_market x markets = $400 x 20 = $8,000
+    # against a nominal $1,200 allocation_budget. Measured 2026-07-30: $9,588
+    # had left the wallet -- $7,452 in paired inventory, $767 naked, $1,369
+    # resting in offers -- while the dashboard's headline return divided rent
+    # by the $1,369 alone and reported 1.80%/day. Against the money actually
+    # committed it was 0.256%/day. The cap and the honest denominator are the
+    # same fix.
+    #
+    # Counts inventory cost PLUS resting offer notional, because both are
+    # dollars that are spoken for. $2,000 leaves room above the observed
+    # working set without permitting another $9.5k drift.
+    max_committed_usd: float = 2000.0
+    # Injected each cycle by the fleet runner, same pattern as fleet_naked_usd.
+    # Zero for a single-market bot, which has no fleet to total up.
+    committed_usd: float = 0.0
+
     # Maker pool per 5-min window, for turning score-share into dollars.
     # Measured 2026-07-28 from 15 recorded windows: 68405 shares traded per
     # window -> $716 median taker-fee pool -> 20% = $143 to makers. Treat as an

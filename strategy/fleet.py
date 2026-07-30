@@ -205,6 +205,29 @@ def fleet_naked_cost(states) -> float:
     return total
 
 
+def fleet_committed_cost(states) -> float:
+    """Every dollar that has left the wallet or is spoken for.
+
+    Inventory cost -- BOTH legs, paired and naked -- plus the notional resting
+    in unfilled offers. `fleet_naked_cost` deliberately counts only the
+    unhedged residue because that is what can lose money; this counts what is
+    committed, which is a different question and the one nobody was asking.
+
+    Measured 2026-07-30, the gap between them was the whole problem: $767
+    naked (inside its $800 cap, looking healthy) against $9,588 committed.
+    """
+    total = 0.0
+    for s in states:
+        total += (s.inv.up_cost or 0.0) + (s.inv.down_cost or 0.0)
+        # Resting offers are not spent yet, but they are promised: the venue
+        # holds collateral against an open bid, and a fill converts the promise
+        # into inventory without asking. Excluding them would let the fleet sit
+        # exactly at the cap with thousands more already in flight.
+        for o in s.engine.open_orders():
+            total += o.price * max(0.0, o.size - o.filled)
+    return total
+
+
 def reallocate(states, base) -> dict:
     """Resize every market by marginal return instead of a flat 120 shares.
 
@@ -261,7 +284,7 @@ def reallocate(states, base) -> dict:
 
 
 def visit(st: MarketState, bot_cfg, now: float,
-          fleet_naked_usd: float = 0.0) -> None:
+          fleet_naked_usd: float = 0.0, committed_usd: float = 0.0) -> None:
     """One poll of one market: books -> fills -> requote -> reward sample."""
     cfg = st.cfg
     if st.market is None:
@@ -382,7 +405,8 @@ def visit(st: MarketState, bot_cfg, now: float,
     # Fleet exposure is a property of every OTHER market as well, so it has to
     # be injected here rather than derived from this market's inventory.
     cfg = replace(cfg, gate_state=st.gate,
-                  fleet_naked_usd=fleet_naked_usd)
+                  fleet_naked_usd=fleet_naked_usd,
+                  committed_usd=committed_usd)
 
     # MERGE FIRST, then consider selling. A matched pair redeems for exactly
     # 1.00 through the collateral adapter with no spread and no taker fee, so
@@ -643,7 +667,12 @@ def main() -> None:
         st = states[i % len(states)]
         i += 1
         try:
-            visit(st, bot_cfg, time.time(), fleet_naked_cost(states))
+            # Both totals are recomputed per visit rather than per sweep: a
+            # fill in the market visited two seconds ago has already changed
+            # them, and a cap evaluated against a stale total is a cap that
+            # lets the overshoot through.
+            visit(st, bot_cfg, time.time(), fleet_naked_cost(states),
+                  fleet_committed_cost(states))
         except Exception as e:
             log.warning("%s: %s", st.title[:30], e)
             st.err = str(e)
@@ -679,9 +708,16 @@ def main() -> None:
                 fills_txt = f"{vr['verified_fills']}v/{vr['unverified_fills']}u"
             except Exception as e:
                 vr_txt, fills_txt = "err", str(type(e).__name__)
-            log.info("sweep | %d/%d scoring | est $%.2f/day | capital $%.0f "
-                     "| naked $%.0f | funded %d/%d | verified %s (%s)",
+            # `capital` is offers only; `committed` is every dollar out the
+            # door. The pair is logged together on purpose -- reading the
+            # first without the second is how a 0.256%/day return got reported
+            # as 1.80%/day for a day and a half.
+            committed = fleet_committed_cost(states)
+            log.info("sweep | %d/%d scoring | est $%.2f/day | offers $%.0f "
+                     "| committed $%.0f/%.0f | naked $%.0f | funded %d/%d "
+                     "| verified %s (%s)",
                      len(live), len(states), inc, cap,
+                     committed, base.max_committed_usd,
                      fleet_naked_cost(states), funded, len(states),
                      vr_txt, fills_txt)
             (RUN / "fleet_state.json").write_text(
