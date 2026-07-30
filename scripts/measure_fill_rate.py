@@ -301,7 +301,17 @@ def replay(w: Window, cfg, rule: str, requote: str,
         for lbl, bk in (("UP", poll.up), ("DOWN", poll.dn)):
             tp = (traded_between(w, bk["token_id"], prev_ts, ts)
                   if use_tape and prev_ts is not None else None)
-            for f in engine.on_book(bk["token_id"], bk["bids"], ts, tp):
+            # U1 made the tape the only crediting path, so a no-tape replay --
+            # which is this tool's whole book-only mode -- now returns nothing
+            # and records shadow candidates instead. Read them back here so the
+            # comparison this script exists to make still works. What changed is
+            # the label, not the arithmetic: in book-only mode these are the
+            # shares the old model CLAIMED, not shares anybody can stand behind.
+            shadow_mark = len(engine.unverified)
+            observed = engine.on_book(bk["token_id"], bk["bids"], ts, tp)
+            if tp is None:
+                observed = engine.unverified[shadow_mark:]
+            for f in observed:
                 if f.side == "UP":
                     inv.up_shares += f.size; inv.up_cost += f.size * f.price
                     res.up_shares += f.size; res.up_cost += f.size * f.price
@@ -312,7 +322,7 @@ def replay(w: Window, cfg, rule: str, requote: str,
                 ep = open_ep.get(f.side)
                 if ep is not None:
                     ep.filled += f.size
-                    if f.reason == "sweep":
+                    if f.reason in ("sweep", "unverified_sweep"):
                         ep.filled_sweep += f.size
                     else:
                         # 'queue' (book-only) and 'tape' (tape-confirmed) are

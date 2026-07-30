@@ -281,9 +281,42 @@ def visit(st: MarketState, bot_cfg, now: float,
     first_pass = not st.tape_primed
     st.tape_primed = True
     for book in (up, dn):
-        traded = tape.get(book["token_id"]) if tape else None
+        # A token with NO trades this poll must read as an empty tape, not a
+        # missing one. `tape.get(...)` returns None in both cases, and before
+        # U1 that None sent the engine down the cancel-ambiguous delta path --
+        # so the quietest markets, where nothing traded at all, were exactly
+        # the ones generating phantom fills. `{}` says measured-and-empty;
+        # None is reserved for a tape we genuinely could not read.
+        traded = None if tape is None else (tape.get(book["token_id"]) or {})
+        if first_pass:
+            traded = None      # a startup backlog is not evidence about us
+        mark = len(st.engine.unverified)
         fills = st.engine.on_book(book["token_id"], book["bids"], now,
-                                  traded=None if first_pass else traded)
+                                  traded=traded)
+        new_unverified = st.engine.unverified[mark:]
+
+        # Persist the decision inputs so a later engine change can be replayed
+        # offline -- the capability whose absence forced Phase A to verify by
+        # forward running instead of replaying the 18.7h run.
+        try:
+            store.log_fill_evidence(
+                ts=now, condition_id=m.condition_id,
+                token_id=book["token_id"],
+                bids_json=json.dumps({str(p): s for p, s in book["bids"].items()}),
+                tape_json=(None if traded is None
+                           else json.dumps({str(p): v for p, v in traded.items()})),
+                credited=sum(f.size for f in fills),
+                unverified=sum(f.size for f in new_unverified))
+        except Exception as e:
+            log.warning("fill evidence not recorded for %s: %s", st.title[:30], e)
+
+        for f in new_unverified:
+            # Recorded, never applied. These shares were not bought.
+            store.log_unverified_fill(
+                ts=now, market_slug=m.market_slug,
+                condition_id=m.condition_id, token_id=f.token_id,
+                side=f.side, price=f.price, size=f.size,
+                queue_waited=f.queue_waited, reason=f.reason)
         for f in fills:
             if f.side == "UP":
                 st.inv.up_shares += f.size
@@ -577,10 +610,23 @@ def main() -> None:
                             type(e).__name__, e)
                 sizes = {}
             funded = sum(1 for n in sizes.values() if n > 0)
+            # The verified ratio rides on the sweep line because it is the one
+            # number that decides what happens after Phase A, and a figure that
+            # lives only in the database is a figure nobody reads. `--` means
+            # nothing observed yet, deliberately not 0% -- an idle fleet has
+            # not measured anything.
+            try:
+                vr = store.verified_ratio()
+                vr_txt = ("--" if vr["ratio"] is None
+                          else f"{100 * vr['ratio']:.1f}%")
+                fills_txt = f"{vr['verified_fills']}v/{vr['unverified_fills']}u"
+            except Exception as e:
+                vr_txt, fills_txt = "err", str(type(e).__name__)
             log.info("sweep | %d/%d scoring | est $%.2f/day | capital $%.0f "
-                     "| naked $%.0f | funded %d/%d",
+                     "| naked $%.0f | funded %d/%d | verified %s (%s)",
                      len(live), len(states), inc, cap,
-                     fleet_naked_cost(states), funded, len(states))
+                     fleet_naked_cost(states), funded, len(states),
+                     vr_txt, fills_txt)
             (RUN / "fleet_state.json").write_text(
                 json.dumps(specs, default=str), encoding="utf-8")
         time.sleep(gap)

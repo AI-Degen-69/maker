@@ -61,6 +61,49 @@ CREATE TABLE IF NOT EXISTS fills (
     reason TEXT DEFAULT 'queue'
 );
 
+-- U1. Fills the pre-tape-gate delta logic WOULD have credited, which the trade
+-- tape does not support. Deliberately a SEPARATE table rather than a flag on
+-- `fills`: inventory, P&L and the dashboard all reconstruct from `fills`, and a
+-- single query that forgot a `WHERE verified = 1` would put phantom shares into
+-- a real position. Nothing may join this table into an inventory path.
+--
+-- The ratio of these to real fills is what the Phase A decision gate reads. On
+-- the 18.7h pre-U1 run the equivalent split was 246 delta-credited against 2
+-- tape-backed, so this table is expected to be much larger than `fills`.
+CREATE TABLE IF NOT EXISTS unverified_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    market_slug TEXT,
+    condition_id TEXT,
+    token_id TEXT,
+    side TEXT,
+    price REAL,
+    size REAL,
+    queue_waited REAL,
+    -- 'unverified_sweep' (level emptied, indistinguishable from a mass cancel)
+    -- or 'unverified_queue' (level shrank past our position). Both unverified;
+    -- the sweep is the weaker of the two.
+    reason TEXT
+);
+
+-- U1. The book and tape slice behind one fill decision, so a future engine
+-- change can be replayed offline against the same inputs. The 18.7h run could
+-- not be replayed at all -- `fills` records what was credited, never what was
+-- observed -- which is why Phase A verifies by forward running instead.
+CREATE TABLE IF NOT EXISTS fill_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    condition_id TEXT,
+    token_id TEXT,
+    -- JSON {price: size} of the bid ladder at decision time, and the tape
+    -- volumes since the previous poll. tape_json IS NULL means the tape could
+    -- not be read -- distinct from '{}', which means it was read and empty.
+    bids_json TEXT,
+    tape_json TEXT,
+    credited REAL DEFAULT 0,
+    unverified REAL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS resolutions (
     condition_id TEXT PRIMARY KEY,
     winning_token TEXT,
@@ -267,6 +310,66 @@ def log_fill(**kw) -> None:
              kw.get("reason") or "queue"))
         c.execute("UPDATE quotes SET filled = filled + ?, fill_ts = ? WHERE id = ?",
                   (kw["size"], time.time(), kw.get("quote_id")))
+
+
+def log_unverified_fill(**kw) -> None:
+    """Record a fill the tape could not support.
+
+    Writes ONLY to `unverified_fills`. It must never touch `fills`, `quotes`,
+    or anything inventory reconstructs from -- the whole point is that these
+    shares were never bought.
+    """
+    with db() as c:
+        c.execute(
+            "INSERT INTO unverified_fills (ts, market_slug, condition_id, "
+            "token_id, side, price, size, queue_waited, reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (kw.get("ts") or time.time(), kw["market_slug"], kw["condition_id"],
+             kw["token_id"], kw["side"], kw["price"], kw["size"],
+             kw.get("queue_waited"), kw.get("reason")))
+
+
+def log_fill_evidence(**kw) -> None:
+    """Persist the inputs behind one fill decision, for offline replay.
+
+    `tape_json` is None when the tape could not be read at all, and '{}' when
+    it was read and empty. Collapsing those two would destroy the distinction
+    U1 exists to draw, so the caller passes them through unchanged.
+    """
+    with db() as c:
+        c.execute(
+            "INSERT INTO fill_evidence (ts, condition_id, token_id, bids_json, "
+            "tape_json, credited, unverified) VALUES (?,?,?,?,?,?,?)",
+            (kw.get("ts") or time.time(), kw["condition_id"], kw["token_id"],
+             kw.get("bids_json"), kw.get("tape_json"),
+             kw.get("credited") or 0.0, kw.get("unverified") or 0.0))
+
+
+def verified_ratio() -> dict:
+    """Tape-backed fills against everything observed, fleet-wide.
+
+    THE Phase A decision-gate number. `ratio` is None when nothing has been
+    observed yet rather than a confident 0.0 or 1.0 -- an empty run must not
+    read as a measurement.
+    """
+    # Tuple indices, not names: `db()` hands back a bare connection with no
+    # row_factory, which is the convention every other reader here follows.
+    with db() as c:
+        v_n, v_sh = c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM fills "
+            "WHERE reason != 'cross'").fetchone()
+        u_n, u_sh, u_sweep = c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0), "
+            "COALESCE(SUM(CASE WHEN reason = 'unverified_sweep' THEN size "
+            "ELSE 0 END), 0) FROM unverified_fills").fetchone()
+    v_sh, u_sh = float(v_sh or 0.0), float(u_sh or 0.0)
+    total = v_sh + u_sh
+    return {
+        "verified_fills": v_n, "verified_shares": v_sh,
+        "unverified_fills": u_n, "unverified_shares": u_sh,
+        "unverified_sweep_shares": float(u_sweep or 0.0),
+        "ratio": (v_sh / total) if total > 1e-9 else None,
+    }
 
 
 def log_markout_open(**kw) -> int:
