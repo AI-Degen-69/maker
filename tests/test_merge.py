@@ -243,6 +243,40 @@ def test_merge_and_sell_share_one_table_and_reconstruct_identically(
     assert round(inv.avg("DOWN"), 6) == 0.4728
 
 
+def test_pre_u1_fills_never_count_as_verified(monkeypatch, tmp_path):
+    """REGRESSION. 'queue' and 'sweep' are the pre-U1 vocabulary -- delta
+    credits with no tape evidence, the exact thing the ratio measures. Counting
+    them as verified reads 1.0 on run/fleet.db's 302 queue + 37 sweep rows: a
+    perfect score on the data whose unreliability motivated the unit."""
+    store = _fresh(monkeypatch, tmp_path, name="legacy.db")
+    for reason in ("queue",) * 30 + ("sweep",) * 7:
+        store.log_fill(market_slug="s", condition_id="c", token_id="t",
+                       side="UP", price=0.5, size=10, reason=reason)
+    store.log_fill(market_slug="s", condition_id="c", token_id="t",
+                   side="UP", price=0.5, size=10, reason="tape")
+    store.log_unverified_fill(ts=1.0, market_slug="s", condition_id="c",
+                              token_id="t", side="UP", price=0.5, size=30,
+                              queue_waited=0, reason="unverified_sweep")
+
+    r = store.verified_ratio()
+    assert r["legacy_fills"] == 37          # counted, and reported
+    assert r["verified_fills"] == 1         # only the tape-backed one
+    assert r["ratio"] == 10 / (10 + 30)     # legacy excluded from both sides
+
+
+def test_a_database_of_only_legacy_fills_reports_no_measurement(
+        monkeypatch, tmp_path):
+    """The dangerous case: reusing run/fleet.db for the forward test. Its 342
+    pre-U1 fills must not manufacture a ratio before a single new fill lands."""
+    store = _fresh(monkeypatch, tmp_path, name="legacyonly.db")
+    for _ in range(342):
+        store.log_fill(market_slug="s", condition_id="c", token_id="t",
+                       side="UP", price=0.5, size=10, reason="queue")
+    r = store.verified_ratio()
+    assert r["ratio"] is None               # no observation, not a score
+    assert r["legacy_fills"] == 342
+
+
 def test_existing_close_rows_default_to_sell(monkeypatch, tmp_path):
     """Rows written before U2 predate merge entirely, so 'sell' is the true
     value for every one of them and the column default backfills itself."""

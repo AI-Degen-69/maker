@@ -374,10 +374,27 @@ def verified_ratio() -> dict:
     """
     # Tuple indices, not names: `db()` hands back a bare connection with no
     # row_factory, which is the convention every other reader here follows.
+    #
+    # ONLY reason='tape' counts as verified. 'queue' and 'sweep' are the
+    # PRE-U1 vocabulary -- fills the delta logic credited without tape
+    # evidence, which is exactly the thing this ratio exists to measure. They
+    # sit in `fills` because they really are in inventory, but counting them as
+    # verified would report the old model's guesses as confirmations.
+    #
+    # This is not hypothetical: run/fleet.db carries 302 'queue' + 37 'sweep'
+    # against 3 'tape', so a naive `reason != 'cross'` reads 1.0 -- a perfect
+    # score, on the data whose unreliability motivated the whole unit. Legacy
+    # rows are counted and reported separately, and excluded from the ratio
+    # entirely: they are neither a fresh confirmation nor a fresh unverified
+    # observation, and dragging them into either side would let pre-U1 history
+    # decide a post-U1 measurement.
     with db() as c:
         v_n, v_sh = c.execute(
             "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM fills "
-            "WHERE reason != 'cross'").fetchone()
+            "WHERE reason = 'tape'").fetchone()
+        l_n, l_sh = c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM fills "
+            "WHERE reason IN ('queue', 'sweep')").fetchone()
         u_n, u_sh, u_sweep = c.execute(
             "SELECT COUNT(*), COALESCE(SUM(size), 0), "
             "COALESCE(SUM(CASE WHEN reason = 'unverified_sweep' THEN size "
@@ -388,6 +405,10 @@ def verified_ratio() -> dict:
         "verified_fills": v_n, "verified_shares": v_sh,
         "unverified_fills": u_n, "unverified_shares": u_sh,
         "unverified_sweep_shares": float(u_sweep or 0.0),
+        # Pre-U1 rows still in inventory. Surfaced so an operator reading a
+        # clean ratio on a reused database can see how much history is being
+        # excluded from it.
+        "legacy_fills": l_n, "legacy_shares": float(l_sh or 0.0),
         "ratio": (v_sh / total) if total > 1e-9 else None,
     }
 
