@@ -1,0 +1,518 @@
+# Instincts generated from https://github.com/AI-Degen-69/maker
+# Generated: 2026-07-31T21:13:17.945Z
+# Version: 2.0
+# NOTE: This file supplements (does not replace) any existing curated instincts.
+# High-confidence manually curated instincts should be preserved alongside these.
+
+---
+id: maker-commit-conventional
+trigger: "when writing a commit message"
+confidence: 0.85
+domain: git
+source: repo-analysis
+source_repo: https://github.com/AI-Degen-69/maker
+---
+
+# Maker Commit Conventional
+
+## Action
+
+Use conventional commit format with prefixes: feat, fix, archive
+
+## Evidence
+
+- 9 commits analyzed
+- Detected conventional commit pattern
+- Examples: feat(fills): make the trade tape the only crediting path (U1), fix(fleet): make defunding actually stop quoting
+
+---
+id: maker-commit-length
+trigger: "when writing a commit message"
+confidence: 0.6
+domain: git
+source: repo-analysis
+source_repo: https://github.com/AI-Degen-69/maker
+---
+
+# Maker Commit Length
+
+## Action
+
+Write moderate-length commit messages (~58 characters)
+
+## Evidence
+
+- Average commit message length: 58 chars
+- Based on 9 commits
+
+---
+id: maker-naming-files
+trigger: "when creating a new file"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/AI-Degen-69/maker
+---
+
+# Maker Naming Files
+
+## Action
+
+Use snake_case naming convention
+
+## Evidence
+
+- Analyzed file naming patterns in repository
+- Dominant pattern: snake_case
+
+---
+id: maker-import-relative
+trigger: "when importing modules"
+confidence: 0.75
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/AI-Degen-69/maker
+---
+
+# Maker Import Relative
+
+## Action
+
+Use relative imports for project files
+
+## Evidence
+
+- Import analysis shows relative import pattern
+- Example: import { x } from '../lib/x'
+
+---
+id: maker-export-style
+trigger: "when exporting from a module"
+confidence: 0.7
+domain: code-style
+source: repo-analysis
+source_repo: https://github.com/AI-Degen-69/maker
+---
+
+# Maker Export Style
+
+## Action
+
+Prefer named exports
+
+## Evidence
+
+- Export pattern analysis
+- Dominant style: named
+
+---
+id: maker-test-separate
+trigger: "when writing tests"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/AI-Degen-69/maker
+---
+
+# Maker Test Separate
+
+## Action
+
+Place tests in the tests/ or __tests__/ directory, mirroring src structure
+
+## Evidence
+
+- Separate test directory pattern detected
+- Tests live in dedicated test folders
+
+---
+id: maker-test-naming
+trigger: "when creating a test file"
+confidence: 0.85
+domain: testing
+source: repo-analysis
+source_repo: https://github.com/AI-Degen-69/maker
+---
+
+# Maker Test Naming
+
+## Action
+
+Name test files using the pattern: *.test.ts
+
+## Evidence
+
+- File pattern: *.test.ts
+- Consistent across test files
+
+---
+id: maker-workflow-feature-development
+trigger: "when implementing a new feature"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/AI-Degen-69/maker
+---
+
+# Maker Workflow Feature Development
+
+## Action
+
+Follow the feature-development workflow:
+1. Add feature implementation
+2. Add tests for feature
+3. Update documentation
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~17x per month
+- Files: **/*.test.*
+
+---
+id: maker-workflow-feature-development-with-tests-and-config
+trigger: "when doing feature development with tests and config"
+confidence: 0.7
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/AI-Degen-69/maker
+---
+
+# Maker Workflow Feature Development With Tests And Config
+
+## Action
+
+Follow the feature-development-with-tests-and-config workflow:
+1. Edit or create implementation files in strategy/ (e.g., fleet.py, merge.py, quotes.py, fills.py, store.py, config.py)
+2. Update configuration in strategy/config.py if needed
+3. Add or update corresponding test files in tests/ (e.g., test_merge.py, test_fills.py, test_quotes.py, test_rank_markets.py)
+4. Optionally update related scripts/ or server/ files if feature affects them
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~4x per month
+- Files: strategy/fleet.py, strategy/merge.py, strategy/quotes.py
+
+---
+id: maker-workflow-bugfix-with-test-update
+trigger: "when doing bugfix with test update"
+confidence: 0.6
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/AI-Degen-69/maker
+---
+
+# Maker Workflow Bugfix With Test Update
+
+## Action
+
+Follow the bugfix-with-test-update workflow:
+1. Edit implementation file(s) in strategy/ to fix the bug (e.g., fleet.py, store.py, quotes.py)
+2. Update or add relevant test(s) in tests/ to cover the fixed behavior
+3. Optionally update related files if the bug affects other modules
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~2x per month
+- Files: strategy/fleet.py, strategy/store.py, strategy/quotes.py
+
+---
+id: maker-workflow-archive-legacy-code-branch
+trigger: "when doing archive legacy code branch"
+confidence: 0.55
+domain: workflow
+source: repo-analysis
+source_repo: https://github.com/AI-Degen-69/maker
+---
+
+# Maker Workflow Archive Legacy Code Branch
+
+## Action
+
+Follow the archive-legacy-code-branch workflow:
+1. Move legacy files to archive/ directory, preserving subpaths
+2. Update .gitignore to ensure archive/ code is tracked (or not ignored)
+3. Update or remove tests that reference archived code
+4. Update main entry points to reference new or slimmed-down logic
+
+## Evidence
+
+- Workflow detected from commit patterns
+- Frequency: ~1x per month
+- Files: archive/legacy-bot-8788/*, .gitignore, strategy/main.py
+
+---
+id: maker-instinct-file-naming
+trigger: "When creating or renaming a file in the codebase"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct File Naming
+
+## Action
+
+Use snake_case for file names
+
+## Evidence
+
+- Pattern in namingConventions.files: 'snake_case'
+- Files like strategy/fleet.py, strategy/store.py
+
+---
+id: maker-instinct-function-naming
+trigger: "When defining a new function"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Function Naming
+
+## Action
+
+Use camelCase for function names
+
+## Evidence
+
+- Pattern in namingConventions.functions: 'camelCase'
+
+---
+id: maker-instinct-class-naming
+trigger: "When defining a new class"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Class Naming
+
+## Action
+
+Use PascalCase for class names
+
+## Evidence
+
+- Pattern in namingConventions.classes: 'PascalCase'
+
+---
+id: maker-instinct-constant-naming
+trigger: "When defining a constant"
+confidence: 0.9
+domain: code-style
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Constant Naming
+
+## Action
+
+Use SCREAMING_SNAKE_CASE for constant names
+
+## Evidence
+
+- Pattern in namingConventions.constants: 'SCREAMING_SNAKE_CASE'
+
+---
+id: maker-instinct-import-style
+trigger: "When importing modules within the package"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Import Style
+
+## Action
+
+Use relative imports
+
+## Evidence
+
+- Pattern in importStyle: 'relative'
+
+---
+id: maker-instinct-export-style
+trigger: "When exporting functions or classes from a module"
+confidence: 0.8
+domain: code-style
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Export Style
+
+## Action
+
+Use named exports
+
+## Evidence
+
+- Pattern in exportStyle: 'named'
+
+---
+id: maker-instinct-test-location
+trigger: "When adding or updating tests"
+confidence: 0.9
+domain: testing
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Test Location
+
+## Action
+
+Place test files in the separate 'tests/' directory
+
+## Evidence
+
+- architecture.folderStructure.testLocation: 'separate'
+- Files like tests/test_fills.py
+
+---
+id: maker-instinct-test-pattern
+trigger: "When naming a test file"
+confidence: 0.8
+domain: testing
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Test Pattern
+
+## Action
+
+Use the pattern 'test_<module>.py' for test files
+
+## Evidence
+
+- Files like tests/test_fills.py, tests/test_merge.py
+
+---
+id: maker-instinct-test-type
+trigger: "When writing tests"
+confidence: 0.7
+domain: testing
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Test Type
+
+## Action
+
+Write unit tests for strategy logic
+
+## Evidence
+
+- testing.testTypes: ['unit']
+- Presence of tests/test_fills.py, tests/test_merge.py
+
+---
+id: maker-instinct-git-commit-format
+trigger: "When writing a commit message"
+confidence: 0.9
+domain: git
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Git Commit Format
+
+## Action
+
+Use conventional commits with a prefix (feat, fix, archive) and scope in parentheses
+
+## Evidence
+
+- Commits like 'feat(fills): make the trade tape the only crediting path (U1)'
+- Pattern in commits.prefixes: ['feat', 'fix', 'archive']
+
+---
+id: maker-instinct-git-commit-length
+trigger: "When composing a commit message"
+confidence: 0.7
+domain: git
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Git Commit Length
+
+## Action
+
+Keep commit messages concise, around 58 characters on average
+
+## Evidence
+
+- commits.averageLength: 58
+
+---
+id: maker-instinct-feature-workflow
+trigger: "When adding a new trading or strategy feature, or making a major change to core logic"
+confidence: 0.95
+domain: workflow
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Feature Workflow
+
+## Action
+
+Edit or create implementation files in strategy/, update configuration in strategy/config.py if needed, add or update corresponding test files in tests/, and optionally update related scripts/ or server/ files if feature affects them
+
+## Evidence
+
+- Workflow: feature-development-with-tests-and-config
+- Example commits and files in workflow definition
+
+---
+id: maker-instinct-bugfix-workflow
+trigger: "When fixing a bug or logic error in trading/strategy code"
+confidence: 0.9
+domain: workflow
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Bugfix Workflow
+
+## Action
+
+Edit implementation file(s) in strategy/ to fix the bug, update or add relevant test(s) in tests/ to cover the fixed behavior, and optionally update related files if the bug affects other modules
+
+## Evidence
+
+- Workflow: bugfix-with-test-update
+- Example commits and files in workflow definition
+
+---
+id: maker-instinct-archive-workflow
+trigger: "When deprecating a pipeline or major code section but keeping it accessible for historical purposes"
+confidence: 0.88
+domain: workflow
+source: repo-analysis
+source_repo: AI-Degen-69/maker
+---
+
+# Maker Instinct Archive Workflow
+
+## Action
+
+Move legacy files to archive/ directory, update .gitignore as needed, update or remove tests referencing archived code, and update main entry points to reference new or slimmed-down logic
+
+## Evidence
+
+- Workflow: archive-legacy-code-branch
+- Example commits and files in workflow definition
+
