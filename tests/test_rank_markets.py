@@ -37,10 +37,16 @@ def _spec(cid="c1", daily=50, title="t", min_size=50, shares=120):
 
 
 def _state(cid="c1", income=5.0, share=0.05, capital=120.0, ours=10.0,
-           daily=50, base=None):
+           daily=50, base=None, theirs=None):
+    """`theirs` is what the allocator sizes on, because it is the only reading
+    that survives being defunded -- see tests/test_refunding.py. `income` is
+    still recorded, since the dashboard and the sweep line read it, but it no
+    longer decides anything."""
     st = MarketState(_spec(cid=cid, daily=daily), base or load_cfg())
     st.spec["_live"] = {"income": income, "share": share,
-                        "capital": capital, "ours": ours}
+                        "capital": capital, "ours": ours, "theirs": theirs}
+    if theirs is not None:
+        st.observe_theirs(0.0, theirs, window_sec=1800.0)
     return st
 
 
@@ -50,21 +56,25 @@ def test_a_market_under_the_payout_floor_is_not_funded():
     """Below $1/day the venue pays nothing at all, so funding it commits
     capital for exactly zero income."""
     base = load_cfg()
-    poor = _state(cid="poor", income=0.25, base=base)
+    poor = _state(cid="poor", income=0.25, theirs=400_000.0, base=base)
     assert reallocate([poor], base).get("poor", 0) == 0
 
 
 def test_a_market_above_the_floor_is_funded():
     base = load_cfg()
-    rich = _state(cid="rich", income=9.0, base=base)
+    rich = _state(cid="rich", income=9.0, theirs=612.0, base=base)
     assert reallocate([rich], base).get("rich", 0) > 0
 
 
 def test_the_floor_carries_headroom_above_the_bare_minimum():
     """A market at exactly $1.00 sits on the line, and projections are noisy
-    -- one more competitor puts it under. The multiple buys margin."""
+    -- one more competitor puts it under. The multiple buys margin.
+
+    Uncontested, so the whole $1/day pot is ours at the 50-share minimum: the
+    market clears the marginal floor (2%/day on a $50 lot) and is refused on
+    the payout floor alone, which is the rule under test."""
     base = load_cfg()
-    marginal = _state(cid="edge", income=1.0, base=base)
+    marginal = _state(cid="edge", income=1.0, daily=1, theirs=0.0, base=base)
     assert reallocate([marginal], base).get("edge", 0) == 0
     assert base.reward_min_payout_usd * base.reward_floor_multiple > 1.0
 
@@ -79,7 +89,7 @@ def test_an_ineligible_market_is_sized_to_zero_not_left_at_startup_size():
     while 4 were funded, so offers alone reached $2,108 against a $2,000
     committed cap before a single share was bought."""
     base = load_cfg()
-    poor = _state(cid="poor", income=0.25, base=base)
+    poor = _state(cid="poor", income=0.25, theirs=400_000.0, base=base)
     assert reallocate([poor], base)["poor"] == 0
     assert poor.cfg.quote_shares == 0
 
@@ -88,8 +98,8 @@ def test_an_unfunded_market_is_still_tracked_not_dropped():
     """Unfunded means stop quoting, never stop tending. Its inventory still
     needs merging, marking out and reconciling."""
     base = load_cfg()
-    poor = _state(cid="poor", income=0.25, base=base)
-    rich = _state(cid="rich", income=9.0, base=base)
+    poor = _state(cid="poor", income=0.25, theirs=400_000.0, base=base)
+    rich = _state(cid="rich", income=9.0, theirs=612.0, base=base)
     states = [poor, rich]
     reallocate(states, base)
     assert len(states) == 2                       # nothing removed

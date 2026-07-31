@@ -17,7 +17,9 @@ class MakerConfig:
     series_slug: str = "btc-up-or-down-5m"
 
     # --- virtual account --------------------------------------------------
-    bankroll_usd: float = 5000.0
+    # Fresh paper run wallet. This is the total simulated capital available,
+    # not a promise that the allocator may commit every dollar at once.
+    bankroll_usd: float = 1000.0
 
     # --- objective --------------------------------------------------------
     # "pair"    : the original bet -- rest under the ask, try to buy a hedged
@@ -119,7 +121,8 @@ class MakerConfig:
     widen_offset: float = 0.035
     # Marginal $/day per $ committed, below which capital is better left idle.
     marginal_return_floor: float = 0.02
-    allocation_budget: float = 1200.0
+    # Leave wallet headroom for inventory and order-lifecycle timing.
+    allocation_budget: float = 900.0
     # Set per-market by the fleet each cycle: NORMAL | WIDENED | EXITED.
     gate_state: str = "NORMAL"
 
@@ -244,7 +247,7 @@ class MakerConfig:
     # $800 is roughly half the observed exposure, which halves the swing while
     # leaving room for the light side to keep flattening. It costs rent:
     # capped markets quote one-sided and score at 1/c, c=3.0.
-    max_fleet_naked_usd: float = 800.0
+    max_fleet_naked_usd: float = 400.0
     # Current fleet-wide unhedged cost, injected each cycle by the fleet
     # runner. Zero here so a single-market bot (strategy.main) is unaffected --
     # it has no fleet to be over budget.
@@ -267,7 +270,7 @@ class MakerConfig:
     # Counts inventory cost PLUS resting offer notional, because both are
     # dollars that are spoken for. $2,000 leaves room above the observed
     # working set without permitting another $9.5k drift.
-    max_committed_usd: float = 2000.0
+    max_committed_usd: float = 1000.0
     # Injected each cycle by the fleet runner, same pattern as fleet_naked_usd.
     # Zero for a single-market bot, which has no fleet to total up.
     committed_usd: float = 0.0

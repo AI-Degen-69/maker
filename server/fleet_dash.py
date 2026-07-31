@@ -14,10 +14,17 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
+from strategy import store
+from strategy.config import load as load_config
 
 ROOT = Path(__file__).resolve().parent.parent
 RUN = ROOT / "run"
 DB = RUN / "fleet.db"
+CFG = load_config()
+# A 20-market sweep normally takes about 50-70 seconds at the public-book
+# polling interval. Give one slow sweep room before calling the fleet dead;
+# otherwise a healthy fleet flashes STALE between every state-file write.
+STALE_AFTER_SEC = 120.0
 
 app = FastAPI(title="maker fleet")
 
@@ -42,6 +49,25 @@ def _run_started() -> float | None:
     except Exception:
         # A brand-new DB has no reward_samples table yet. That is "not started",
         # not an error worth surfacing on the page.
+        return None
+
+
+def _db_heartbeat() -> float | None:
+    """Most recent write timestamp from the fleet DB, if it has started."""
+    if not DB.exists():
+        return None
+    try:
+        c = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+        row = c.execute(
+            "SELECT MAX(ts) FROM ("
+            "SELECT ts FROM reward_samples "
+            "UNION ALL SELECT ts FROM fill_evidence "
+            "UNION ALL SELECT ts FROM live_state"
+            ")"
+        ).fetchone()
+        c.close()
+        return row[0] if row and row[0] else None
+    except Exception:
         return None
 
 
@@ -246,6 +272,15 @@ def fleet():
     hist = _db_stats()
     mk = _markout_stats()
     now = time.time()
+    live_ts = max((s.get("_live", {}).get("ts", 0) or 0
+                   for s in specs), default=0.0)
+    db_ts = _db_heartbeat() or 0.0
+    # The state file is the primary fleet heartbeat: it is written only after
+    # a complete sweep. DB writes are useful diagnostics, but historical DB
+    # activity must not make a dead fleet look LIVE.
+    heartbeat_ts = live_ts or (f.stat().st_mtime if f.exists() else 0.0)
+    state_age = now - heartbeat_ts if heartbeat_ts else None
+    fleet_stale = state_age is None or state_age > STALE_AFTER_SEC
 
     rows = []
     for s in specs:
@@ -258,7 +293,13 @@ def fleet():
             "max_spread": s["max_spread"],
             "share": live.get("share", 0.0),
             "income": live.get("income", 0.0),
+            # `capital` is resting offers only. `committed` includes offers
+            # plus inventory cost, so the table uses the same denominator as
+            # the wallet gauge instead of silently understating exposure.
             "capital": live.get("capital", 0.0),
+            "committed": (live.get("capital", 0.0)
+                          + (live.get("naked_cost", 0.0) or 0.0)
+                          + (live.get("pair_paid", 0.0) or 0.0)),
             "quotes": live.get("quotes", []),
             "fills": h.get("fills", 0),
             "uptime": h.get("uptime", 0.0),
@@ -342,6 +383,9 @@ def fleet():
     # what selling out actually raises if it happened this second.
     naked_exit_total = sum(r["naked_exit_value"] for r in rows)
     unfunded = [r for r in rows if not (r["daily"] or 0) > 0]
+    committed_total = cap + at_risk + sum(r["pair_paid"] or 0 for r in rows)
+    available_cash = max(0.0, CFG.bankroll_usd - committed_total)
+    committed_overage = max(0.0, committed_total - CFG.max_committed_usd)
 
     return {
         "now": now,
@@ -365,38 +409,36 @@ def fleet():
             "locked_pair": locked,
             "at_risk": at_risk,
             "net_worst": rz["realized"] + locked - at_risk,
-            # Liquidate everything right now: booked P&L, plus pairs merged
-            # for $1 each (always available, no need to wait for
-            # resolution), plus naked shares sold at today's best bid minus
-            # what they cost. Distinct from net_worst, which prices naked
-            # shares at $0 -- the resolution floor, not a sellable price.
+            # Liquidate & cancel everything: booked P&L + pairs merged ($1 each)
+            # + naked shares sold at current bid - cost of naked shares.
             "liquidate_now_pnl": rz["realized"] + locked
                                  + (naked_exit_total - at_risk),
+            # Cash currently locked in active limit orders (released 100% on cancel)
+            "locked_bids_cash": cap,
             "markout_total": mk["total"],
             "markout_spread": mk["spread"],
             "markout_n": mk["n"],
-            "fleet_naked_budget": 800.0,
+            "fleet_naked_budget": CFG.max_fleet_naked_usd,
+            "wallet": CFG.bankroll_usd,
+            "committed_total": committed_total,
+            "available_cash": available_cash,
+            "committed_overage": committed_overage,
+            "max_committed": CFG.max_committed_usd,
+            "state_age": state_age,
+            "db_age": (now - db_ts) if db_ts else None,
+            "heartbeat_ts": heartbeat_ts or None,
+            "fleet_stale": fleet_stale,
             "exited": len([r for r in rows if r["gate"] == "EXITED"]),
             "widened": len([r for r in rows if r["gate"] == "WIDENED"]),
             "capital": cap,
-            # NOTE: `cap` counts money resting in UNFILLED offers only, so this
-            # answers "what do my resting offers earn", not "what does my
-            # bankroll earn". Measured 2026-07-30: 1.80%/day on $1,369 of
-            # offers while $9,588 had actually left the wallet -- 0.256%/day
-            # against the real denominator. U3 bounds that total; until it
-            # does, read this ratio for what it is.
-            "return_pct_day": (100 * inc / cap) if cap else 0.0,
-            # U2. Capital that went back to work instead of sitting until 2027.
+            # Honest wallet return: offers-only was the old misleading
+            # denominator. Open inventory is committed capital too.
+            "return_pct_day": (100 * inc / committed_total)
+                               if committed_total else 0.0,
             "merged_shares": merged_total,
             "recycled_usd": sum(r["recycled_usd"] for r in rows),
-            # Fleet-wide pairing rate: merged pairs over shares actually
-            # filled. Deliberately NOT over `fills`, which is a count of fill
-            # events -- dividing shares by events would produce a ratio with no
-            # meaning that still looks plausible. None until something fills.
             "pairing_rate": ((merged_total / vr["verified_shares"])
                              if vr["verified_shares"] > 1e-9 else None),
-            # U1. The Phase A decision-gate number, on the dashboard because a
-            # figure that lives only in the database is a figure nobody reads.
             "verified": vr,
             "funded_total": sum(r["daily"] for r in rows),
             "fills": sum(r["fills"] for r in rows),
@@ -457,7 +499,7 @@ PAGE = r"""<!doctype html>
  .hero-eyebrow{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--tx-dim);font-weight:600}
  .hero-value{font-family:var(--disp);font-size:44px;font-weight:700;line-height:1.05;margin-top:8px;
              transition:color .3s ease}
- .hero-sub{font-size:12px;color:var(--tx-dim);margin-top:6px;max-width:30ch}
+ .hero-sub{font-size:12px;color:var(--tx-dim);margin-top:6px;max-width:32ch}
  .hero-spark{width:100%;height:36px;margin-top:14px;display:block}
  .hero-rail{background:var(--panel);padding:24px 28px;display:flex;flex-direction:column;gap:14px}
  .hero-rail-hdr{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--tx-dim);font-weight:600}
@@ -516,13 +558,14 @@ PAGE = r"""<!doctype html>
   </span>
   <span style="flex:1"></span>
   <span id="live" class="live"></span>
+  <span id="health" class="live"></span>
   <span id="clock" class="clock"></span>
 </header>
 <section class="hero">
   <div class="hero-main">
-    <div class="hero-eyebrow">If liquidated right now</div>
+    <div class="hero-eyebrow">Net Liquidation P&L</div>
     <div class="hero-value" id="heroValue">$0.00</div>
-    <div class="hero-sub">Realized, plus pairs merged for $1, plus naked shares sold at today's best bid</div>
+    <div class="hero-sub">Realized P&L + pairs merged ($1) + naked shares sold at best bid (bids release 100% cash)</div>
     <svg class="hero-spark" id="heroSpark" viewBox="0 0 300 36" preserveAspectRatio="none"></svg>
   </div>
   <div class="hero-rail">
@@ -531,7 +574,7 @@ PAGE = r"""<!doctype html>
   </div>
 </section>
 <div class="gauge-strip">
-  <div class="gauge-label">Exposure budget</div>
+  <div class="gauge-label">Wallet committed</div>
   <div class="gauge-track"><div class="gauge-fill" id="gaugeFill"></div><div class="gauge-cap" id="gaugeCap"></div></div>
   <div class="gauge-value" id="gaugeValue"></div>
 </div>
@@ -540,17 +583,12 @@ PAGE = r"""<!doctype html>
 <div class="wrap"><table id="tbl">
  <thead><tr>
   <th>Market</th>
-  <th class="num">Our $/day</th>
-  <th class="num">Rent collected</th>
-  <th>Inventory</th>
-  <th>Financials</th>
-  <th style="width:300px">Where our offers sit</th>
-  <th class="num">Capital</th>
-  <th class="num">Our slice</th>
-  <th class="num">Funds $/day</th>
-  <th class="num">Qualifying</th>
+  <th class="num">Projected / day</th>
+  <th class="num">Committed</th>
+  <th>Position / risk</th>
+  <th class="num">Score share</th>
+  <th class="num">Uptime</th>
   <th class="num">Fills</th>
-  <th class="num">Cost per fill</th>
   <th>Status</th>
  </tr></thead><tbody id="rows"></tbody></table></div>
 <script>
@@ -677,6 +715,7 @@ async function tick(){
   if(s.error){
     $('exp').textContent = s.error;
     $('exp').style.display = 'block';
+    $('health').innerHTML = '<span class="alert-tx">● OFFLINE</span>';
     return;
   } else {
     $('exp').style.display = 'none';
@@ -684,7 +723,15 @@ async function tick(){
 
   const t=s.totals;
   const activeCount = s.markets.filter(m => (m.income || 0) > 0).length;
-  $('live').innerHTML = `<span class="${activeCount > 0 ? 'up' : 'down'}">● ${activeCount}/${t.markets} markets generating rent</span>`;
+  const healthy = !t.fleet_stale;
+  $('live').innerHTML = `<span class="${activeCount > 0 ? 'up' : 'down'}">● ${activeCount}/${t.markets} scoring</span>`;
+  $('health').innerHTML = healthy
+    ? '<span class="up">● LIVE</span>'
+    : `<span class="alert-tx">● STALE · ${hms(t.state_age)}</span>`;
+  if(!healthy){
+    $('exp').textContent = `Fleet heartbeat is stale (${hms(t.state_age)} old). Displayed figures are historical, not live.`;
+    $('exp').style.display = 'block';
+  }
 
   // ---- hero: the one number, its trend, and who's carrying it ----
   const hv=$('heroValue');
@@ -702,89 +749,69 @@ async function tick(){
     </div>`).join('') || '<span class="dim" style="font-size:12px">No markets reporting yet</span>';
 
   // ---- exposure gauge ----
-  const budgetPct = Math.min(100, 100*t.at_risk/t.fleet_naked_budget);
-  const budgetAlert = t.at_risk >= t.fleet_naked_budget;
+  const budgetPct = t.wallet > 0 ? Math.min(100, 100*t.committed_total/t.wallet) : 0;
+  const capPct = t.wallet > 0 ? Math.min(100, 100*t.max_committed/t.wallet) : 100;
+  const budgetAlert = t.committed_total >= t.max_committed;
   const gf=$('gaugeFill');
   gf.style.width = budgetPct+'%';
   gf.style.background = budgetAlert ? 'var(--alert)' : (budgetPct>70?'var(--down)':'var(--up)');
-  $('gaugeCap').style.left = '100%';
-  $('gaugeValue').innerHTML = `<span class="${budgetAlert?'alert-tx bold':'dim'}">${usd(t.at_risk,0)} / ${usd(t.fleet_naked_budget,0)}</span>`+
-    (budgetAlert ? ' <span class="alert-tx">· over budget, flattening only</span>' : '');
+  $('gaugeCap').style.left = capPct+'%';
+  $('gaugeValue').innerHTML = `<span class="${budgetAlert?'alert-tx bold':'dim'}">${usd(t.committed_total,0)} / ${usd(t.wallet,0)}</span>`+
+    (budgetAlert ? ` <span class="alert-tx">· ${usd(t.committed_overage,0)} over cap</span>` : ` · ${usd(t.available_cash,0)} available`);
 
   const K=(n,v,sub,cl,isAlert)=>`<div class="k ${isAlert?'alert':''}"><div class="n">${n}</div>
     <div class="v ${cl||''}">${v}</div><div class="s">${sub||''}</div></div>`;
   const renderGroup = (title, tiles) => `<div><div class="kpi-hdr">${title}</div><div class="kpi-group">${tiles.join('')}</div></div>`;
 
   const t_pl = [
-    K('Realized P&L',usd(t.realized), (t.settled?t.settled+' settled · '+t.wins+'W/'+t.losses+'L':'nothing settled yet')+(t.closes?' · incl. '+t.closes+' early close'+(t.closes===1?'':'s'):''), (t.settled||t.closes)?cls(t.realized):'dim'),
-    K('Rent collected',usd(t.collected_rent_total), 'total historical rent earned across fleet','gold'),
-    K('Early closes (sim)',usd(t.closed_pnl), t.closes?t.closes+' closed · forgave '+usd(t.closed_forgone)+' vs holding to settlement':'none yet', t.closes?cls(t.closed_pnl):'dim'),
-    K('Rent projected',usd(t.income_day)+'/day', usd(t.income_hour)+'/hr forecast at current share','proj'),
-    K('Return projected',t.return_pct_day.toFixed(2)+'%/day', 'rent forecast over capital committed','proj')
+    K('Projected reward',usd(t.income_day)+'/day','modelled at current score share','proj'),
+    K('Realized P&L',usd(t.realized),(t.settled?t.settled+' settled':'no settlement yet')+(t.closes?' · '+t.closes+' early close'+(t.closes===1?'':'s'):''),(t.settled||t.closes)?cls(t.realized):'dim'),
+    K('Estimated collected',usd(t.collected_rent_total),'projection, not a wallet credit','gold'),
+    K('Wallet available',usd(t.available_cash,0),'$'+usd(t.wallet,0).replace('$','')+' simulated wallet','up'),
+    K('Capital return',t.return_pct_day.toFixed(2)+'%/day','projected reward / wallet committed','proj')
   ];
 
   const t_risk = [
-    K('At risk (naked)',usd(t.at_risk,0), activeCount > 0 ?'unpaired shares, pay $1 or $0':'stale reporting', activeCount > 0 ?(t.at_risk>0?'down':'up'):'dim'),
-    K('Net if all naked lose',usd(t.net_worst),'worst case on today’s book', cls(t.net_worst)),
-    K('Locked (paired)',usd(t.locked_pair), activeCount > 0 ?'pairs always pay $1 - won':'stale reporting', activeCount > 0 ?(t.locked_pair>0?'up':'dim'):'dim'),
-    K('Markets backed off', t.widened + ' / ' + t.exited, 'widened / exited on bad fills', (t.exited > 0 ? 'down' : (t.widened > 0 ? 'down' : 'up')), t.exited>0),
-    K('Spread captured', t.markout_n >= 20 ? usd(t.markout_spread) : 'measuring…', '2c entry discount', t.markout_n >= 20 ? 'gold' : 'dim'),
-    K('Drift after fill', t.markout_n >= 20 ? usd(t.markout_total) : 'measuring…', t.markout_n + ' fills priced - negative = picked off', t.markout_n >= 20 ? cls(t.markout_total) : 'dim')
+    K('Committed',usd(t.committed_total,0),`of ${usd(t.wallet,0)} simulated wallet`,t.committed_total>=t.max_committed?'alert-tx':'dim',t.committed_total>=t.max_committed),
+    K('At risk (naked)',usd(t.at_risk,0),'unpaired inventory can pay $0','down'),
+    K('Worst case',usd(t.net_worst),'realized + locked pairs − naked cost',cls(t.net_worst)),
+    K('Paired inventory',usd(t.locked_pair),'matched shares valued at $1','up'),
+    K('Markout sample',String(t.markout_n),'fills with a matured horizon',t.markout_n>=20?'up':'dim'),
+    K('Markets exited',String(t.exited),'after adverse-selection evidence',t.exited?'down':'up',t.exited>0)
   ];
 
   const t_cap = [
-    K('Capital used',usd(t.capital,0),'money tied up in offers','dim'),
-    K('Markets earning',t.scoring+' / '+t.markets, t.unfunded?t.unfunded+' unfunded (rent $0)':'0 = quoting but not scoring', t.unfunded?'down':(t.scoring===t.markets?'up':'dim')),
-    K('Qualifying time',pct(t.uptime),'% of checks earning rent', thresh(t.uptime,true,0.8)),
-    K('Fills',String(t.fills),'offers taken - watch for losses','dim'),
-    K('Pool available',usd(t.funded_total,0)+'/day','total funded by venue','dim'),
-    K('Concentration',pct(t.concentration),'share from best market', thresh(t.concentration,false,0.5))
+    K('Offers locked',usd(t.capital,0),'current simulated resting cash','gold'),
+    K('Markets scoring',t.scoring+' / '+t.markets,'positive projected reward',t.scoring?'up':'dim'),
+    K('Scoring uptime',pct(t.uptime),'checks with non-zero score',thresh(t.uptime,true,0.8)),
+    K('Fills',String(t.fills),'tape-confirmed + crossed','dim'),
+    K('Naked budget',usd(t.fleet_naked_budget,0),'hard fleet risk ceiling','dim'),
+    K('Data health',healthy?'LIVE':'STALE',healthy?'heartbeat < 120s':'do not trust live figures',healthy?'up':'alert-tx',!healthy)
   ];
 
   $('agg').innerHTML = renderGroup('Profit &amp; loss', t_pl) + renderGroup('Risk &amp; exposure', t_risk) + renderGroup('Capital &amp; operations', t_cap);
 
   $('rows').innerHTML=s.markets.map(m=>{
-    const q=ladder(m)+capBar(m);
-
     const currentIncome = (m.income || 0);
     const isGenerating = currentIncome > 0;
-
-    let statusHtml = '';
-    if (m.err) {
-      statusHtml = `<span class="down bold">${m.err}</span>`;
-    } else if (isGenerating) {
-      statusHtml = `<span class="up bold">Active</span>`;
-    } else {
-      let reason = m.why || 'Not scoring';
-      if (m.daily === 0 || m.daily == null) {
-        reason = 'Market unfunded ($0/day)';
-      } else if (m.uptime < 0.1) {
-        reason = 'Not on the board (0% uptime)';
-      }
-      statusHtml = `<span class="down" style="font-size:12px;" title="${reason}">${reason}</span>`;
-    }
-
-    const inv = posBar(m);
-    const fin = finBox(m);
-    const rowAlert = m.gate === 'EXITED';
-
-    return `<tr class="${rowAlert ? 'alert' : ''}">
-      <td style="max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${m.title}">${m.url?`<a class="mkt-link" href="${m.url}" target="_blank">${m.title}</a>`:m.title}</td>
+    const risk = m.naked_sh || 0;
+    const position = risk > 0
+      ? `<span class="down bold">${risk.toFixed(0)} ${m.naked_side || 'naked'}</span><br><span class="dim">risk ${usd(m.naked_cost,0)}</span>`
+      : (m.paired > 0 ? `<span class="up bold">${m.paired.toFixed(0)} paired</span>` : '<span class="dim">flat</span>');
+    let statusHtml = m.err
+      ? `<span class="down bold">${m.err}</span>`
+      : (m.gate === 'EXITED' ? '<span class="down bold">EXITED</span>'
+      : (isGenerating ? '<span class="up bold">SCORING</span>' : `<span class="dim">${m.why || 'not scoring'}</span>`));
+    return `<tr class="${m.gate === 'EXITED' ? 'alert' : ''}">
+      <td style="max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${m.title}">${m.url?`<a class="mkt-link" href="${m.url}" target="_blank">${m.title}</a>`:m.title}</td>
       <td class="num bold mono ${isGenerating ? 'up' : 'dim'}" style="font-size:15px">${usd(currentIncome)}</td>
-      <td class="num bold mono gold" style="font-size:14px">${usd(m.collected_rent)}</td>
-      <td>${inv}</td>
-      <td>${fin}</td>
-      <td class="dim">${q}</td>
-      <td class="num mono">${usd(m.capital,0)}</td>
-      <td class="num mono dim">${pct(m.share,2)}</td>
-      <td class="num mono">${usd(m.daily,0)}</td>
+      <td class="num mono" title="Offers ${usd(m.capital,0)}">${usd(m.committed,0)}</td>
+      <td>${position}</td>
+      <td class="num mono">${pct(m.share,1)}</td>
       <td class="num mono ${thresh(m.uptime,true,0.8)}">${pct(m.uptime,0)}</td>
       <td class="num mono dim">${m.fills}</td>
-      <td class="num mono ${m.markout==null?'dim':(m.markout<0?'down':'up')}">${
-        m.markout==null?'-':(m.markout>=0?'+':'')+(100*m.markout).toFixed(2)+'¢'
-      }<span class="dim" style="font-size:11px"> · ${m.markout_n||0}</span></td>
       <td>${statusHtml}</td>
-      </tr>`;
+    </tr>`;
   }).join('');
 }
 tick(); setInterval(tick,4000);

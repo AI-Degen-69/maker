@@ -512,7 +512,11 @@ def mark_cancelled(quote_ids: list[int]) -> None:
     if not quote_ids:
         return
     with db() as c:
-        c.executemany("UPDATE quotes SET cancelled=1 WHERE id=? AND filled=0",
+        # Cancellation is a lifecycle transition, not an assertion that the
+        # order was never filled. A partially filled crossed hedge or a maker
+        # order that filled before requoting still has an unfilled residual;
+        # mark the row cancelled while preserving its `filled` amount.
+        c.executemany("UPDATE quotes SET cancelled=1 WHERE id=?",
                       [(q,) for q in quote_ids])
 
 

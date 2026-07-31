@@ -366,3 +366,83 @@ subdirectory. The live fleet pipeline runs unchanged on port 8800.
 
 **Verdict.** PARKED — preserved, not deleted; not running on the live host;
 recoverable from the archive branch by checkout.
+
+### Session 5 — 2026-07-31: fresh $1,000 paper fleet and dashboard audit
+
+**Question.** Can the live fleet be restarted with a clean $1,000 simulated wallet while keeping the dashboard's headline numbers honest and easy to scan?
+
+**Method.** Reduced the dashboard to a hierarchy of liquidation P&L, projected reward, wallet commitment, naked risk, realized P&L, and data health. Replaced the hard-coded $800 naked-budget display with config, changed projected return to use total committed capital rather than resting offers alone, added per-market committed exposure, and made the heartbeat use both fleet state and recent DB writes. Added `-FreshRun` startup behavior that archives the prior SQLite database/sidecars and stale state file before launching the supervisor.
+
+**Result.** The previous run remains preserved; the new process is started against a clean `run/fleet.db` with `bankroll_usd = $1,000`, `allocation_budget = $900`, `max_committed_usd = $1,000`, and `max_fleet_naked_usd = $400`. Dashboard parser and focused strategy/dashboard tests pass. Projected reward remains explicitly labeled as a model, while realized P&L remains zero until a close or settlement exists.
+
+**Verdict.** LIVE — clean paper run and dashboard are operational; profitability remains OPEN pending verified fills and realized outcomes.
+
+### Session 6 — 2026-07-31: committed-cap overshoot caught and bounded
+
+**Question.** Does the new $1,000 cap remain true when an allocation changes an existing order size or an emergency hedge crosses the book?
+
+**Method.** Audited the first fresh-run sweep and found $1,036.80 committed despite the $1,000 cap: the allocator sized new quotes, but the live order reservation used a stale pre-visit total and retained old-size orders. Added post-cancellation reservation immediately before resting each order, resized stale orders, and applied the same affordable-notional calculation to emergency crossed hedges.
+
+**Result.** After the guard, a fresh validation run stayed below the cap: the observed committed total fell from $1,036.80 to $367 and then $256 as the fleet reallocated, with no inventory fills. The dashboard exposes both committed total and any over-cap amount instead of hiding a violation.
+
+**Verdict.** LIVE — cap enforcement is now bounded in the paper engine; the fill and realized-P&L experiment remains OPEN.
+
+### Session 7 — 2026-07-31: fleet-wide cap context made explicit
+
+**Question.** Does the hard cap still work when `visit()` is called from the fleet loop rather than a single-market test helper?
+
+**Method.** Reviewed the emergency-hedge and resting-order reservation paths after the cap fix. The affordability calculation was made explicit about its state scope: the fleet runner passes all `MarketState` objects, while direct single-market callers retain a safe one-state default. Recompiled the strategy and reran all tests before restarting the paper sample.
+
+**Result.** The cap calculation no longer depends on an undefined local `states` name, and both crossed hedges and new resting orders use the complete fleet committed total when invoked by `main()`. The single-market compatibility path remains bounded to that market rather than silently guessing a fleet total.
+
+**Verdict.** LIVE — scope bug fixed; fill and realized-P&L evidence remains OPEN.
+
+### Session 8 — 2026-07-31: heartbeat threshold aligned with sweep cadence
+
+**Question.** Does the dashboard mark a healthy 20-market fleet stale while it is still completing its normal sweep?
+
+**Method.** Compared the dashboard heartbeat threshold with the observed paper-run cadence. A complete sweep was taking roughly 50–70 seconds, while the 45-second threshold was shorter than one normal sweep and could flash STALE between state-file writes. Increased the threshold to 120 seconds, leaving the state-file heartbeat as the primary liveness signal.
+
+**Result.** The dashboard now allows one slow sweep to complete before declaring the fleet stale, while still exposing state age and DB age for diagnosis. This changes presentation/health classification only; it does not relax the strategy's capital or risk limits.
+
+**Verdict.** LIVE — health indicator aligned with observed polling cadence; fill and realized-P&L evidence remains OPEN.
+
+### Session 9 — 2026-07-31: cancellation lifecycle kept in the ledger
+
+**Question.** Do hard-cap cancellations and partial emergency hedges leave the database's historical quote state consistent with the paper engine?
+
+**Method.** Attached each simulated resting order to its persisted quote ID, marked released orders cancelled when emergency hedging or requoting removes them, and marked the residual of a shallow crossed hedge cancelled after the filled portion is logged. Recompiled and reran fill, quote, and dashboard tests.
+
+**Result.** The in-memory order lifecycle and the `quotes` table now agree: cancelled offers are not presented as still open, while filled crossed portions remain recorded as fills. The final paper run must be restarted because this lifecycle change invalidates the prior sample.
+
+**Verdict.** LIVE — ledger lifecycle is aligned; fill and realized-P&L evidence remains OPEN.
+
+### Session 10 — 2026-07-31: filled quote rows retain their source order
+
+**Question.** Does the quote ledger stay accurate when a resting simulated order fills before it is cancelled or resized?
+
+**Method.** Propagated each resting order's persisted quote ID into tape-confirmed `Fill` records, passed that ID to `store.log_fill`, and changed cancellation to preserve the `filled` amount while marking the remaining lifecycle closed. Recompiled and reran the full test suite.
+
+**Result.** Maker fills now update the originating quote row instead of leaving it open with `filled = 0`; cancellation also works for partially filled rows. The next fresh paper run will therefore keep quote, fill, and active-order metrics aligned.
+
+**Verdict.** LIVE — quote attribution and partial-cancel accounting are aligned; fill and realized-P&L evidence remains OPEN.
+
+### Session 11 — 2026-07-31: launcher waits for a clean handoff
+
+**Question.** Can a `-FreshRun` or restart accidentally archive a live database or race the old dashboard on port 8800?
+
+**Method.** Replaced the launcher’s hard-coded checkout path with a path derived from `$PSScriptRoot`, and added a bounded wait after process termination. The script now refuses to archive or restart if fleet children remain or port 8800 is still listening.
+
+**Result.** Startup is checkout-portable and fails closed instead of mixing old and new writers. The active paper run was restarted without `-FreshRun` after the final UI edit, preserving its clean sample while reloading the dashboard process.
+
+**Verdict.** LIVE — restart handoff is guarded; fill and realized-P&L evidence remains OPEN.
+
+### Session 12 — 2026-07-31: quote-row cancellation behavior covered by a regression test
+
+**Question.** Does cancelling a partially filled quote preserve the filled quantity while closing only its remaining lifecycle?
+
+**Method.** Added an isolated store test that creates a 100-share quote, records a 25-share tape-confirmed fill, calls `mark_cancelled`, and reads the row back from SQLite. Ran the full test suite and compile checks.
+
+**Result.** The row remains `filled = 25` and becomes `cancelled = 1`; the database no longer loses the executed portion when an order is released. This protects the crossed-hedge and requote accounting used by the live paper process.
+
+**Verdict.** LIVE — partial-cancel accounting is now directly tested; fill and realized-P&L evidence remains OPEN.

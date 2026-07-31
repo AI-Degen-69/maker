@@ -25,7 +25,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from strategy import gate, markout, merge, profit_take, rewards, store
-from strategy.allocate import allocate, capital_scarcity, shares_for
+from strategy.allocate import allocate_fundable, capital_scarcity, shares_for
 from strategy.config import load as load_cfg
 from strategy.fills import QueueFillEngine
 from strategy.main import full_book, recent_trades
@@ -229,6 +229,23 @@ def fleet_naked_cost(states) -> float:
     return total
 
 
+def _affordable_cross_size(book_asks: dict, requested: float,
+                           available_usd: float) -> float:
+    """Maximum taker-hedge size whose ask notional fits the cap."""
+    remaining = min(float(requested), sum(float(v) for v in book_asks.values()))
+    budget = max(float(available_usd), 0.0)
+    size = 0.0
+    for price in sorted(book_asks):
+        if remaining <= 1e-9 or budget <= 1e-9:
+            break
+        depth = max(float(book_asks.get(price, 0.0)), 0.0)
+        take = min(depth, remaining, budget / price) if price > 0 else 0.0
+        size += take
+        remaining -= take
+        budget -= take * price
+    return size
+
+
 def fleet_committed_cost(states) -> float:
     """Every dollar that has left the wallet or is spoken for.
 
@@ -267,49 +284,60 @@ def reallocate(states, base) -> dict:
     worse than capital sitting idle.
     """
     obs = []
-    ineligible: set[str] = set()
     floor = base.reward_min_payout_usd * base.reward_floor_multiple
     for s in states:
-        live = s.spec.get("_live") or {}
-        share, capital = live.get("share"), live.get("capital")
-        if not share or not capital:
-            continue
-
-        # REWARD ELIGIBILITY. Polymarket pays nothing below $1 per
-        # distribution, so a market projecting under the floor is not a small
-        # earner -- it is committed capital earning exactly zero. 16 of 20
-        # markets were in that state on 2026-07-30 while the fleet kept funding
-        # every one of them.
+        # SIZE OFF THE COMPETITION, NOT OFF OUR OWN ORDERS.
         #
-        # Unfunded, NOT dropped: the market stays in `states` so its inventory
-        # is still merged, marked out and reconciled. Removing it here would
-        # strand a real position with nothing tending it.
-        if (live.get("income") or 0.0) < floor:
-            ineligible.add(s.cid)
-            continue
-
-        # Averaged competing depth, not the instantaneous reading. A single
-        # snapshot is what sized the fleet off a competing score of 35 for a
-        # market that measured 3,727. `share` is inverted back out of the
-        # average so the allocator's own competitor_depth() sees a stable
-        # number instead of whatever the book happened to be this second.
+        # `_live["share"]`, `["capital"]` and `["income"]` are all measured
+        # from our resting orders, so all three read zero the moment a market
+        # is defunded -- and this function used to consult exactly those. A
+        # market defunded for earning nothing then reported nothing, was
+        # skipped for having no share, and could never be funded again. One
+        # way. Measured on the 13.4h run of 2026-07-30: samples scoring
+        # anything decayed from 67/219 to 0/190, and the fleet posted its last
+        # quote at T+8.1h while continuing to poll for another five hours.
+        #
+        # `theirs` is the input that survives, because it is scored over the
+        # whole book whether or not we are in it -- Taylor Swift still
+        # measured 1,504 while we quoted nothing at all. Averaged, not
+        # instantaneous: one snapshot read 35 for a market that measured 3,727
+        # and sized the entire fleet off it.
         avg_theirs = s.avg_theirs()
-        ours = live.get("ours") or 0.0
-        if avg_theirs is not None and (ours + avg_theirs) > 0:
-            share = ours / (ours + avg_theirs)
+        if avg_theirs is None:
+            continue        # never sampled -- keep its size rather than guess
 
-        obs.append({"cid": s.cid, "daily": s.daily,
-                    "capital": capital, "share": share})
+        # A score converts to dollars through the per-share score, since a
+        # pair costs ~$1 and N dollars therefore buys ~N shares a side. Any
+        # reference capital returns the same competitor depth out of
+        # competitor_depth() -- it cancels -- so this is a change of units,
+        # not an assumption about size.
+        k = rewards.score_per_share(s.cfg.max_spread_from_mid,
+                                    s.cfg.reward_offset)
+        ref = 100.0
+        ours_ref = ref * k
+        total = ours_ref + avg_theirs
+        obs.append({"cid": s.cid, "daily": s.daily, "capital": ref,
+                    "share": (ours_ref / total) if total > 0 else 1.0,
+                    "min_dollars": float(s.spec["min_size"])})
 
-    # Defund the ineligible even when NOTHING is fundable. Returning early on
-    # an empty `obs` would skip the zeroing loop below, so a fleet where every
-    # market had fallen under the payout floor would keep quoting all of them
-    # -- the exact case the floor exists for.
-    if not obs and not ineligible:
+    if not obs:
         return {}
 
-    dollars = (allocate(obs, base.allocation_budget,
-                        base.marginal_return_floor) if obs else {})
+    # REWARD ELIGIBILITY, applied inside the allocation rather than ahead of
+    # it. Polymarket pays nothing below $1 per distribution, so a market
+    # projecting under the floor is not a small earner -- it is committed
+    # capital earning exactly zero, and 16 of 20 markets were in that state on
+    # 2026-07-30 while the fleet funded every one.
+    #
+    # Judged at the size actually allocated, because income is monotone in
+    # size: the same market that fails the floor at its 100-share minimum
+    # clears it 3.6x over at the 600 shares the budget affords.
+    #
+    # Unfunded, NOT dropped: the market stays in `states` so its inventory is
+    # still merged, marked out and reconciled. Removing it here would strand a
+    # real position with nothing tending it.
+    dollars = allocate_fundable(obs, base.allocation_budget,
+                                base.marginal_return_floor, floor)
 
     # Whether the BUDGET, rather than the floor, is what stopped the water-fill
     # while a market was still returning well above the floor. That is the only
@@ -328,20 +356,16 @@ def reallocate(states, base) -> dict:
         # one whose locked capital we most want released.
         s.cfg = replace(s.cfg, capital_scarce=scarce)
 
-        # Below the payout floor: quote NOTHING. Two different reasons a
-        # market is absent from `dollars` and they need opposite treatment.
-        # An unmeasured market keeps its current size (sizing it off a guess
-        # is worse than leaving it alone); an INELIGIBLE one has been measured
-        # and cannot pay, so leaving it at its startup size funds a market
-        # known to earn zero.
+        # Absent from `dollars` means never sampled, and only that -- a market
+        # `allocate_fundable` refused is present at 0.0. The two need opposite
+        # treatment: an unmeasured market keeps its current size (sizing it
+        # off a guess is worse than leaving it alone), while a measured market
+        # that cannot pay must be zeroed, or it keeps quoting its startup size
+        # while earning nothing.
         #
         # Caught by the smoke run, not the tests: 17 markets kept quoting 120
         # shares each while only 4 were funded, so offers alone reached $2,108
         # against a $2,000 committed cap before a single share was bought.
-        if s.cid in ineligible:
-            out[s.cid] = 0
-            s.cfg = replace(s.cfg, quote_shares=0)
-            continue
         if s.cid not in dollars:
             continue
         n = shares_for(dollars[s.cid], int(s.spec["min_size"]))
@@ -354,9 +378,14 @@ def reallocate(states, base) -> dict:
 
 
 def visit(st: MarketState, bot_cfg, now: float,
-          fleet_naked_usd: float = 0.0, committed_usd: float = 0.0) -> None:
+          fleet_naked_usd: float = 0.0, committed_usd: float = 0.0,
+          states=None) -> None:
     """One poll of one market: books -> fills -> requote -> reward sample."""
     cfg = st.cfg
+    # The single-market helper remains callable in tests; the fleet runner
+    # passes the complete state list so emergency-hedge affordability and
+    # resting-order reservation use the same fleet-wide committed total.
+    committed_states = states if states is not None else [st]
     if st.market is None:
         st.market = fetch_pinned_market(st.cid)
         if st.market is None:
@@ -425,7 +454,7 @@ def visit(st: MarketState, bot_cfg, now: float,
             store.log_fill(
                 market_slug=m.market_slug, condition_id=m.condition_id,
                 token_id=f.token_id, side=f.side, price=f.price, size=f.size,
-                quote_id=None, mid_at_post=None, edge_vs_mid=None,
+                quote_id=f.quote_id, mid_at_post=None, edge_vs_mid=None,
                 queue_waited=getattr(f, "queue_waited", 0.0),
                 seconds_to_fill=0.0, crossed=False, reason=f.reason,
             )
@@ -594,17 +623,46 @@ def visit(st: MarketState, bot_cfg, now: float,
     # real ask depth at real prices and accept a partial fill as a real result.
     crossing = [qi for qi in intents if qi.crossed]
     intents = [qi for qi in intents if not qi.crossed]
+    if crossing:
+        # A taker hedge is an exit action, not an additional resting position.
+        # Release every open bid before measuring affordability so stale offers
+        # cannot consume capacity and incorrectly block the hedge. The next
+        # requote pass below may restore only the intents that still qualify.
+        released = st.engine.open_orders()
+        for o in released:
+            o.cancelled = True
+        store.mark_cancelled([o.quote_id for o in released
+                              if o.quote_id is not None])
+
     for qi in crossing:
         book = up if qi.side == "UP" else dn
+        asks = book.get("asks") or {}
+        # Emergency hedges are the only path that can add inventory without
+        # going through the resting-order reservation below. Cap them too:
+        # the stop-loss may take a partial hedge, but it must never turn a
+        # $1,000 wallet into a larger simulated position.
+        available = max(cfg.max_committed_usd
+                       - fleet_committed_cost(committed_states), 0.0)
+        cross_size = _affordable_cross_size(asks, qi.size, available)
+        if cross_size <= 1e-9:
+            store.log_decision(
+                market_slug=m.market_slug, condition_id=m.condition_id,
+                action="EMERGENCY_HEDGE_BLOCKED", side=qi.side,
+                price=qi.price, mid=qi.mid, edge_vs_mid=qi.edge_vs_mid,
+                t_remaining=None, balance=st.inv.balance,
+                pair_cost=st.inv.pair_cost(),
+                reason=f"{qi.reason}; committed cap leaves no affordable hedge",
+            )
+            continue
         got = 0.0
         qid = store.log_quote(
             market_slug=m.market_slug, condition_id=m.condition_id,
-            token_id=qi.token_id, side=qi.side, price=qi.price, size=qi.size,
+            token_id=qi.token_id, side=qi.side, price=qi.price, size=cross_size,
             queue_ahead=0.0, mid=qi.mid, edge_vs_mid=qi.edge_vs_mid,
             t_remaining=None,
         )
-        for f in st.engine.cross(qi.token_id, qi.side, qi.size,
-                                 book.get("asks") or {}, now):
+        for f in st.engine.cross(qi.token_id, qi.side, cross_size,
+                                 asks, now):
             if f.side == "UP":
                 st.inv.up_shares += f.size
                 st.inv.up_cost += f.size * f.price
@@ -623,34 +681,67 @@ def visit(st: MarketState, bot_cfg, now: float,
                 edge_vs_mid=None, queue_waited=0.0, seconds_to_fill=0.0,
                 crossed=True, reason=f.reason,
             )
+        # A shallow ask can leave a residual portion of the capped cross
+        # unfilled. It was never a resting order, so close its quote row now;
+        # otherwise historical open-offer metrics overstate live exposure.
+        if got + 1e-9 < cross_size:
+            store.mark_cancelled([qid])
         store.log_decision(
             market_slug=m.market_slug, condition_id=m.condition_id,
             action="EMERGENCY_HEDGE", side=qi.side, price=qi.price,
             mid=qi.mid, edge_vs_mid=qi.edge_vs_mid, t_remaining=None,
             balance=st.inv.balance, pair_cost=st.inv.pair_cost(),
-            reason=f"{qi.reason}; filled {got:.0f}/{qi.size:.0f}sh",
+            reason=f"{qi.reason}; filled {got:.0f}/{cross_size:.0f}sh "
+                   f"(requested {qi.size:.0f})",
         )
         log.info("EMERGENCY_HEDGE %-28s %-4s %.0f/%.0fsh bal=%.2f",
                  st.title[:28], qi.side, got, qi.size, st.inv.balance)
 
-    want = {qi.side: round(qi.price, 4) for qi in intents}
+    # Cancel stale or resized orders before reserving the next batch. Keeping
+    # an old-size order when the allocator just reduced `quote_shares` makes
+    # the allocation advisory rather than a capital limit.
+    want = {qi.side: qi for qi in intents}
     keep = set()
+    cancelled = []
     for o in st.engine.open_orders():
-        if want.get(o.side) == o.price:
+        qi = want.get(o.side)
+        if (qi is not None and round(qi.price, 4) == o.price
+                and o.size == qi.size):
             keep.add(o.side)      # leave it alone: requoting loses queue position
         else:
             o.cancelled = True
+            cancelled.append(o.quote_id)
+    store.mark_cancelled([qid for qid in cancelled if qid is not None])
+
+    # `committed_usd` was sampled before this visit. It is useful for the
+    # decision layer, but it cannot reserve the order we are about to add.
+    # Enforce the hard wallet cap against the post-cancellation state and size
+    # each new order to the remaining dollars. A final remainder below the
+    # venue's minimum is left idle rather than creating a quote that scores 0.
+    available = max(cfg.max_committed_usd
+                       - fleet_committed_cost(committed_states), 0.0)
+    budget_blocked: list[str] = []
     for qi in intents:
         if qi.side in keep:
             continue
+        if qi.price <= 0:
+            continue
+        size = min(qi.size, int(available / qi.price))
+        if size < cfg.min_quote_shares:
+            budget_blocked.append(f"{qi.side}: committed cap leaves "
+                                 f"{size:.0f}sh < {cfg.min_quote_shares} minimum")
+            continue
         book = up if qi.side == "UP" else dn
-        o = st.engine.post(qi.token_id, qi.side, qi.price, qi.size, book["bids"], now)
-        store.log_quote(
+        o = st.engine.post(qi.token_id, qi.side, qi.price, size, book["bids"], now)
+        available -= o.price * o.size
+        o.quote_id = store.log_quote(
             market_slug=m.market_slug, condition_id=m.condition_id,
-            token_id=qi.token_id, side=qi.side, price=qi.price, size=qi.size,
+            token_id=qi.token_id, side=qi.side, price=qi.price, size=size,
             queue_ahead=o.queue_ahead, mid=qi.mid, edge_vs_mid=qi.edge_vs_mid,
             t_remaining=None,
         )
+    if budget_blocked:
+        why = "; ".join(x for x in (why, *budget_blocked) if x)
 
     bq1, bq2 = rewards.book_scores(up, dn, cfg.max_spread_from_mid,
                                    cfg.min_quote_shares)
@@ -791,7 +882,7 @@ def main() -> None:
             # them, and a cap evaluated against a stale total is a cap that
             # lets the overshoot through.
             visit(st, bot_cfg, time.time(), fleet_naked_cost(states),
-                  fleet_committed_cost(states))
+                  fleet_committed_cost(states), states)
         except Exception as e:
             log.warning("%s: %s", st.title[:30], e)
             st.err = str(e)

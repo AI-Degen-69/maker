@@ -202,6 +202,17 @@ def test_shadow_accounting_does_not_disturb_queue_position():
     assert eng2.open_orders()[0].queue_ahead == queue_after_shadow
 
 
+def test_tape_fill_retains_originating_quote_id():
+    eng = QueueFillEngine()
+    order = eng.post("T", "UP", 0.50, 100, {0.50: 0.0}, 0.0)
+    order.quote_id = 42
+    eng.on_book("T", {0.50: 0.0}, 1.0)
+    fills = eng.on_book("T", {0.50: 0.0}, 2.0,
+                       traded={0.50: 25.0})
+    assert len(fills) == 1
+    assert fills[0].quote_id == 42
+
+
 def test_tape_fills_only_past_the_queue_ahead():
     eng = _engine_with(0.50, 120, {0.50: 100.0})          # 100 ahead of us
     f1 = eng.on_book("T", {0.50: 40.0}, 2.0, traded={0.50: 60.0})

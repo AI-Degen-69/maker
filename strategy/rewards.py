@@ -29,6 +29,25 @@ def q_min(q_one: float, q_two: float) -> float:
     return max(min(q_one, q_two), max(q_one / C, q_two / C))
 
 
+def score_per_share(max_spread: float, offset: float) -> float:
+    """Score one share of a balanced two-sided quote earns at `offset`.
+
+    Answers "what WOULD we score here", which is a different question from
+    `our_scores` -- that one reads our resting orders, and a market the
+    allocator has defunded has none. Sizing off a measurement that only exists
+    while we are already funded is what latched the fleet on 2026-07-30:
+    defund once, measure zero forever, never fund again.
+
+    Balanced two-sided collapses Q_min to the single-side score -- both sides
+    are equal, so min(Q_one, Q_two) is that value and it is never below either
+    side over c. Size then cancels, leaving a per-share constant, ((v-s)/v)^2,
+    that converts a competing SCORE into the share count needed to match it.
+    At the shipped 2.0c offset in a 4.5c window it is 0.3086, so 120 shares
+    score 37.04 -- exactly what the venue reported for our 120-share quotes.
+    """
+    return order_score(max_spread, offset, 1.0, 0.0)
+
+
 def book_scores(up: dict, dn: dict, max_spread: float, min_size: float
                 ) -> tuple[float, float]:
     """(Q_one, Q_two) for everything resting in both books.

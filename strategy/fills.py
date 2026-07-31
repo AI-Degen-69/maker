@@ -71,6 +71,10 @@ class RestingOrder:
     shadow_filled: float = 0.0
     queue_ahead: float = 0.0  # shares resting ahead of us when we joined
     posted_ts: float = 0.0
+    # Database quote row corresponding to this in-memory order. Kept here so
+    # cancellation paths can close the historical row as well as the simulator
+    # order; otherwise the dashboard would report cancelled offers as open.
+    quote_id: int | None = None
     cancelled: bool = False
 
     @property
@@ -94,6 +98,7 @@ class Fill:
     price: float
     size: float
     ts: float
+    quote_id: int | None = None
     queue_waited: float = 0.0   # shares that had to clear ahead of us
     # HOW we decided this filled. The two are not equally trustworthy:
     #   'queue' -- size at our level shrank past the queue ahead of us. The
@@ -329,7 +334,8 @@ class QueueFillEngine:
         # untouched and the next sweep would claim shares already credited.
         o.shadow_filled += qty
         f = Fill(token_id=o.token_id, side=o.side, price=o.price, size=qty,
-                 ts=ts, queue_waited=o.queue_ahead, reason=reason)
+                 ts=ts, quote_id=o.quote_id, queue_waited=o.queue_ahead,
+                 reason=reason)
         self.fills.append(f)
         return f
 
