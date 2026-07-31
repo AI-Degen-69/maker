@@ -1,0 +1,40 @@
+---
+name: bugfix-with-test-update
+description: Workflow command scaffold for bugfix-with-test-update in maker.
+allowed_tools: ["Bash", "Read", "Write", "Grep", "Glob"]
+---
+
+# /bugfix-with-test-update
+
+Use this workflow when working on **bugfix-with-test-update** in `maker`.
+
+## Goal
+
+Fixes a bug in strategy logic and updates or adds a test to verify the fix.
+
+## Common Files
+
+- `strategy/fleet.py`
+- `strategy/store.py`
+- `strategy/quotes.py`
+- `tests/test_quotes.py`
+- `tests/test_rank_markets.py`
+- `tests/test_merge.py`
+
+## Suggested Sequence
+
+1. Understand the current state and failure mode before editing.
+2. Make the smallest coherent change that satisfies the workflow goal.
+3. Run the most relevant verification for touched files.
+4. Summarize what changed and what still needs review.
+
+## Typical Commit Signals
+
+- Edit implementation file(s) in strategy/ to fix the bug (e.g., fleet.py, store.py, quotes.py)
+- Update or add relevant test(s) in tests/ to cover the fixed behavior
+- Optionally update related files if the bug affects other modules
+
+## Notes
+
+- Treat this as a scaffold, not a hard-coded script.
+- Update the command if the workflow evolves materially.
