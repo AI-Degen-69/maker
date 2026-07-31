@@ -351,3 +351,88 @@ def test_ordinary_reward_quotes_are_never_marked_crossed():
                                1e9, None)
     assert intents and all(not q.crossed for q in intents)
     assert all(q.price < q.mid for q in intents)
+
+
+# --- U3: bounding what is committed, not just what is unhedged ---------------
+
+def _rw_quote(cfg, inv=None):
+    return decide_quotes(cfg, _book("UPTOK", 0.52, 0.53),
+                         _book("DNTOK", 0.46, 0.47), inv or Inventory(),
+                         1e9, None)
+
+
+def test_under_the_committed_cap_both_sides_quote():
+    intents, _ = _rw_quote(_rw(max_committed_usd=2000.0, committed_usd=500.0))
+    assert {q.side for q in intents} == {"UP", "DOWN"}
+
+
+def test_at_the_committed_cap_a_balanced_book_stops_quoting():
+    """Balanced means neither side reduces anything, so both are additions."""
+    intents, why = _rw_quote(
+        _rw(max_committed_usd=2000.0, committed_usd=2000.0))
+    assert intents == []
+    assert "committed" in why
+
+
+def test_at_the_committed_cap_the_reducing_side_still_quotes():
+    """The cap must never remove the only route back under itself. Merge needs
+    a matched pair, and the light side is what produces one -- blocking it
+    would freeze the fleet at maximum commitment permanently."""
+    inv = Inventory(up_shares=300.0, down_shares=0.0, up_cost=300.0 * 0.52,
+                    down_cost=0.0)
+    intents, _ = _rw_quote(
+        _rw(max_committed_usd=2000.0, committed_usd=2500.0), inv=inv)
+    assert [q.side for q in intents] == ["DOWN"]      # the light side only
+
+
+def test_inventory_alone_can_breach_the_cap_with_no_offers_resting():
+    """The cap is on committed capital, not on open orders. $9,588 had left
+    the wallet while only $1,369 was resting in offers."""
+    intents, why = _rw_quote(
+        _rw(max_committed_usd=2000.0, committed_usd=9588.0))
+    assert intents == []
+    assert "committed" in why
+
+
+def test_the_committed_cap_names_itself_separately_from_the_naked_cap():
+    """An operator reading 'not adding' has to be able to tell which limit
+    bound, or the dashboard shows a dead market with no explanation."""
+    _, why = _rw_quote(_rw(max_committed_usd=2000.0, committed_usd=2000.0,
+                           fleet_naked_usd=0.0))
+    assert "committed" in why and "unhedged" not in why
+
+
+def test_a_zero_committed_cap_disables_the_rule():
+    """Same escape hatch every other cap here has -- 0 means unset, not
+    'commit nothing'."""
+    intents, _ = _rw_quote(_rw(max_committed_usd=0.0, committed_usd=99999.0))
+    assert intents
+
+
+# --- U3: the fill cap that never ran ----------------------------------------
+
+def test_the_fill_cap_applies_to_the_rewards_objective():
+    """REGRESSION. max_fills_per_market was checked in `decide_quotes` several
+    lines AFTER the rewards path had already returned, so it never executed on
+    the objective the fleet actually runs. Three markets reached 26 fills
+    against a nominal limit of 25."""
+    inv = Inventory(fills=25)
+    intents, why = _rw_quote(_rw(max_fills_per_market=25), inv=inv)
+    assert intents == []
+    assert "25 fills" in why
+
+
+def test_one_fill_below_the_cap_still_quotes():
+    inv = Inventory(fills=24)
+    intents, _ = _rw_quote(_rw(max_fills_per_market=25), inv=inv)
+    assert intents
+
+
+def test_a_zero_allocation_actually_stops_quoting():
+    """REGRESSION. reallocate has always documented that an unfunded market
+    'gets 0 and stops quoting', and it never did -- `max(quote_shares,
+    min_quote_shares)` promoted the 0 back to the venue minimum, so a
+    deliberately defunded market kept posting 50-share orders."""
+    intents, why = _rw_quote(_rw(quote_shares=0))
+    assert intents == []
+    assert "unfunded" in why

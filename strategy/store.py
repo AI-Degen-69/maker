@@ -61,6 +61,49 @@ CREATE TABLE IF NOT EXISTS fills (
     reason TEXT DEFAULT 'queue'
 );
 
+-- U1. Fills the pre-tape-gate delta logic WOULD have credited, which the trade
+-- tape does not support. Deliberately a SEPARATE table rather than a flag on
+-- `fills`: inventory, P&L and the dashboard all reconstruct from `fills`, and a
+-- single query that forgot a `WHERE verified = 1` would put phantom shares into
+-- a real position. Nothing may join this table into an inventory path.
+--
+-- The ratio of these to real fills is what the Phase A decision gate reads. On
+-- the 18.7h pre-U1 run the equivalent split was 246 delta-credited against 2
+-- tape-backed, so this table is expected to be much larger than `fills`.
+CREATE TABLE IF NOT EXISTS unverified_fills (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    market_slug TEXT,
+    condition_id TEXT,
+    token_id TEXT,
+    side TEXT,
+    price REAL,
+    size REAL,
+    queue_waited REAL,
+    -- 'unverified_sweep' (level emptied, indistinguishable from a mass cancel)
+    -- or 'unverified_queue' (level shrank past our position). Both unverified;
+    -- the sweep is the weaker of the two.
+    reason TEXT
+);
+
+-- U1. The book and tape slice behind one fill decision, so a future engine
+-- change can be replayed offline against the same inputs. The 18.7h run could
+-- not be replayed at all -- `fills` records what was credited, never what was
+-- observed -- which is why Phase A verifies by forward running instead.
+CREATE TABLE IF NOT EXISTS fill_evidence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    condition_id TEXT,
+    token_id TEXT,
+    -- JSON {price: size} of the bid ladder at decision time, and the tape
+    -- volumes since the previous poll. tape_json IS NULL means the tape could
+    -- not be read -- distinct from '{}', which means it was read and empty.
+    bids_json TEXT,
+    tape_json TEXT,
+    credited REAL DEFAULT 0,
+    unverified REAL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS resolutions (
     condition_id TEXT PRIMARY KEY,
     winning_token TEXT,
@@ -154,15 +197,32 @@ CREATE TABLE IF NOT EXISTS markouts (
 );
 CREATE INDEX IF NOT EXISTS idx_mk_done ON markouts(done, ts);
 
--- One row per profit-taking close. Kept separate from `fills` because a close
--- is the only row in this database that books REALIZED money -- everything
--- else is an estimate or an open position. Blending the two is how a
--- projection turns into a reported profit.
+-- One row per early exit. Kept separate from `fills` because these are the
+-- only rows in this database that book REALIZED money -- everything else is an
+-- estimate or an open position. Blending the two is how a projection turns
+-- into a reported profit.
+--
+-- U2 (KTD2c): one table, discriminated by `method`, rather than a second
+-- `merges` table. A merge and a sell are the same event -- capital released
+-- early -- differing only in mechanism, price and cost. Two tables carrying
+-- near-identical columns drift the moment one gains a field the other does
+-- not, and every P&L query then has to remember to union them.
+--
+-- Columns that apply to one method only are nullable rather than zero:
+--   sell  -> up_price / dn_price (achieved averages), fee (two taker fees)
+--   merge -> gas (one transaction, whatever the size); price is always
+--            parity, so there is no achieved average to record.
 CREATE TABLE IF NOT EXISTS closes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
     condition_id TEXT,
     market_slug TEXT,
+    -- 'sell' (crossed the book, strategy/profit_take.py) or 'merge'
+    -- (redeemed a complete set at parity, strategy/merge.py). Defaults to
+    -- 'sell' so rows written before U2 keep their true meaning without a
+    -- backfill.
+    method TEXT DEFAULT 'sell',
+    gas REAL,                  -- merge only; NULL for a sell
     shares REAL,               -- pairs closed
     -- Size-weighted AVERAGE price actually achieved selling this leg, not the
     -- top-of-book tick: a close can walk past the best bid into worse levels,
@@ -215,7 +275,10 @@ CREATE TABLE IF NOT EXISTS market_gate (
 _MIGRATIONS = {
     "fills": {"crossed": "INTEGER DEFAULT 0", "reason": "TEXT DEFAULT 'queue'"},
     "closes": {"up_cost_removed": "REAL", "dn_cost_removed": "REAL",
-               "forgone_vs_settlement": "REAL"},
+               "forgone_vs_settlement": "REAL",
+               # U2. Existing rows predate merge, so 'sell' is the correct
+               # value for every one of them -- the default backfills itself.
+               "method": "TEXT DEFAULT 'sell'", "gas": "REAL"},
 }
 
 
@@ -269,6 +332,87 @@ def log_fill(**kw) -> None:
                   (kw["size"], time.time(), kw.get("quote_id")))
 
 
+def log_unverified_fill(**kw) -> None:
+    """Record a fill the tape could not support.
+
+    Writes ONLY to `unverified_fills`. It must never touch `fills`, `quotes`,
+    or anything inventory reconstructs from -- the whole point is that these
+    shares were never bought.
+    """
+    with db() as c:
+        c.execute(
+            "INSERT INTO unverified_fills (ts, market_slug, condition_id, "
+            "token_id, side, price, size, queue_waited, reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (kw.get("ts") or time.time(), kw["market_slug"], kw["condition_id"],
+             kw["token_id"], kw["side"], kw["price"], kw["size"],
+             kw.get("queue_waited"), kw.get("reason")))
+
+
+def log_fill_evidence(**kw) -> None:
+    """Persist the inputs behind one fill decision, for offline replay.
+
+    `tape_json` is None when the tape could not be read at all, and '{}' when
+    it was read and empty. Collapsing those two would destroy the distinction
+    U1 exists to draw, so the caller passes them through unchanged.
+    """
+    with db() as c:
+        c.execute(
+            "INSERT INTO fill_evidence (ts, condition_id, token_id, bids_json, "
+            "tape_json, credited, unverified) VALUES (?,?,?,?,?,?,?)",
+            (kw.get("ts") or time.time(), kw["condition_id"], kw["token_id"],
+             kw.get("bids_json"), kw.get("tape_json"),
+             kw.get("credited") or 0.0, kw.get("unverified") or 0.0))
+
+
+def verified_ratio() -> dict:
+    """Tape-backed fills against everything observed, fleet-wide.
+
+    THE Phase A decision-gate number. `ratio` is None when nothing has been
+    observed yet rather than a confident 0.0 or 1.0 -- an empty run must not
+    read as a measurement.
+    """
+    # Tuple indices, not names: `db()` hands back a bare connection with no
+    # row_factory, which is the convention every other reader here follows.
+    #
+    # ONLY reason='tape' counts as verified. 'queue' and 'sweep' are the
+    # PRE-U1 vocabulary -- fills the delta logic credited without tape
+    # evidence, which is exactly the thing this ratio exists to measure. They
+    # sit in `fills` because they really are in inventory, but counting them as
+    # verified would report the old model's guesses as confirmations.
+    #
+    # This is not hypothetical: run/fleet.db carries 302 'queue' + 37 'sweep'
+    # against 3 'tape', so a naive `reason != 'cross'` reads 1.0 -- a perfect
+    # score, on the data whose unreliability motivated the whole unit. Legacy
+    # rows are counted and reported separately, and excluded from the ratio
+    # entirely: they are neither a fresh confirmation nor a fresh unverified
+    # observation, and dragging them into either side would let pre-U1 history
+    # decide a post-U1 measurement.
+    with db() as c:
+        v_n, v_sh = c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM fills "
+            "WHERE reason = 'tape'").fetchone()
+        l_n, l_sh = c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0) FROM fills "
+            "WHERE reason IN ('queue', 'sweep')").fetchone()
+        u_n, u_sh, u_sweep = c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(size), 0), "
+            "COALESCE(SUM(CASE WHEN reason = 'unverified_sweep' THEN size "
+            "ELSE 0 END), 0) FROM unverified_fills").fetchone()
+    v_sh, u_sh = float(v_sh or 0.0), float(u_sh or 0.0)
+    total = v_sh + u_sh
+    return {
+        "verified_fills": v_n, "verified_shares": v_sh,
+        "unverified_fills": u_n, "unverified_shares": u_sh,
+        "unverified_sweep_shares": float(u_sweep or 0.0),
+        # Pre-U1 rows still in inventory. Surfaced so an operator reading a
+        # clean ratio on a reused database can see how much history is being
+        # excluded from it.
+        "legacy_fills": l_n, "legacy_shares": float(l_sh or 0.0),
+        "ratio": (v_sh / total) if total > 1e-9 else None,
+    }
+
+
 def log_markout_open(**kw) -> int:
     """Open a markout row at fill time. The horizons are filled in later."""
     with db() as c:
@@ -282,16 +426,25 @@ def log_markout_open(**kw) -> int:
 
 
 def log_close(**kw) -> None:
-    """A profit-taking close. Realized money -- never blended into estimates."""
+    """An early exit. Realized money -- never blended into estimates.
+
+    `method` discriminates a sell from a merge (KTD2c). It defaults to 'sell'
+    so existing callers, and every row written before U2, keep their meaning
+    unchanged. A merge passes method='merge' and `gas`, and leaves up_price /
+    dn_price / fee unset: there is no achieved average price when the payout is
+    parity, and no taker fee when nothing crossed a book.
+    """
     with db() as c:
         c.execute(
-            "INSERT INTO closes (ts, condition_id, market_slug, shares, "
-            "up_price, dn_price, cost_basis, proceeds, fee, realized_pnl, "
-            "forgone_vs_settlement, up_cost_removed, dn_cost_removed) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (time.time(), kw["condition_id"], kw["market_slug"], kw["shares"],
-             kw["up_price"], kw["dn_price"], kw["cost_basis"], kw["proceeds"],
-             kw["fee"], kw["realized_pnl"], kw.get("forgone_vs_settlement"),
+            "INSERT INTO closes (ts, condition_id, market_slug, method, gas, "
+            "shares, up_price, dn_price, cost_basis, proceeds, fee, "
+            "realized_pnl, forgone_vs_settlement, up_cost_removed, "
+            "dn_cost_removed) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (time.time(), kw["condition_id"], kw["market_slug"],
+             kw.get("method") or "sell", kw.get("gas"), kw["shares"],
+             kw.get("up_price"), kw.get("dn_price"), kw["cost_basis"],
+             kw["proceeds"], kw.get("fee"), kw["realized_pnl"],
+             kw.get("forgone_vs_settlement"),
              kw["up_cost_removed"], kw["dn_cost_removed"]))
 
 
@@ -359,7 +512,11 @@ def mark_cancelled(quote_ids: list[int]) -> None:
     if not quote_ids:
         return
     with db() as c:
-        c.executemany("UPDATE quotes SET cancelled=1 WHERE id=? AND filled=0",
+        # Cancellation is a lifecycle transition, not an assertion that the
+        # order was never filled. A partially filled crossed hedge or a maker
+        # order that filled before requoting still has an unfilled residual;
+        # mark the row cancelled while preserving its `filled` amount.
+        c.executemany("UPDATE quotes SET cancelled=1 WHERE id=?",
                       [(q,) for q in quote_ids])
 
 

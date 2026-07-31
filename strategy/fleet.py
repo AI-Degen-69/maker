@@ -24,8 +24,8 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from strategy import gate, markout, profit_take, rewards, store
-from strategy.allocate import allocate, capital_scarcity, shares_for
+from strategy import gate, markout, merge, profit_take, rewards, store
+from strategy.allocate import allocate_fundable, capital_scarcity, shares_for
 from strategy.config import load as load_cfg
 from strategy.fills import QueueFillEngine
 from strategy.main import full_book, recent_trades
@@ -152,6 +152,15 @@ class MarketState:
         self.inv = _inventory_from_db(self.cid)
         self.seen_trades: set = set()
         self.tape_primed = False
+        # Pairs merged back to collateral this process. Session-scoped on
+        # purpose: it feeds the pairing rate against fills observed in the same
+        # window, and the durable record is the `closes` table.
+        self.merged_shares = 0.0
+        # Rolling (ts, theirs) observations. One snapshot sized the entire
+        # fleet on 2026-07-29 and read a competing score of 35 for a market
+        # that measured 3,727 live -- a 100x error, and the reason the
+        # top-ranked market delivered $0.25/day against $18.96 projected.
+        self.theirs_samples: list[tuple[float, float]] = []
         self.err = ""
         # Rehydrate an EXITED verdict, and only an EXITED verdict.
         #
@@ -172,6 +181,25 @@ class MarketState:
         self.gate = _gate_from_db(self.cid)
         self.markout: dict = {"verdict": "insufficient_sample",
                               "mean_per_share": None, "n": 0}
+
+    def observe_theirs(self, ts: float, theirs: float, window_sec: float) -> None:
+        """Add one competitor-depth reading and drop anything past the window."""
+        self.theirs_samples.append((ts, theirs))
+        cutoff = ts - window_sec
+        self.theirs_samples = [(t, v) for t, v in self.theirs_samples
+                               if t >= cutoff]
+
+    def avg_theirs(self) -> float | None:
+        """Mean competing depth over the window, or None with no samples.
+
+        None rather than 0.0: no observation is not an empty book, and an
+        empty book is the single most attractive-looking input the allocator
+        can receive. Guessing it would concentrate capital into exactly the
+        markets we know least about.
+        """
+        if not self.theirs_samples:
+            return None
+        return sum(v for _, v in self.theirs_samples) / len(self.theirs_samples)
 
 
 def load_specs() -> list[dict]:
@@ -201,6 +229,46 @@ def fleet_naked_cost(states) -> float:
     return total
 
 
+def _affordable_cross_size(book_asks: dict, requested: float,
+                           available_usd: float) -> float:
+    """Maximum taker-hedge size whose ask notional fits the cap."""
+    remaining = min(float(requested), sum(float(v) for v in book_asks.values()))
+    budget = max(float(available_usd), 0.0)
+    size = 0.0
+    for price in sorted(book_asks):
+        if remaining <= 1e-9 or budget <= 1e-9:
+            break
+        depth = max(float(book_asks.get(price, 0.0)), 0.0)
+        take = min(depth, remaining, budget / price) if price > 0 else 0.0
+        size += take
+        remaining -= take
+        budget -= take * price
+    return size
+
+
+def fleet_committed_cost(states) -> float:
+    """Every dollar that has left the wallet or is spoken for.
+
+    Inventory cost -- BOTH legs, paired and naked -- plus the notional resting
+    in unfilled offers. `fleet_naked_cost` deliberately counts only the
+    unhedged residue because that is what can lose money; this counts what is
+    committed, which is a different question and the one nobody was asking.
+
+    Measured 2026-07-30, the gap between them was the whole problem: $767
+    naked (inside its $800 cap, looking healthy) against $9,588 committed.
+    """
+    total = 0.0
+    for s in states:
+        total += (s.inv.up_cost or 0.0) + (s.inv.down_cost or 0.0)
+        # Resting offers are not spent yet, but they are promised: the venue
+        # holds collateral against an open bid, and a fill converts the promise
+        # into inventory without asking. Excluding them would let the fleet sit
+        # exactly at the cap with thousands more already in flight.
+        for o in s.engine.open_orders():
+            total += o.price * max(0.0, o.size - o.filled)
+    return total
+
+
 def reallocate(states, base) -> dict:
     """Resize every market by marginal return instead of a flat 120 shares.
 
@@ -216,18 +284,60 @@ def reallocate(states, base) -> dict:
     worse than capital sitting idle.
     """
     obs = []
+    floor = base.reward_min_payout_usd * base.reward_floor_multiple
     for s in states:
-        live = s.spec.get("_live") or {}
-        share, capital = live.get("share"), live.get("capital")
-        if not share or not capital:
-            continue
-        obs.append({"cid": s.cid, "daily": s.daily,
-                    "capital": capital, "share": share})
+        # SIZE OFF THE COMPETITION, NOT OFF OUR OWN ORDERS.
+        #
+        # `_live["share"]`, `["capital"]` and `["income"]` are all measured
+        # from our resting orders, so all three read zero the moment a market
+        # is defunded -- and this function used to consult exactly those. A
+        # market defunded for earning nothing then reported nothing, was
+        # skipped for having no share, and could never be funded again. One
+        # way. Measured on the 13.4h run of 2026-07-30: samples scoring
+        # anything decayed from 67/219 to 0/190, and the fleet posted its last
+        # quote at T+8.1h while continuing to poll for another five hours.
+        #
+        # `theirs` is the input that survives, because it is scored over the
+        # whole book whether or not we are in it -- Taylor Swift still
+        # measured 1,504 while we quoted nothing at all. Averaged, not
+        # instantaneous: one snapshot read 35 for a market that measured 3,727
+        # and sized the entire fleet off it.
+        avg_theirs = s.avg_theirs()
+        if avg_theirs is None:
+            continue        # never sampled -- keep its size rather than guess
+
+        # A score converts to dollars through the per-share score, since a
+        # pair costs ~$1 and N dollars therefore buys ~N shares a side. Any
+        # reference capital returns the same competitor depth out of
+        # competitor_depth() -- it cancels -- so this is a change of units,
+        # not an assumption about size.
+        k = rewards.score_per_share(s.cfg.max_spread_from_mid,
+                                    s.cfg.reward_offset)
+        ref = 100.0
+        ours_ref = ref * k
+        total = ours_ref + avg_theirs
+        obs.append({"cid": s.cid, "daily": s.daily, "capital": ref,
+                    "share": (ours_ref / total) if total > 0 else 1.0,
+                    "min_dollars": float(s.spec["min_size"])})
+
     if not obs:
         return {}
 
-    dollars = allocate(obs, base.allocation_budget,
-                       base.marginal_return_floor)
+    # REWARD ELIGIBILITY, applied inside the allocation rather than ahead of
+    # it. Polymarket pays nothing below $1 per distribution, so a market
+    # projecting under the floor is not a small earner -- it is committed
+    # capital earning exactly zero, and 16 of 20 markets were in that state on
+    # 2026-07-30 while the fleet funded every one.
+    #
+    # Judged at the size actually allocated, because income is monotone in
+    # size: the same market that fails the floor at its 100-share minimum
+    # clears it 3.6x over at the 600 shares the budget affords.
+    #
+    # Unfunded, NOT dropped: the market stays in `states` so its inventory is
+    # still merged, marked out and reconciled. Removing it here would strand a
+    # real position with nothing tending it.
+    dollars = allocate_fundable(obs, base.allocation_budget,
+                                base.marginal_return_floor, floor)
 
     # Whether the BUDGET, rather than the floor, is what stopped the water-fill
     # while a market was still returning well above the floor. That is the only
@@ -245,6 +355,17 @@ def reallocate(states, base) -> dict:
         # allocator did not fund this sweep -- an unfunded market is precisely
         # one whose locked capital we most want released.
         s.cfg = replace(s.cfg, capital_scarce=scarce)
+
+        # Absent from `dollars` means never sampled, and only that -- a market
+        # `allocate_fundable` refused is present at 0.0. The two need opposite
+        # treatment: an unmeasured market keeps its current size (sizing it
+        # off a guess is worse than leaving it alone), while a measured market
+        # that cannot pay must be zeroed, or it keeps quoting its startup size
+        # while earning nothing.
+        #
+        # Caught by the smoke run, not the tests: 17 markets kept quoting 120
+        # shares each while only 4 were funded, so offers alone reached $2,108
+        # against a $2,000 committed cap before a single share was bought.
         if s.cid not in dollars:
             continue
         n = shares_for(dollars[s.cid], int(s.spec["min_size"]))
@@ -257,9 +378,14 @@ def reallocate(states, base) -> dict:
 
 
 def visit(st: MarketState, bot_cfg, now: float,
-          fleet_naked_usd: float = 0.0) -> None:
+          fleet_naked_usd: float = 0.0, committed_usd: float = 0.0,
+          states=None) -> None:
     """One poll of one market: books -> fills -> requote -> reward sample."""
     cfg = st.cfg
+    # The single-market helper remains callable in tests; the fleet runner
+    # passes the complete state list so emergency-hedge affordability and
+    # resting-order reservation use the same fleet-wide committed total.
+    committed_states = states if states is not None else [st]
     if st.market is None:
         st.market = fetch_pinned_market(st.cid)
         if st.market is None:
@@ -281,9 +407,42 @@ def visit(st: MarketState, bot_cfg, now: float,
     first_pass = not st.tape_primed
     st.tape_primed = True
     for book in (up, dn):
-        traded = tape.get(book["token_id"]) if tape else None
+        # A token with NO trades this poll must read as an empty tape, not a
+        # missing one. `tape.get(...)` returns None in both cases, and before
+        # U1 that None sent the engine down the cancel-ambiguous delta path --
+        # so the quietest markets, where nothing traded at all, were exactly
+        # the ones generating phantom fills. `{}` says measured-and-empty;
+        # None is reserved for a tape we genuinely could not read.
+        traded = None if tape is None else (tape.get(book["token_id"]) or {})
+        if first_pass:
+            traded = None      # a startup backlog is not evidence about us
+        mark = len(st.engine.unverified)
         fills = st.engine.on_book(book["token_id"], book["bids"], now,
-                                  traded=None if first_pass else traded)
+                                  traded=traded)
+        new_unverified = st.engine.unverified[mark:]
+
+        # Persist the decision inputs so a later engine change can be replayed
+        # offline -- the capability whose absence forced Phase A to verify by
+        # forward running instead of replaying the 18.7h run.
+        try:
+            store.log_fill_evidence(
+                ts=now, condition_id=m.condition_id,
+                token_id=book["token_id"],
+                bids_json=json.dumps({str(p): s for p, s in book["bids"].items()}),
+                tape_json=(None if traded is None
+                           else json.dumps({str(p): v for p, v in traded.items()})),
+                credited=sum(f.size for f in fills),
+                unverified=sum(f.size for f in new_unverified))
+        except Exception as e:
+            log.warning("fill evidence not recorded for %s: %s", st.title[:30], e)
+
+        for f in new_unverified:
+            # Recorded, never applied. These shares were not bought.
+            store.log_unverified_fill(
+                ts=now, market_slug=m.market_slug,
+                condition_id=m.condition_id, token_id=f.token_id,
+                side=f.side, price=f.price, size=f.size,
+                queue_waited=f.queue_waited, reason=f.reason)
         for f in fills:
             if f.side == "UP":
                 st.inv.up_shares += f.size
@@ -295,7 +454,7 @@ def visit(st: MarketState, bot_cfg, now: float,
             store.log_fill(
                 market_slug=m.market_slug, condition_id=m.condition_id,
                 token_id=f.token_id, side=f.side, price=f.price, size=f.size,
-                quote_id=None, mid_at_post=None, edge_vs_mid=None,
+                quote_id=f.quote_id, mid_at_post=None, edge_vs_mid=None,
                 queue_waited=getattr(f, "queue_waited", 0.0),
                 seconds_to_fill=0.0, crossed=False, reason=f.reason,
             )
@@ -345,7 +504,59 @@ def visit(st: MarketState, bot_cfg, now: float,
     # Fleet exposure is a property of every OTHER market as well, so it has to
     # be injected here rather than derived from this market's inventory.
     cfg = replace(cfg, gate_state=st.gate,
-                  fleet_naked_usd=fleet_naked_usd)
+                  fleet_naked_usd=fleet_naked_usd,
+                  committed_usd=committed_usd)
+
+    # MERGE FIRST, then consider selling. A matched pair redeems for exactly
+    # 1.00 through the collateral adapter with no spread and no taker fee, so
+    # whenever both exits are available merge strictly dominates: selling the
+    # same pair pays 3.4c of fees into a bid sum bounded by 1.00. Running the
+    # sell path first would occasionally book a worse exit for no reason.
+    #
+    # Simulation only in Phase A -- the on-chain executor is U6, and fleet.py
+    # deliberately does not import it. What this records is what a merge WOULD
+    # realize, on the same terms the real one will.
+    try:
+        # Projected rent comes from this market's MEASURED income, not an
+        # assumed rate -- the velocity exception is only as honest as the
+        # number backing it. None when we have not scored here yet, which
+        # blocks the exception rather than assuming it favourable.
+        prev_live = st.spec.get("_live") or {}
+        mg = merge.should_merge(
+            st.inv, cfg, gas_cost=cfg.merge_gas_usd,
+            projected_rent_per_day=prev_live.get("income"),
+            hold_days=cfg.merge_velocity_hold_days)
+        if mg["take"]:
+            n = mg["shares"]
+            up_removed, dn_removed = mg["up_cost_removed"], mg["dn_cost_removed"]
+
+            # Ledger first, memory second -- same ordering discipline as the
+            # sell path below, and for the same reason: _inventory_from_db
+            # rebuilds from this table on restart, so a merge must never exist
+            # in memory without also existing on disk.
+            store.log_close(
+                condition_id=m.condition_id, market_slug=m.market_slug,
+                method="merge", gas=mg["gas"], shares=n,
+                cost_basis=mg["cost_basis"], proceeds=mg["proceeds"],
+                realized_pnl=mg["realized_pnl"],
+                # Merging forgoes nothing: parity IS the settlement value, so
+                # there is no concession against holding, only the gas.
+                forgone_vs_settlement=0.0,
+                up_cost_removed=up_removed, dn_cost_removed=dn_removed)
+
+            # Cost before shares: avg() divides by the share count, so
+            # decrementing shares first would rewrite the basis of the residue.
+            st.inv.up_cost -= up_removed
+            st.inv.down_cost -= dn_removed
+            st.inv.up_shares -= n
+            st.inv.down_shares -= n
+            st.merged_shares += n
+            log.info("MERGE %-28s %.0f pairs realized $%+.2f | %s",
+                     st.title[:28], n, mg["realized_pnl"], mg["why"])
+    except Exception as e:
+        log.warning("merge failed on %s: %s: %s",
+                    st.title[:30], type(e).__name__, e)
+        mg = {"take": False, "why": f"error: {e}"}
 
     # Take profit on the paired portion, if the market has moved far enough to
     # cover selling both legs and still pay. Wrapped for the same reason
@@ -412,17 +623,46 @@ def visit(st: MarketState, bot_cfg, now: float,
     # real ask depth at real prices and accept a partial fill as a real result.
     crossing = [qi for qi in intents if qi.crossed]
     intents = [qi for qi in intents if not qi.crossed]
+    if crossing:
+        # A taker hedge is an exit action, not an additional resting position.
+        # Release every open bid before measuring affordability so stale offers
+        # cannot consume capacity and incorrectly block the hedge. The next
+        # requote pass below may restore only the intents that still qualify.
+        released = st.engine.open_orders()
+        for o in released:
+            o.cancelled = True
+        store.mark_cancelled([o.quote_id for o in released
+                              if o.quote_id is not None])
+
     for qi in crossing:
         book = up if qi.side == "UP" else dn
+        asks = book.get("asks") or {}
+        # Emergency hedges are the only path that can add inventory without
+        # going through the resting-order reservation below. Cap them too:
+        # the stop-loss may take a partial hedge, but it must never turn a
+        # $1,000 wallet into a larger simulated position.
+        available = max(cfg.max_committed_usd
+                       - fleet_committed_cost(committed_states), 0.0)
+        cross_size = _affordable_cross_size(asks, qi.size, available)
+        if cross_size <= 1e-9:
+            store.log_decision(
+                market_slug=m.market_slug, condition_id=m.condition_id,
+                action="EMERGENCY_HEDGE_BLOCKED", side=qi.side,
+                price=qi.price, mid=qi.mid, edge_vs_mid=qi.edge_vs_mid,
+                t_remaining=None, balance=st.inv.balance,
+                pair_cost=st.inv.pair_cost(),
+                reason=f"{qi.reason}; committed cap leaves no affordable hedge",
+            )
+            continue
         got = 0.0
         qid = store.log_quote(
             market_slug=m.market_slug, condition_id=m.condition_id,
-            token_id=qi.token_id, side=qi.side, price=qi.price, size=qi.size,
+            token_id=qi.token_id, side=qi.side, price=qi.price, size=cross_size,
             queue_ahead=0.0, mid=qi.mid, edge_vs_mid=qi.edge_vs_mid,
             t_remaining=None,
         )
-        for f in st.engine.cross(qi.token_id, qi.side, qi.size,
-                                 book.get("asks") or {}, now):
+        for f in st.engine.cross(qi.token_id, qi.side, cross_size,
+                                 asks, now):
             if f.side == "UP":
                 st.inv.up_shares += f.size
                 st.inv.up_cost += f.size * f.price
@@ -441,40 +681,76 @@ def visit(st: MarketState, bot_cfg, now: float,
                 edge_vs_mid=None, queue_waited=0.0, seconds_to_fill=0.0,
                 crossed=True, reason=f.reason,
             )
+        # A shallow ask can leave a residual portion of the capped cross
+        # unfilled. It was never a resting order, so close its quote row now;
+        # otherwise historical open-offer metrics overstate live exposure.
+        if got + 1e-9 < cross_size:
+            store.mark_cancelled([qid])
         store.log_decision(
             market_slug=m.market_slug, condition_id=m.condition_id,
             action="EMERGENCY_HEDGE", side=qi.side, price=qi.price,
             mid=qi.mid, edge_vs_mid=qi.edge_vs_mid, t_remaining=None,
             balance=st.inv.balance, pair_cost=st.inv.pair_cost(),
-            reason=f"{qi.reason}; filled {got:.0f}/{qi.size:.0f}sh",
+            reason=f"{qi.reason}; filled {got:.0f}/{cross_size:.0f}sh "
+                   f"(requested {qi.size:.0f})",
         )
         log.info("EMERGENCY_HEDGE %-28s %-4s %.0f/%.0fsh bal=%.2f",
                  st.title[:28], qi.side, got, qi.size, st.inv.balance)
 
-    want = {qi.side: round(qi.price, 4) for qi in intents}
+    # Cancel stale or resized orders before reserving the next batch. Keeping
+    # an old-size order when the allocator just reduced `quote_shares` makes
+    # the allocation advisory rather than a capital limit.
+    want = {qi.side: qi for qi in intents}
     keep = set()
+    cancelled = []
     for o in st.engine.open_orders():
-        if want.get(o.side) == o.price:
+        qi = want.get(o.side)
+        if (qi is not None and round(qi.price, 4) == o.price
+                and o.size == qi.size):
             keep.add(o.side)      # leave it alone: requoting loses queue position
         else:
             o.cancelled = True
+            cancelled.append(o.quote_id)
+    store.mark_cancelled([qid for qid in cancelled if qid is not None])
+
+    # `committed_usd` was sampled before this visit. It is useful for the
+    # decision layer, but it cannot reserve the order we are about to add.
+    # Enforce the hard wallet cap against the post-cancellation state and size
+    # each new order to the remaining dollars. A final remainder below the
+    # venue's minimum is left idle rather than creating a quote that scores 0.
+    available = max(cfg.max_committed_usd
+                       - fleet_committed_cost(committed_states), 0.0)
+    budget_blocked: list[str] = []
     for qi in intents:
         if qi.side in keep:
             continue
+        if qi.price <= 0:
+            continue
+        size = min(qi.size, int(available / qi.price))
+        if size < cfg.min_quote_shares:
+            budget_blocked.append(f"{qi.side}: committed cap leaves "
+                                 f"{size:.0f}sh < {cfg.min_quote_shares} minimum")
+            continue
         book = up if qi.side == "UP" else dn
-        o = st.engine.post(qi.token_id, qi.side, qi.price, qi.size, book["bids"], now)
-        store.log_quote(
+        o = st.engine.post(qi.token_id, qi.side, qi.price, size, book["bids"], now)
+        available -= o.price * o.size
+        o.quote_id = store.log_quote(
             market_slug=m.market_slug, condition_id=m.condition_id,
-            token_id=qi.token_id, side=qi.side, price=qi.price, size=qi.size,
+            token_id=qi.token_id, side=qi.side, price=qi.price, size=size,
             queue_ahead=o.queue_ahead, mid=qi.mid, edge_vs_mid=qi.edge_vs_mid,
             t_remaining=None,
         )
+    if budget_blocked:
+        why = "; ".join(x for x in (why, *budget_blocked) if x)
 
     bq1, bq2 = rewards.book_scores(up, dn, cfg.max_spread_from_mid,
                                    cfg.min_quote_shares)
     oq1, oq2 = rewards.our_scores(st.engine.open_orders(), up, dn,
                                   cfg.max_spread_from_mid, cfg.min_quote_shares)
     ours, theirs, share = rewards.share_of_pool(oq1, oq2, bq1, bq2)
+    # Feed the rolling window the allocator averages over, so sizing responds
+    # to the competition's typical depth rather than to one lucky snapshot.
+    st.observe_theirs(now, theirs, cfg.rank_sample_window_sec)
     store.log_reward_sample(
         ts=now, market_slug=m.market_slug, condition_id=m.condition_id,
         our_score=ours, market_score=theirs,
@@ -521,6 +797,16 @@ def visit(st: MarketState, bot_cfg, now: float,
         "markout": st.markout.get("mean_per_share"),
         "markout_n": st.markout.get("n", 0),
         "close_why": pt.get("why", ""),
+        # Merge, reported separately from the sell path. Recycled capital is
+        # the number that distinguishes this strategy from a carry trade: it
+        # is money that went back to work rather than sitting until 2027.
+        "merge_why": mg.get("why", ""),
+        "merged_shares": st.merged_shares,
+        "recycled_usd": st.merged_shares * merge.PARITY,
+        # Merged pairs against shares filled -- the assumption merge economics
+        # rest on. None until something fills; no observation is not a zero.
+        "pairing_rate": merge.pairing_rate(
+            st.merged_shares, st.engine.filled_shares(include_crossed=False)),
         "fills": st.inv.fills, "err": st.err, "ts": now,
         "up_bid": up_bid, "up_ask": up_ask,
         "dn_bid": dn_bid, "dn_ask": dn_ask,
@@ -549,11 +835,54 @@ def main() -> None:
 
     gap = 2.0 / REQ_PER_SEC
     i = 0
+    last_rerank = time.time()
     while True:
+        # PERIODIC RE-RANK. run/markets.json was written 2026-07-29 01:39 and
+        # the fleet ran against it for a day and a half while competitors
+        # arrived and reward rates changed underneath it.
+        #
+        # Re-picking the candidate set means scoring hundreds of books, which
+        # does not belong inside the trading loop -- `scripts/rank_markets`
+        # owns that and writes the file. What happens here is adopting the
+        # result: any market the ranker has since added is picked up, and any
+        # market it dropped is retained if it still holds inventory, because
+        # dropping a live position strands it with nothing to merge or
+        # reconcile it.
+        now_ts = time.time()
+        if now_ts - last_rerank >= base.rerank_interval_sec:
+            last_rerank = now_ts
+            try:
+                fresh = {s["cid"]: s for s in load_specs()}
+                known = {s.cid for s in states}
+                for cid, spec in fresh.items():
+                    if cid not in known:
+                        states.append(MarketState(spec, base))
+                        log.info("RERANK + %s", spec["title"][:40])
+                held = [s for s in states if s.cid not in fresh
+                        and (s.inv.up_shares or s.inv.down_shares)]
+                dropped = [s for s in states
+                           if s.cid not in fresh and s not in held]
+                if dropped:
+                    for s in dropped:
+                        log.info("RERANK - %s", s.title[:40])
+                    states = [s for s in states if s not in dropped]
+                if held:
+                    log.info("RERANK %d dropped market(s) retained: still "
+                             "holding inventory", len(held))
+            except Exception as e:
+                # A stale market set is survivable; a dead fleet is not.
+                log.warning("rerank failed, keeping current markets: %s: %s",
+                            type(e).__name__, e)
+
         st = states[i % len(states)]
         i += 1
         try:
-            visit(st, bot_cfg, time.time(), fleet_naked_cost(states))
+            # Both totals are recomputed per visit rather than per sweep: a
+            # fill in the market visited two seconds ago has already changed
+            # them, and a cap evaluated against a stale total is a cap that
+            # lets the overshoot through.
+            visit(st, bot_cfg, time.time(), fleet_naked_cost(states),
+                  fleet_committed_cost(states), states)
         except Exception as e:
             log.warning("%s: %s", st.title[:30], e)
             st.err = str(e)
@@ -577,10 +906,30 @@ def main() -> None:
                             type(e).__name__, e)
                 sizes = {}
             funded = sum(1 for n in sizes.values() if n > 0)
-            log.info("sweep | %d/%d scoring | est $%.2f/day | capital $%.0f "
-                     "| naked $%.0f | funded %d/%d",
+            # The verified ratio rides on the sweep line because it is the one
+            # number that decides what happens after Phase A, and a figure that
+            # lives only in the database is a figure nobody reads. `--` means
+            # nothing observed yet, deliberately not 0% -- an idle fleet has
+            # not measured anything.
+            try:
+                vr = store.verified_ratio()
+                vr_txt = ("--" if vr["ratio"] is None
+                          else f"{100 * vr['ratio']:.1f}%")
+                fills_txt = f"{vr['verified_fills']}v/{vr['unverified_fills']}u"
+            except Exception as e:
+                vr_txt, fills_txt = "err", str(type(e).__name__)
+            # `capital` is offers only; `committed` is every dollar out the
+            # door. The pair is logged together on purpose -- reading the
+            # first without the second is how a 0.256%/day return got reported
+            # as 1.80%/day for a day and a half.
+            committed = fleet_committed_cost(states)
+            log.info("sweep | %d/%d scoring | est $%.2f/day | offers $%.0f "
+                     "| committed $%.0f/%.0f | naked $%.0f | funded %d/%d "
+                     "| verified %s (%s)",
                      len(live), len(states), inc, cap,
-                     fleet_naked_cost(states), funded, len(states))
+                     committed, base.max_committed_usd,
+                     fleet_naked_cost(states), funded, len(states),
+                     vr_txt, fills_txt)
             (RUN / "fleet_state.json").write_text(
                 json.dumps(specs, default=str), encoding="utf-8")
         time.sleep(gap)

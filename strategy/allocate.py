@@ -107,6 +107,85 @@ def allocate(markets: list[dict], budget: float, floor: float,
     return out
 
 
+def allocate_fundable(markets: list[dict], budget: float, floor: float,
+                      payout_floor: float, step: float = 5.0
+                      ) -> dict[str, float]:
+    """Water-fill, then drop whatever the funded size cannot actually earn on,
+    and redistribute what that frees. Every input cid appears in the result;
+    the ones that survived nothing are 0.0.
+
+    Two ways an allocation is dead on arrival, and plain `allocate` sees
+    neither, because both depend on the market's own venue terms rather than
+    on the marginal return:
+
+      * Under `min_dollars`. `shares_for` refuses to quote below a market's
+        minimum -- an order that small scores zero -- so the dollars are
+        committed on paper and buy nothing at all.
+      * Under `payout_floor`. Polymarket pays nothing below $1 per
+        distribution, so a market projecting under it is not a small earner,
+        it earns exactly zero.
+
+    Judged AT the allocation, not at a fixed probe size, because income is
+    monotone in size: Taylor Swift pays $1.00/day at its 100-share minimum and
+    $5.50/day at the 600 shares the budget can afford. A probe at the minimum
+    would defund a market paying 3.6x the floor.
+
+    An under-minimum allocation is not automatically a bad market, so it is
+    offered a promotion to the full lot before being dropped. The water-fill
+    is a marginal-return argument and marginal return cannot see an
+    indivisible lot: the two markets we face no competition in have T = 0, and
+    marginal() is then a step -- the first dollar is worth the whole pot, every
+    dollar after it is worth nothing -- so the fill hands them $5 and moves on.
+    $5 cannot be quoted. Dropping them costs the two best returns on the board
+    ($5/day each on a $100 minimum, 5%/day), so the lot gets judged on the
+    AVERAGE return over the whole lot, which is what an indivisible commitment
+    actually earns.
+
+    One change per pass, promotions before drops, and the worst market first
+    among drops. Dropping frees budget for the survivors and can lift a market
+    that was only just under, so clearing every offender at once would defund
+    markets the redistribution would have saved.
+    """
+    live = list(markets)
+    fixed: dict[str, float] = {}          # markets held at their minimum lot
+    out = {m["cid"]: 0.0 for m in markets}
+    while True:
+        free = max(budget - sum(fixed.values()), 0.0)
+        dollars = allocate(live, free, floor, step) if live else {}
+
+        promote, drop = None, None
+        for m in live:
+            d = dollars.get(m["cid"], 0.0)
+            if d <= 0:
+                continue        # under the marginal floor; allocate said so
+            T = competitor_depth(m["capital"], m["share"])
+            lot = m.get("min_dollars", 0.0)
+            if d < lot:
+                inc = income(lot, m["daily"], T)
+                if lot <= free and inc >= payout_floor and inc / lot >= floor:
+                    if promote is None or inc / lot > promote[1]:
+                        promote = (m["cid"], inc / lot, lot)
+                elif drop is None or inc < drop[1]:
+                    drop = (m["cid"], inc)
+                continue
+            inc = income(d, m["daily"], T)
+            if inc < payout_floor and (drop is None or inc < drop[1]):
+                drop = (m["cid"], inc)
+
+        if promote is not None:
+            cid, _, lot = promote
+            fixed[cid] = lot
+            live = [m for m in live if m["cid"] != cid]
+            continue
+        if drop is not None:
+            live = [m for m in live if m["cid"] != drop[0]]
+            continue
+
+        out.update(dollars)
+        out.update(fixed)
+        return out
+
+
 def capital_scarcity(markets: list[dict], allocation: dict[str, float],
                      budget: float, floor: float,
                      multiple: float = 2.0) -> bool:

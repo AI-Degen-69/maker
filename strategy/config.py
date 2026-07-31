@@ -17,7 +17,9 @@ class MakerConfig:
     series_slug: str = "btc-up-or-down-5m"
 
     # --- virtual account --------------------------------------------------
-    bankroll_usd: float = 5000.0
+    # Fresh paper run wallet. This is the total simulated capital available,
+    # not a promise that the allocator may commit every dollar at once.
+    bankroll_usd: float = 1000.0
 
     # --- objective --------------------------------------------------------
     # "pair"    : the original bet -- rest under the ask, try to buy a hedged
@@ -119,7 +121,8 @@ class MakerConfig:
     widen_offset: float = 0.035
     # Marginal $/day per $ committed, below which capital is better left idle.
     marginal_return_floor: float = 0.02
-    allocation_budget: float = 1200.0
+    # Leave wallet headroom for inventory and order-lifecycle timing.
+    allocation_budget: float = 900.0
     # Set per-market by the fleet each cycle: NORMAL | WIDENED | EXITED.
     gate_state: str = "NORMAL"
 
@@ -132,6 +135,78 @@ class MakerConfig:
     # Selling means crossing the spread, so BOTH legs pay the taker fee. The
     # move therefore has to clear two fees before it clears anything else.
     profit_take_fee_per_share: float = 0.017
+
+    # MERGE (U2). Total cost of one mergePositions transaction, in dollars --
+    # per TRANSACTION, not per share, because a merge costs the same whether it
+    # redeems ten pairs or ten thousand. That is why the economic floor is on
+    # total gain rather than per-share gain.
+    #
+    # A seeded estimate, not a measurement. Polygon gas for a CTF merge is
+    # cents, and this is deliberately set high enough to be conservative in
+    # Phase A, where no transaction has been sent and nothing on-chain has been
+    # verified. U6's verify_merge.py replaces it with the real figure from an
+    # actual transaction, and U5 reads it to compute the minimum economic size.
+    #
+    # Never set this to 0. Zero-cost gas makes every merge look profitable,
+    # including ones that lose money -- `strategy/merge.py` treats None as
+    # blocking for the same reason.
+    merge_gas_usd: float = 0.05
+
+    # OVER-PARITY MERGES (U5, KTD2b). 4.5% of measured pairs cost more than
+    # 1.00, so merging them books an immediate loss. Holding is not obviously
+    # better: the pair pays exactly 1.00 either way, so the nominal comparison
+    # is a wash and the real question is what the freed capital earns in the
+    # meantime.
+    #
+    # The velocity test answers that -- merge when projected rent on the
+    # released capital over the remaining hold beats the concession plus gas.
+    # This is the hard bound around it. Checked BEFORE the velocity arithmetic
+    # runs, and never yielded to: without it, a large projected-rent figure
+    # would license an arbitrarily bad exit price, which is how a capital
+    # efficiency rule turns into an inventory fire sale.
+    #
+    # 1c/share. Roughly a third of what selling the same pair would pay in
+    # taker fees, so the exception stays cheaper than the alternative it
+    # replaces.
+    merge_max_loss_per_share: float = 0.01
+
+    # How long the freed capital is assumed to keep earning, in days, when
+    # pricing the velocity exception above. NOT the time to resolution --
+    # markets here settle in 2027, and crediting ~500 days of rent would make
+    # every over-parity pair mergeable regardless of price, which is precisely
+    # what merge_max_loss_per_share exists to stop.
+    #
+    # 30 days is deliberately short: long enough that freeing capital is worth
+    # something, short enough that the exception stays rare and the loss cap
+    # remains the binding constraint rather than a formality.
+    merge_velocity_hold_days: float = 30.0
+
+    # REWARD ELIGIBILITY (U4). Polymarket's published rule: "The minimum reward
+    # payout is $1; amounts below this will not be paid." A market projecting
+    # under a dollar a day does not pay a fraction of a dollar -- it pays zero.
+    #
+    # Measured 2026-07-30, only 4 of 20 fleet markets cleared it. The other 16
+    # held capital and earned exactly nothing, which makes spreading thin
+    # actively harmful rather than merely inefficient. Concentration is not a
+    # preference here, it is what the payout rule requires.
+    #
+    # Whether the threshold applies per-market or across a maker's aggregate is
+    # not settled by the docs. Per-market is the conservative reading and is
+    # safe under either; the first real payout settles it empirically.
+    reward_min_payout_usd: float = 1.0
+    # Multiple of the floor a market must clear to be funded. Projections are
+    # noisy and competitors arrive, so 1.0x would fund markets that cross below
+    # the line the moment anyone else quotes. 1.5x buys headroom.
+    reward_floor_multiple: float = 1.5
+
+    # How long to average competitor depth before sizing a position. One
+    # snapshot sized the whole fleet on 2026-07-29 and read a competing score
+    # of 35 for a market that measured 3,727 live -- a 100x error that put the
+    # top-ranked market at $0.25/day actual against $18.96 projected.
+    rank_sample_window_sec: float = 1800.0
+    # Re-rank cadence. run/markets.json was frozen from 2026-07-29 01:39 while
+    # the fleet ran against it for a day and a half.
+    rerank_interval_sec: float = 3600.0
     # Required profit per share AFTER both fees. Set at roughly one fee's
     # width again, so a close is only taken on a move clearly larger than the
     # cost of taking it -- at 1c the threshold sits inside the noise of a
@@ -172,11 +247,33 @@ class MakerConfig:
     # $800 is roughly half the observed exposure, which halves the swing while
     # leaving room for the light side to keep flattening. It costs rent:
     # capped markets quote one-sided and score at 1/c, c=3.0.
-    max_fleet_naked_usd: float = 800.0
+    max_fleet_naked_usd: float = 400.0
     # Current fleet-wide unhedged cost, injected each cycle by the fleet
     # runner. Zero here so a single-market bot (strategy.main) is unaffected --
     # it has no fleet to be over budget.
     fleet_naked_usd: float = 0.0
+
+    # TOTAL COMMITTED CAPITAL (U3). Everything above bounds the UNHEDGED leg;
+    # nothing bounded the hedged one. A matched pair cannot lose -- it pays
+    # exactly $1 -- so it was treated as free, and it is not: until U2 it was
+    # frozen until 2027, and even with merge it is money that is committed
+    # right now and cannot be committed anywhere else.
+    #
+    # The real ceiling was max_cost_per_market x markets = $400 x 20 = $8,000
+    # against a nominal $1,200 allocation_budget. Measured 2026-07-30: $9,588
+    # had left the wallet -- $7,452 in paired inventory, $767 naked, $1,369
+    # resting in offers -- while the dashboard's headline return divided rent
+    # by the $1,369 alone and reported 1.80%/day. Against the money actually
+    # committed it was 0.256%/day. The cap and the honest denominator are the
+    # same fix.
+    #
+    # Counts inventory cost PLUS resting offer notional, because both are
+    # dollars that are spoken for. $2,000 leaves room above the observed
+    # working set without permitting another $9.5k drift.
+    max_committed_usd: float = 1000.0
+    # Injected each cycle by the fleet runner, same pattern as fleet_naked_usd.
+    # Zero for a single-market bot, which has no fleet to total up.
+    committed_usd: float = 0.0
 
     # Maker pool per 5-min window, for turning score-share into dollars.
     # Measured 2026-07-28 from 15 recorded windows: 68405 shares traded per

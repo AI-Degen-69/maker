@@ -55,3 +55,27 @@ bottom. One bullet per concrete thing done, tried, found, or broken.
 * **Added powerwinner's two missing rules** — price band 0.30-0.70 and quoting only in the first 40% of the window — each behind its own switch so they can be measured one at a time.
 * **Dashboard now shows maker metrics:** fill rate vs queue depth, fill provenance (tape-confirmed vs inferred vs crossed), pair-cost distribution, quote uptime + top skip reasons, partial-fill exposure, taker fees, spread capture per share. `fills.reason` is persisted so provenance traces to a real row.
 * **Two bugs in this session's own tooling, caught before they produced a finding:** the replay harness stopped quoting a side after a complete fill (a filled order is done, not resting); the tape cursor advanced after `continue` paths and would have re-credited prints. Tests 8 -> 31; the harness is verified against scripted books with hand-computed answers before touching real data.
+
+## 31/07/2026
+* **Parked the port-8788 single-bot pipeline on a sibling git branch
+  (`archive/legacy-bot-8788`).** The fleet on port 8800 has rendered
+  the legacy single-market code (server/dashboard, server/kanban,
+  strategy/main.py's loop, scripts/run_fleet.py, deploy/run_service.py)
+  functionally dead on this host. All five moved to
+  `archive/legacy-bot-8788/<original subpath>`. `strategy/main.py` keeps
+  only `full_book` + `recent_trades` — the two helpers `strategy.fleet`
+  still imports; the dead tail is preserved at the archive path. The
+  fleet dashboard test now validates the live fleet page only.
+  `.gitignore` was loosened to track `archive/legacy-bot-8788/`; the rest
+  of `archive/` (DB snapshots, NEXT_SESSION notes) stays gitignored.
+  Both `feat/live-readiness` and `archive/legacy-bot-8788` point at this
+  single commit, so the live branch is clean and the historical version
+  is recoverable.
+* **Prepared a fresh $1,000 paper run and simplified the dashboard.** Configured a $1,000 simulated wallet with $900 allocation headroom, a $1,000 committed-cap ceiling, and a $400 fleet naked-risk ceiling. The dashboard now foregrounds liquidation P&L, projected reward, committed wallet, naked risk, realized P&L, and heartbeat health; projected return uses total committed capital instead of offers alone. The startup script gained `-FreshRun` to archive the old DB/sidecars and stale state file before restart.
+* **Caught and bounded a $1,036.80 committed-cap overshoot.** The first fresh sweep retained old-size orders and reserved new offers against a stale total. Post-cancellation reservation now resizes existing orders, caps new resting notional, and caps emergency crossed hedges; validation fell to $367 then $256 committed, below the $1,000 ceiling.
+* **Made fleet-wide cap scope explicit.** `visit()` now accepts the complete fleet state list from `main()` for emergency-hedge and resting-order affordability, while direct single-market calls remain safely bounded to one state; the undefined-local scope bug is gone.
+* **Aligned dashboard heartbeat health with observed sweep cadence.** Raised the stale threshold from 45 to 120 seconds because a normal 20-market sweep takes roughly 50–70 seconds; state age and DB age remain visible for diagnosis.
+* **Kept cancellation lifecycle in the ledger.** Simulated orders now retain their quote IDs so hard-cap releases and requotes mark database rows cancelled; shallow emergency hedges also close their unfilled residual quote row.
+* **Linked maker fills back to their quote rows.** Tape-confirmed resting fills now carry the originating quote ID, and cancellation preserves partial fill quantities while closing the remaining quote lifecycle.
+* **Corrected the health label to match the 120-second stale threshold.** The dashboard now says `heartbeat < 120s` instead of retaining the old 45-second copy.
+* **Hardened the launcher handoff.** `fleet-start.ps1` now resolves its checkout from `$PSScriptRoot`, checks for unrelated port-8800 listeners, and waits for child processes and the port to clear before restarting, failing closed if either remains. Added regression tests for preserving the originating quote ID on tape-confirmed fills and for cancelling a partially filled quote without losing its filled quantity.

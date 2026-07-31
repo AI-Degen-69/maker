@@ -117,6 +117,30 @@ def _decide_quotes_rewards(
     if getattr(cfg, "gate_state", gate.NORMAL) == gate.EXITED:
         return [], "market exited: fills still lost money after widening"
 
+    # PER-MARKET FILL CAP. This check has existed in `decide_quotes` since the
+    # beginning and has never once run: the rewards objective returns from THIS
+    # function, several lines before the caller reaches it. Three markets sat
+    # at 26 fills against a nominal limit of 25.
+    #
+    # It belongs here rather than in the caller because "rewards" is the
+    # objective the fleet actually runs -- a cap enforced only on the path
+    # nobody takes is not a cap.
+    if inv.fills >= cfg.max_fills_per_market:
+        return [], f"hit {cfg.max_fills_per_market} fills for this market"
+
+    # ZERO ALLOCATION MEANS QUOTE NOTHING. `reallocate` has always documented
+    # that an unfunded market "gets 0 and stops quoting", and it never did:
+    # `size = max(quote_shares, min_quote_shares)` below silently promoted a 0
+    # back to the venue minimum, so a market the allocator had deliberately
+    # defunded carried on posting 50-share orders.
+    #
+    # Harmless while every market was fundable. Not harmless once U4 defunds
+    # markets that cannot clear the payout floor -- measured on the first
+    # smoke run, 17 markets kept quoting while 4 were funded, putting $2,108
+    # of offers against a $2,000 committed cap before a share was bought.
+    if cfg.quote_shares <= 0:
+        return [], "unfunded by the allocator -- quoting nothing"
+
     out: list[QuoteIntent] = []
     blocked: list[str] = []
     for side, book in (("UP", up_book), ("DOWN", down_book)):
@@ -218,6 +242,30 @@ def _decide_quotes_rewards(
             blocked.append(
                 f"{side}: fleet ${cfg.fleet_naked_usd:.0f} unhedged >= "
                 f"${cfg.max_fleet_naked_usd:.0f} budget -- not adding")
+            continue
+
+        # TOTAL COMMITTED CAPITAL. The cap above bounds only the unhedged leg,
+        # on the reasoning that a matched pair always pays $1 and therefore
+        # cannot lose. True, and beside the point: a pair still ties up money
+        # that cannot be committed elsewhere. With only the naked cap running,
+        # $9,588 left the wallet against a nominal $1,200 budget.
+        #
+        # Same asymmetry as the naked cap, for the same reason: the side that
+        # would REDUCE the position keeps quoting even at the limit. Blocking
+        # both sides here would freeze the fleet at maximum commitment with no
+        # way down, since merge needs a matched pair and the light side is what
+        # produces one. Being over the cap must never remove the only route
+        # back under it.
+        #
+        # Named separately in the blocked list from the naked cap: an operator
+        # reading "not adding" has to be able to tell which limit bound, or the
+        # dashboard shows a dead market with no explanation.
+        if (imbalance >= 0
+                and cfg.max_committed_usd > 0
+                and cfg.committed_usd >= cfg.max_committed_usd):
+            blocked.append(
+                f"{side}: fleet ${cfg.committed_usd:.0f} committed >= "
+                f"${cfg.max_committed_usd:.0f} cap -- not adding")
             continue
         skew = cfg.max_skew * max(-1.0, min(1.0, imbalance / cfg.skew_full_shares))
         # A WIDENED market quotes further from mid on BOTH sides: fewer fills,

@@ -62,13 +62,29 @@ class RestingOrder:
     price: float
     size: float               # shares we want
     filled: float = 0.0
+    # Shares the PRE-U1 engine would have considered filled by now: real
+    # tape-backed fills plus the delta-path credits U1 withdrew. Tracked
+    # separately so shadow accounting cannot double-count -- without it an
+    # order whose queue shrinks and is then swept records candidates totalling
+    # more than the order size, inflating the unverified count and making the
+    # verified ratio read worse than it is.
+    shadow_filled: float = 0.0
     queue_ahead: float = 0.0  # shares resting ahead of us when we joined
     posted_ts: float = 0.0
+    # Database quote row corresponding to this in-memory order. Kept here so
+    # cancellation paths can close the historical row as well as the simulator
+    # order; otherwise the dashboard would report cancelled offers as open.
+    quote_id: int | None = None
     cancelled: bool = False
 
     @property
     def remaining(self) -> float:
         return max(0.0, self.size - self.filled)
+
+    @property
+    def shadow_remaining(self) -> float:
+        """`remaining` as the pre-U1 engine would have seen it."""
+        return max(0.0, self.size - self.shadow_filled)
 
     @property
     def is_open(self) -> bool:
@@ -82,6 +98,7 @@ class Fill:
     price: float
     size: float
     ts: float
+    quote_id: int | None = None
     queue_waited: float = 0.0   # shares that had to clear ahead of us
     # HOW we decided this filled. The two are not equally trustworthy:
     #   'queue' -- size at our level shrank past the queue ahead of us. The
@@ -103,6 +120,11 @@ class QueueFillEngine:
 
     orders: list[RestingOrder] = field(default_factory=list)
     fills: list[Fill] = field(default_factory=list)
+    # Fills the pre-U1 delta logic WOULD have credited but the tape cannot
+    # support. Never applied to inventory; recorded so the gap is measurable
+    # rather than silently traded away for an under-count. These carry
+    # `reason="unverified"` and exist only in this list.
+    unverified: list[Fill] = field(default_factory=list)
     # token_id -> {price: size} as of the previous poll
     _last_book: dict[str, dict[float, float]] = field(default_factory=dict)
 
@@ -219,53 +241,87 @@ class QueueFillEngine:
             before = prev.get(o.price, 0.0)
             now = bids.get(o.price, 0.0)
 
-            if tape is not None:
-                # Measured path. Trades hit the front of the queue, so only
-                # volume beyond the shares ahead of us can be ours. Cancels
-                # still advance our queue position -- they just never fill us.
-                t_vol = tape.get(o.price, 0.0)
-                qty = min(o.remaining, max(0.0, t_vol - o.queue_ahead))
-                left = max(0.0, before - now)          # trades + cancels
-                if qty > 1e-9:
-                    made.append(self._fill(o, qty, ts, reason="tape"))
-                o.queue_ahead = max(0.0, o.queue_ahead - max(left, t_vol))
-                continue
-
-            # Level cleared outright and the market moved below us -> our
-            # remainder must have traded.
+            # THE ONLY CREDITING PATH (U1). Trades hit the front of the queue,
+            # so only volume beyond the shares ahead of us can be ours. Cancels
+            # still advance our queue position -- they just never fill us.
             #
-            # `before > 1e-9` is REQUIRED. Without it this branch fired for any
-            # order resting ABOVE the best bid -- where, by definition, no size
-            # is queued at our price -- so `now == 0` and `best_bid < price`
-            # were both true on the very first poll and the whole order was
-            # granted as a fill against a book that had not moved a single
-            # share. Measured: post 120sh at 0.52 into a static {0.50: 300}
-            # book and the engine returned a 120sh fill, fill_rate 1.0. That is
-            # precisely the "the ask touched my price, so I filled" model this
-            # module's docstring says it refuses to be, and it was worst exactly
-            # where the spread -- and so the apparent edge -- was widest.
+            # Absent tape is modelled as zero traded volume, NOT as licence to
+            # infer fills from the book delta. The two cases differ in what we
+            # know, not in what we may credit: `{}` means the tape was read and
+            # nothing traded; `None` means we could not read it. Both credit
+            # nothing. Only the second records an unverified candidate, because
+            # only the second leaves a gap somebody might later close.
             #
-            # A level can only be "cleared" if it held something first. When we
-            # rest inside the spread we are alone at our price, and nothing in
-            # the bid-side deltas can tell us a seller came down to hit us; the
-            # honest answer there is "no observable fill".
-            if before > 1e-9 and now <= 1e-9 and best_bid < o.price - 1e-9:
-                made.append(self._fill(o, o.remaining, ts, reason="sweep"))
-                continue
+            # Measured on the 18.7h run, the delta path this replaces produced
+            # 246 of 282 fills against 2 tape-backed ones -- so the entire
+            # fill rate, and every profit number derived from it, rested on the
+            # one branch that could not be checked.
+            t_vol = tape.get(o.price, 0.0) if tape is not None else 0.0
+            qty = min(o.remaining, max(0.0, t_vol - o.queue_ahead))
+            left = max(0.0, before - now)          # trades + cancels
 
-            consumed = before - now
-            if consumed <= 1e-9:
-                continue        # level grew or held: people joined behind us
+            if tape is None:
+                # Shadow accounting. Computed from queue state as it stands
+                # BEFORE the advance below, so it sees exactly what the old
+                # logic saw. Pure: it must never touch `o`, or measuring the
+                # gap would change the fills we credit and the ratio would be
+                # measuring itself.
+                shadow, kind = self._delta_would_have_filled(
+                    o, before, now, best_bid)
+                if shadow > 1e-9:
+                    o.shadow_filled += shadow
+                    self.unverified.append(Fill(
+                        token_id=o.token_id, side=o.side, price=o.price,
+                        size=shadow, ts=ts, queue_waited=o.queue_ahead,
+                        reason=kind))
 
-            # Queue ahead absorbs first.
-            if o.queue_ahead > 0:
-                eaten = min(o.queue_ahead, consumed)
-                o.queue_ahead -= eaten
-                consumed -= eaten
-            if consumed > 1e-9:
-                made.append(self._fill(o, min(o.remaining, consumed), ts))
+            if qty > 1e-9:
+                made.append(self._fill(o, qty, ts, reason="tape"))
+            o.queue_ahead = max(0.0, o.queue_ahead - max(left, t_vol))
 
         return [f for f in made if f is not None and f.size > 1e-9]
+
+    @staticmethod
+    def _delta_would_have_filled(o: RestingOrder, before: float, now: float,
+                                 best_bid: float) -> tuple[float, str]:
+        """Shares the pre-U1 book-delta logic would have credited, verbatim.
+
+        PURE. Reads `o` and never writes it -- the caller applies the queue
+        advance itself, once, for both the measured and unmeasured cases.
+
+        This is kept as an exact replica rather than deleted because the ratio
+        between what it claims and what the tape confirms is the number the
+        Phase A decision gate reads. Deleting it would make the old fill counts
+        unexplainable; trusting it is what U1 exists to stop.
+
+        `before > 1e-9` is REQUIRED. Without it this branch fired for any order
+        resting ABOVE the best bid -- where, by definition, no size is queued at
+        our price -- so `now == 0` and `best_bid < price` were both true on the
+        very first poll and the whole order was granted as a fill against a book
+        that had not moved a single share. Measured: post 120sh at 0.52 into a
+        static {0.50: 300} book and the engine returned a 120sh fill, fill_rate
+        1.0. That guard is why a static book records no candidate here either.
+
+        Returns (shares, kind). The kind preserves the evidence-quality split
+        the pre-U1 reasons carried: a swept level credited the whole remainder
+        off one observation and cannot tell a mass cancel from a mass trade,
+        while a shrinking queue at least observed consumption past our
+        position. Both are unverified, but they are not equally weak, and the
+        gate should be able to see which one dominates.
+        """
+        # Level cleared outright and the market moved below us: the old logic
+        # credited our whole remainder, documented optimistic bias #1.
+        if before > 1e-9 and now <= 1e-9 and best_bid < o.price - 1e-9:
+            return o.shadow_remaining, "unverified_sweep"
+
+        consumed = before - now
+        if consumed <= 1e-9:
+            return 0.0, ""      # level grew or held: people joined behind us
+        # Queue ahead absorbed first -- computed, not applied.
+        consumed -= min(o.queue_ahead, consumed)
+        if consumed <= 1e-9:
+            return 0.0, ""
+        return min(o.shadow_remaining, consumed), "unverified_queue"
 
     def _fill(self, o: RestingOrder, qty: float, ts: float,
               reason: str = "queue") -> Optional[Fill]:
@@ -273,8 +329,13 @@ class QueueFillEngine:
         if qty <= 1e-9:
             return None
         o.filled += qty
+        # A tape-backed fill happened in both universes, so it advances the
+        # shadow too. Otherwise a verified fill would leave shadow_remaining
+        # untouched and the next sweep would claim shares already credited.
+        o.shadow_filled += qty
         f = Fill(token_id=o.token_id, side=o.side, price=o.price, size=qty,
-                 ts=ts, queue_waited=o.queue_ahead, reason=reason)
+                 ts=ts, quote_id=o.quote_id, queue_waited=o.queue_ahead,
+                 reason=reason)
         self.fills.append(f)
         return f
 
@@ -306,3 +367,24 @@ class QueueFillEngine:
         """
         p = self.posted_shares()
         return (self.filled_shares(include_crossed=False) / p) if p else None
+
+    def unverified_shares(self) -> float:
+        """Shares the old book-delta logic would have credited that the tape
+        could not support. Never in inventory, never in `filled_shares`."""
+        return sum(f.size for f in self.unverified)
+
+    def verified_ratio(self) -> Optional[float]:
+        """Tape-backed shares as a fraction of everything the engine observed.
+
+        THE number the Phase A decision gate reads. On the 18.7h pre-U1 run the
+        equivalent figure was roughly 2 fills in 282 -- if that holds, spread
+        capture is mostly an artefact of counting cancels as trades and the
+        strategy pivots to pure rent collection.
+
+        None when nothing has been observed at all. A no-op run must not report
+        a confident 1.0 (nothing was verified) or 0.0 (nothing failed
+        verification); both would be read as a measurement.
+        """
+        verified = self.filled_shares(include_crossed=False)
+        total = verified + self.unverified_shares()
+        return (verified / total) if total > 1e-9 else None
