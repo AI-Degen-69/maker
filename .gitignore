@@ -33,3 +33,6 @@ archive/*
 .venv/
 __pycache__/
 *.pyc
+
+# Freebuff Desktop app data -- local, never commit
+.freebuff/
