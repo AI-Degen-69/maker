@@ -77,6 +77,40 @@ function Get-FleetInstance {
 }
 
 
+# THE FAILURE THIS CATCHES IS A NULL, NOT A NUMBER.
+#
+# A `$strays` local in fleet-stop.ps1 silently aliased its own `-Strays` switch
+# (PowerShell variable names are case-insensitive). The assignment failed, the
+# loop read `$p.ProcessId` off a SwitchParameter as 0, and the descendant walk
+# started at System Idle -- so the script asked Windows to stop System, smss,
+# Registry, Secure System and Memory Compression. Windows refused. That was
+# luck; this is the guard.
+#
+# The threshold covers the reserved low ids (0 = System Idle, 4 = System). It
+# does NOT enumerate every system process -- smss and Registry sit well above
+# it. Those were only ever reachable BECAUSE the walk root was 0, and a walk
+# root of 0 is now refused outright. Rejecting null/0/non-numeric is the load
+# bearing part; the numeric floor is a backstop, not a whitelist of safe ids.
+$FleetMinKillablePid = 100
+
+function Assert-KillablePid {
+    <#  Return the id as an int, or throw. Never returns something unkillable. #>
+    param([Parameter(Mandatory)][AllowNull()][object]$ProcessId,
+          [string]$Context = "")
+
+    $id = 0
+    if ($null -eq $ProcessId -or -not [int]::TryParse([string]$ProcessId, [ref]$id)) {
+        throw "Refusing to stop a non-numeric process id '$ProcessId' $Context"
+    }
+    if ($id -lt $FleetMinKillablePid) {
+        throw ("Refusing to stop PID $id $Context -- ids below " +
+               "$FleetMinKillablePid are Windows system processes, so this is a " +
+               "bug in the caller rather than a fleet process.")
+    }
+    return $id
+}
+
+
 function Get-DescendantPids {
     <#  Every process descending from $ParentId, deepest first.
 
@@ -85,6 +119,9 @@ function Get-DescendantPids {
         fleet is a second writer on the same database. Walks the ParentProcessId
         graph rather than matching on command line. #>
     param([Parameter(Mandatory)][int]$ParentId)
+
+    # Walking down from a system id enumerates half the machine as "children".
+    $ParentId = Assert-KillablePid -ProcessId $ParentId -Context "(descendant walk root)"
 
     $all = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Select-Object ProcessId, ParentProcessId
@@ -106,14 +143,18 @@ function Get-DescendantPids {
 
 function Stop-FleetTree {
     <#  Stop one recorded process and everything below it. #>
-    param([Parameter(Mandatory)][int]$ProcessId, [string]$Label = "")
+    param([Parameter(Mandatory)][AllowNull()][object]$ProcessId, [string]$Label = "")
 
-    foreach ($child in Get-DescendantPids -ParentId $ProcessId) {
-        Write-Host "  stopping child PID $child" -ForegroundColor DarkYellow
-        Stop-Process -Id $child -Force -ErrorAction SilentlyContinue
+    $target = Assert-KillablePid -ProcessId $ProcessId -Context $Label
+    foreach ($child in Get-DescendantPids -ParentId $target) {
+        # Checked individually too: the walk is only as trustworthy as the
+        # ParentProcessId graph it reads.
+        $safe = Assert-KillablePid -ProcessId $child -Context "(child of $target)"
+        Write-Host "  stopping child PID $safe" -ForegroundColor DarkYellow
+        Stop-Process -Id $safe -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "stopping PID $ProcessId $Label" -ForegroundColor Yellow
-    Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
+    Write-Host "stopping PID $target $Label" -ForegroundColor Yellow
+    Stop-Process -Id $target -Force -ErrorAction SilentlyContinue
 }
 
 

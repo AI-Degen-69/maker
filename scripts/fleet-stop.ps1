@@ -33,17 +33,23 @@ if ($stopped -gt 0) {
     Write-Host "fleet stopped ($stopped process tree(s))." -ForegroundColor Green
 }
 
-$strays = @(Find-FleetStrays)
+# NOT $strays. PowerShell variable names are case-insensitive, so `$strays`
+# IS the `-Strays` switch parameter above. Assigning the result here wrote an
+# object array into a SwitchParameter: the conversion failed, `$p.ProcessId`
+# then read as 0, and the descendant walk started from System Idle -- so this
+# tried to Stop-Process the Windows system processes. They are protected and
+# survived, which is luck rather than safety.
+$unowned = @(Find-FleetStrays)
 
-if ($strays.Count -eq 0) {
+if ($unowned.Count -eq 0) {
     if ($stopped -eq 0) { Write-Host "nothing was running." -ForegroundColor DarkGray }
     return
 }
 
 if (-not $Strays) {
     Write-Host ""
-    Write-Host "$($strays.Count) fleet-shaped process(es) NOT started by this checkout:" -ForegroundColor Yellow
-    $strays | ForEach-Object {
+    Write-Host "$($unowned.Count) fleet-shaped process(es) NOT started by this checkout:" -ForegroundColor Yellow
+    $unowned | ForEach-Object {
         $cl = ($_.CommandLine -replace '\s+', ' ')
         Write-Host "  PID $($_.ProcessId)  $($cl.Substring(0, [Math]::Min(90, $cl.Length)))" -ForegroundColor DarkGray
     }
@@ -55,9 +61,9 @@ if (-not $Strays) {
 # Explicitly authorised. Supervisors first, so a supervisor cannot restart a
 # child we just stopped.
 Write-Host ""
-Write-Host "-Strays given: stopping $($strays.Count) unowned process(es)" -ForegroundColor Yellow
-$sups = @($strays | Where-Object { $_.CommandLine -like "*strategy.supervisor*" })
-$rest = @($strays | Where-Object { $_.CommandLine -notlike "*strategy.supervisor*" })
+Write-Host "-Strays given: stopping $($unowned.Count) unowned process(es)" -ForegroundColor Yellow
+$sups = @($unowned | Where-Object { $_.CommandLine -like "*strategy.supervisor*" })
+$rest = @($unowned | Where-Object { $_.CommandLine -notlike "*strategy.supervisor*" })
 foreach ($p in ($sups + $rest)) {
     Stop-FleetTree -ProcessId $p.ProcessId -Label "(stray)"
     Start-Sleep -Milliseconds 300
