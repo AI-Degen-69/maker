@@ -186,6 +186,25 @@ CREATE TABLE IF NOT EXISTS hedge_census (
 -- previous 60-market run measured fills only, which is why it read as flat
 -- while the actual payoff went unrecorded. our_share is what the pool pays us:
 --   payout ~= our_share * 0.20 * taker_fees_in_this_market
+-- PROJECTED INCOME, SAMPLED OVER TIME. One row per sweep, fleet-wide.
+--
+-- The dashboard's income figure is instantaneous: it is what the CURRENT
+-- positions project, and it swings from $302/day to $41/day inside an hour as
+-- markets are funded, defunded, filled and re-ranked. Read as "what the fleet
+-- earns", that is misleading in both directions -- whichever moment you happen
+-- to look at becomes the headline.
+--
+-- Sampling makes the honest quantities computable: income integrated over the
+-- time each level was actually held (dollars genuinely accrued so far), and
+-- that total divided by elapsed time (a time-weighted rate, in which a level
+-- held ten minutes counts a sixth as much as one held an hour).
+CREATE TABLE IF NOT EXISTS income_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL,
+    income_day REAL,           -- projected $/day at this instant, fleet-wide
+    committed REAL             -- dollars deployed behind that projection
+);
+
 CREATE TABLE IF NOT EXISTS reward_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL,
@@ -427,6 +446,57 @@ def recon_summary() -> dict:
         "traded_at_our_price_pct": (100.0 * saw_trade / total
                                     if total else None),
     }
+
+
+def log_income_sample(ts: float, income_day: float, committed: float) -> None:
+    """One fleet-wide projection reading, once per sweep."""
+    with _conn() as c:
+        c.execute("INSERT INTO income_samples (ts, income_day, committed) "
+                  "VALUES (?,?,?)", (ts, income_day, committed))
+
+
+# A sweep is ~30-60s. Anything longer than this between two samples is a gap
+# in the RUN -- a restart, a crash, a laptop asleep -- not a rate that was
+# genuinely held for that whole period. Crediting the gap would invent income
+# for hours the fleet was not quoting, which is precisely the error that makes
+# a paper run look better than the machine it ran on.
+MAX_SAMPLE_GAP_SEC = 300.0
+
+
+def income_accrual() -> dict:
+    """Integrate the projected income series over the time it was held.
+
+    Returns `accrued` (dollars the model says were earned so far), `twa_day`
+    (accrued divided by elapsed quoting time, in $/day), `hours` of credited
+    time, and `n` samples.
+
+    Each sample is credited for the interval UNTIL THE NEXT ONE, not since the
+    previous one, because a projection describes the state going forward from
+    the moment it was taken. The final sample earns nothing yet; it has no
+    interval behind it.
+
+    This is a MODEL integrated over time, not a ledger. It inherits every
+    assumption in the projection -- above all `spread_capture_frac`, which is
+    a hypothesis until enough fills mature to replace it.
+    """
+    out = {"accrued": 0.0, "twa_day": None, "hours": 0.0, "n": 0}
+    with _conn() as c:
+        rows = c.execute("SELECT ts, income_day FROM income_samples "
+                         "ORDER BY ts").fetchall()
+    out["n"] = len(rows)
+    if len(rows) < 2:
+        return out
+    secs = 0.0
+    for (t0, inc), (t1, _) in zip(rows, rows[1:]):
+        dt = (t1 or 0) - (t0 or 0)
+        if dt <= 0 or dt > MAX_SAMPLE_GAP_SEC:
+            continue
+        out["accrued"] += (inc or 0.0) * dt / 86400.0
+        secs += dt
+    out["hours"] = secs / 3600.0
+    if secs > 0:
+        out["twa_day"] = out["accrued"] * 86400.0 / secs
+    return out
 
 
 def verified_ratio() -> dict:

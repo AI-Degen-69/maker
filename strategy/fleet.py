@@ -25,7 +25,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from strategy import gate, markout, merge, profit_take, rewards, store
-from strategy.allocate import allocate_fundable, capital_scarcity, shares_for
+from strategy.allocate import (allocate_fundable, capital_scarcity, shares_for,
+                               spread_capture_daily)
 from strategy.config import load as load_cfg
 from strategy.fills import QueueFillEngine
 from strategy.main import full_book, recent_trades
@@ -127,6 +128,23 @@ class MarketState:
         self.cid = spec["cid"]
         self.title = spec["title"]
         self.daily = spec["daily"]
+        # WHAT THIS MARKET PAYS, AND WHAT PAYS IT.
+        #
+        # `daily` is the reward pot, and it is 0 for every market publishing
+        # clobRewards: 0 -- which is most of the ones that trade. Those are
+        # paid in spread instead, so the pot is reconstructed from volume and
+        # book width. Computed once, here, because three separate consumers
+        # need the same answer: the allocator sizes on it, the live-state
+        # income projection reports it, and the dashboard reads that.
+        #
+        # Derived from config rather than read from the spec, so revising the
+        # capture assumption takes effect on the next sweep instead of
+        # requiring a re-rank.
+        self.source = "rewards" if self.daily > 0 else "spread"
+        self.pot = self.daily if self.daily > 0 else spread_capture_daily(
+            float(spec.get("volume_24h") or 0.0),
+            float(spec.get("spread") or base_cfg.spread_capture_default_spread),
+            base_cfg.spread_capture_frac)
         # Each market publishes its own reward window, minimum order size and
         # tick. Quoting under a market's min_size scores exactly zero, so these
         # are load-bearing, not cosmetic.
@@ -277,6 +295,10 @@ def reallocate(states, base) -> dict:
     share is set by the competition, not by the pot. Big pots are big precisely
     because makers crowd them.
 
+    Two income sources, one water-fill. Reward markets are sized on their pot;
+    markets paying no rewards at all are sized on expected spread capture, and
+    only the reward ones are held to the $1.50 minimum-distribution floor.
+
     Runs only on markets that have reported a live share; a market we have not
     measured yet keeps its current size rather than being sized off a guess.
     Markets the allocator funds below their min_size get 0 and stop quoting,
@@ -316,7 +338,23 @@ def reallocate(states, base) -> dict:
         ref = 100.0
         ours_ref = ref * k
         total = ours_ref + avg_theirs
-        obs.append({"cid": s.cid, "daily": s.daily, "capital": ref,
+
+        # A market that pays no rent still pays a spread, and `MarketState`
+        # has already converted that into the same $/day pot, so everything
+        # here -- income, marginal, the water-fill -- is unchanged. What does
+        # NOT carry over is the $1.50 payout floor: it is the venue's minimum
+        # reward DISTRIBUTION, and a spread market makes no distribution.
+        # `source` is what tells allocate_fundable which rule applies.
+        #
+        # No reward pot and no measured volume leaves a zero pot. That is not
+        # a cheap market, it is an unknown one, and unknown must not size as
+        # zero-competition upside -- skipped exactly like a market we have
+        # never sampled.
+        if s.pot <= 0:
+            continue
+
+        obs.append({"cid": s.cid, "daily": s.pot, "source": s.source,
+                    "capital": ref,
                     "share": (ours_ref / total) if total > 0 else 1.0,
                     "min_dollars": float(s.spec["min_size"])})
 
@@ -387,7 +425,10 @@ def visit(st: MarketState, bot_cfg, now: float,
     # resting-order reservation use the same fleet-wide committed total.
     committed_states = states if states is not None else [st]
     if st.market is None:
-        st.market = fetch_pinned_market(st.cid)
+        # Reward funding is not a loadability condition. The ranker already
+        # decided this market belongs in the universe, and half of it now pays
+        # spread rather than rent.
+        st.market = fetch_pinned_market(st.cid, require_rewards=False)
         if st.market is None:
             st.err = "not funded / not accepting orders"
             return
@@ -789,7 +830,11 @@ def visit(st: MarketState, bot_cfg, now: float,
 
     st.spec["_live"] = {
         "share": share, "ours": ours, "theirs": theirs,
-        "income": share * st.daily,
+        # Projected income at the CURRENT score share, off whichever pot pays
+        # this market. Reading `daily` here reported $0.00/day for every
+        # spread market, which is true of its rent and false of its income.
+        "income": share * st.pot,
+        "pot": st.pot, "source": st.source,
         "capital": sum(o.price * (o.size - o.filled) for o in orders),
         "quotes": [{"side": o.side, "price": round(o.price, 4), "size": o.size}
                    for o in orders],
@@ -941,6 +986,14 @@ def main() -> None:
             # first without the second is how a 0.256%/day return got reported
             # as 1.80%/day for a day and a half.
             committed = fleet_committed_cost(states)
+            # Sample the projection so it can be integrated over time. The
+            # instantaneous figure swings by an order of magnitude within an
+            # hour as markets are funded and defunded, so a single reading is
+            # only whichever moment the reader happened to look at.
+            try:
+                store.log_income_sample(time.time(), inc, committed)
+            except Exception as e:
+                log.warning("income sample failed: %s", e)
             log.info("sweep | %d/%d scoring | est $%.2f/day | offers $%.0f "
                      "| committed $%.0f/%.0f | naked $%.0f | funded %d/%d "
                      "| verified %s (%s)",

@@ -83,7 +83,8 @@ def fetch_live_market(gamma_host: str, series_slug: str) -> Optional[LiveMarket]
     return candidates[0]
 
 
-def fetch_pinned_market(condition_id: str) -> Optional[LiveMarket]:
+def fetch_pinned_market(condition_id: str,
+                        require_rewards: bool = True) -> Optional[LiveMarket]:
     """One specific long-dated market, pinned by condition_id.
 
     The 5-min BTC series pays nothing for resting (rewards.rates = null); these
@@ -92,9 +93,18 @@ def fetch_pinned_market(condition_id: str) -> Optional[LiveMarket]:
     resolution date (months out), which makes t_remaining effectively infinite
     and disables every 5-min-specific timing rule by construction.
 
-    Refuses a market that is not actually funded. A market can carry min_size
-    and max_spread while `rates` is null, which looks configured and pays zero
-    -- that exact trap cost us the previous run.
+    `require_rewards` refuses a market that is not actually funded. A market
+    can carry min_size and max_spread while `rates` is null, which looks
+    configured and pays zero -- that exact trap cost us a whole run, and it is
+    still the right default for a bot whose only income is rent.
+
+    The fleet passes False, because "pays no rewards" stopped being
+    disqualifying when spread capture landed: those are the markets that
+    actually trade, and refusing them here made them unloadable, unsampled and
+    therefore unfundable however well the allocator sized them. Whether a
+    market is worth funding is the allocator's decision and it is made from
+    `run/markets.json`; this function's job is only to say whether the market
+    can be quoted at all.
     """
     r = requests.get(f"https://clob.polymarket.com/markets/{condition_id}", timeout=15)
     r.raise_for_status()
@@ -103,7 +113,7 @@ def fetch_pinned_market(condition_id: str) -> Optional[LiveMarket]:
     rewards = m.get("rewards") or {}
     rates = rewards.get("rates") or []
     daily = sum(x.get("rewards_daily_rate", 0) or 0 for x in rates)
-    if daily <= 0:
+    if require_rewards and daily <= 0:
         return None
     if m.get("closed") or not m.get("accepting_orders"):
         return None

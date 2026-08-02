@@ -18,7 +18,7 @@ from __future__ import annotations
 import concurrent.futures as cf
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +27,7 @@ import requests
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from strategy.allocate import spread_capture_daily   # noqa: E402
 from strategy.config import load as _load_cfg   # noqa: E402
 
 RUN = ROOT / "run"
@@ -126,6 +127,94 @@ def gamma_volume(session: requests.Session,
     return out
 
 
+def gamma_spread_universe(session: requests.Session,
+                          pages: int = 2, per_page: int = 250) -> list[dict]:
+    """Liquid short-dated markets that pay NO rewards, shaped like CLOB rows.
+
+    `/sampling-markets` lists reward-funded markets and nothing else, so the
+    ranker structurally could not see the markets that actually trade. The
+    entire 2026-07-31 universe came from there: 20 markets, 48 tape prints in
+    11.6 hours, nine of them never traded at all, and every `tape_json`
+    recorded in run/fleet.db is `{}`.
+
+    Gamma sorts by 24h volume and carries the book summary (`spread`,
+    `bestBid`, `bestAsk`) inline, so the expensive part -- one CLOB round trip
+    per market -- happens only for candidates that already clear volume and
+    horizon.
+
+    Reward-funded markets are excluded here rather than merged: they are
+    already sourced, priced and floored by the reward path, and a market
+    scored twice would compete against itself in the water-fill.
+
+    Returned rows use CLOB field names (`condition_id`, `tokens`, `rewards`)
+    because `evaluate` reads them, plus the two gamma-only figures the spread
+    pot needs.
+    """
+    now = datetime.now(timezone.utc)
+    out: list[dict] = []
+    for page in range(pages):
+        params = {
+            "closed": "false", "active": "true", "archived": "false",
+            "order": "volume24hr", "ascending": "false",
+            "limit": per_page, "offset": page * per_page,
+            "end_date_min": now.isoformat(),
+            "end_date_max": (now + timedelta(days=MAX_DAYS_TO_RESOLVE)).isoformat(),
+        }
+        try:
+            rows = session.get(GAMMA, params=params, timeout=30).json()
+        except Exception:
+            break
+        if isinstance(rows, dict):
+            rows = rows.get("data") or []
+        if not rows:
+            break
+        for m in rows:
+            vol = float(m.get("volume24hr") or 0.0)
+            if vol < MIN_VOLUME_24H:
+                # Sorted by volume, so the first market under the floor ends
+                # the useful part of the listing.
+                return out
+            if not m.get("enableOrderBook") or not m.get("acceptingOrders"):
+                continue
+            # Reward-funded markets belong to the other path.
+            if m.get("clobRewards"):
+                continue
+            try:
+                toks = json.loads(m.get("clobTokenIds") or "[]")
+            except (TypeError, ValueError):
+                continue
+            if len(toks) != 2:
+                continue
+            spread = float(m.get("spread") or 0.0)
+            if spread <= 0:
+                continue
+            out.append({
+                "condition_id": m.get("conditionId"),
+                "question": m.get("question") or "",
+                "market_slug": m.get("slug") or "",
+                "tokens": [{"token_id": str(t)} for t in toks],
+                # No reward config exists on these markets. The scan below
+                # still needs a window and a scoring minimum to measure
+                # competing depth with, so the venue's usual defaults stand in
+                # -- they set the units of `theirs`, and reallocate() reads the
+                # same units back out. They are NOT a claim that this market
+                # pays rewards; `daily` stays 0 and `source` says spread.
+                "rewards": {"max_spread": float(m.get("rewardsMaxSpread") or 3.5),
+                            "min_size": float(m.get("rewardsMinSize") or 50)},
+                "minimum_tick_size": float(m.get("orderPriceMinTickSize") or 0.01),
+                "end_date_iso": m.get("endDate"),
+                # Quoting minimum, which is the venue's order minimum here --
+                # there is no reward score to qualify for, so rewardsMinSize
+                # would only inflate the lot the allocator has to buy.
+                "_order_min": float(m.get("orderMinSize") or 5),
+                "_volume_24h": vol,
+                "_spread": spread,
+            })
+        if len(rows) < per_page:
+            break
+    return out
+
+
 def order_score(v: float, s: float, size: float, min_size: float) -> float:
     if s < 0 or s > v or size < min_size:
         return 0.0
@@ -133,8 +222,15 @@ def order_score(v: float, s: float, size: float, min_size: float) -> float:
 
 
 def evaluate(session: requests.Session, rate: float, m: dict,
-             volume_24h: Optional[float] = None) -> dict | None:
-    """Income and capital for one market, from its live book."""
+             volume_24h: Optional[float] = None,
+             source: str = "rewards") -> dict | None:
+    """Income and capital for one market, from its live book.
+
+    `rate` is the market's pot in $/day, and `source` says what pays it. For a
+    reward market that is the venue's emission and the $1.50 minimum payout
+    applies; for a spread market it is `spread_capture_daily`, paid by the
+    taker on the trade, and no minimum distribution exists to apply.
+    """
     rw = m.get("rewards") or {}
     v = (rw.get("max_spread") or 3.5) / 100.0
     min_size = rw.get("min_size") or 50
@@ -205,11 +301,18 @@ def evaluate(session: requests.Session, rate: float, m: dict,
     # could not make.
     days = days_to_resolve(m.get("end_date_iso"))
     can_trade, why = tradable(volume_24h, days)
-    pays = income >= MIN_PAYOUT * FLOOR_MULTIPLE
+    # The payout floor is a REWARD rule -- the venue's minimum distribution.
+    # A spread market is paid by whoever lifts the offer, in the amount of the
+    # spread, so there is no distribution to be under. Holding it to the floor
+    # would reject exactly the liquid markets this path exists to admit.
+    pays = income >= MIN_PAYOUT * FLOOR_MULTIPLE if source == "rewards" else income > 0
     if not why and not pays:
-        why = f"income ${income:.2f}/day under payout floor"
+        why = (f"income ${income:.2f}/day under payout floor"
+               if source == "rewards" else "no spread income")
 
     return {
+        "source": source,
+        "spread": round(float(m.get("_spread") or 0.0), 4) or None,
         # Below the payout floor this market pays exactly zero, however good
         # its return_pct_day looks. Recorded rather than filtered here so the
         # report can show what was rejected and why.
@@ -220,8 +323,17 @@ def evaluate(session: requests.Session, rate: float, m: dict,
         "cid": m["condition_id"],
         "title": m.get("question", "")[:90],
         "slug": m.get("market_slug", ""),
-        "daily": rate,
-        "min_size": min_size,
+        # THE REWARD POT, and zero is the honest figure for a market that pays
+        # none. `fleet.reallocate` keys the spread path off `daily <= 0` and
+        # recomputes the pot from `volume_24h` and `spread`, so the capture
+        # assumption stays in config where it can be revised without
+        # re-ranking. `est_income` below reports what that pot projects.
+        "daily": rate if source == "rewards" else 0.0,
+        # Reward markets must quote at least rewardsMinSize or they score
+        # nothing; a spread market only has to clear the venue's order
+        # minimum, and using the larger figure would force the allocator to
+        # buy a lot several times bigger than the market needs.
+        "min_size": min_size if source == "rewards" else m.get("_order_min", 5),
         "max_spread": rw.get("max_spread") or 3.5,
         "tick": m.get("minimum_tick_size") or 0.01,
         "shares": n,
@@ -258,11 +370,26 @@ def main() -> None:
     vols = gamma_volume(s, [m["condition_id"] for _, m in short])
     print(f"volume read for {len(vols)}/{len(short)} unexpired candidates")
 
+    # THE SECOND UNIVERSE. Reward-funded markets are chosen for paying rent,
+    # and rent is paid on resting size whether or not anyone trades -- which is
+    # why the reward-only universe could run 74 hours and produce 9 tape-backed
+    # fills. Markets that pay no rewards at all are sourced here, on volume,
+    # and priced on the spread they pay instead.
+    spread_cands = gamma_spread_universe(s)
+    print(f"unfunded liquid markets: {len(spread_cands)} "
+          f"(>= ${MIN_VOLUME_24H:,.0f}/24h, <= {MAX_DAYS_TO_RESOLVE:.0f}d)")
+
+    jobs = [(rate, m, vols.get(m["condition_id"]), "rewards")
+            for rate, m in short]
+    jobs += [(spread_capture_daily(m["_volume_24h"], m["_spread"],
+                                   _CFG.spread_capture_frac),
+              m, m["_volume_24h"], "spread")
+             for m in spread_cands]
+
     out = []
     with cf.ThreadPoolExecutor(max_workers=12) as ex:
-        for r in ex.map(lambda a: evaluate(s, a[0], a[1],
-                                           vols.get(a[1]["condition_id"])),
-                        short):
+        for r in ex.map(lambda a: evaluate(s, a[0], a[1], a[2], source=a[3]),
+                        jobs):
             if r:
                 out.append(r)
     # Eligibility BEFORE ranking. Sorting on return_pct_day alone put the
@@ -294,13 +421,15 @@ def main() -> None:
     print(f"gates: 24h volume >= ${MIN_VOLUME_24H:,.0f}, "
           f"resolves within {MAX_DAYS_TO_RESOLVE:.0f}d, "
           f"income >= ${MIN_PAYOUT * FLOOR_MULTIPLE:.2f}/day\n")
-    print(f"{'market':<46}{'$/day':>7}{'capital':>9}{'ret%/d':>8}")
+    n_spread = sum(1 for r in picked if r["source"] == "spread")
+    print(f"picked {n_spread} spread / {len(picked) - n_spread} reward\n")
+    print(f"{'market':<40}{'src':>7}{'$/day':>7}{'capital':>9}{'ret%/d':>8}")
     for r in picked:
         # Windows consoles default to a legacy codepage; market titles carry
         # curly quotes and accents that crash a plain print AFTER the file is
         # already written, which looks like a failed run when it succeeded.
-        title = r["title"][:46].encode("ascii", "replace").decode("ascii")
-        print(f"{title:<46}{r['est_income']:>7.2f}"
+        title = r["title"][:40].encode("ascii", "replace").decode("ascii")
+        print(f"{title:<40}{r['source'][:6]:>7}{r['est_income']:>7.2f}"
               f"{r['est_capital']:>9.0f}{r['return_pct_day']:>8.2f}")
     if tc:
         print(f"\nTOTAL capital ${tc:,.0f}  income ${ti:,.2f}/day  = {100*ti/tc:.2f}%/day")

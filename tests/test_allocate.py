@@ -13,7 +13,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from strategy.allocate import (  # noqa: E402
-    allocate, capital_scarcity, competitor_depth, income, marginal)
+    allocate, allocate_fundable, capital_scarcity, competitor_depth, income,
+    marginal, spread_capture_daily)
 
 
 # --- capital scarcity -------------------------------------------------------
@@ -142,3 +143,61 @@ def test_idle_capital_beats_capital_under_the_floor():
     markets = [{"cid": "bad", "daily": 5.0, "capital": 115.0, "share": 0.01}]
     out = allocate(markets, budget=5000.0, floor=0.02)
     assert sum(out.values()) < 5000.0
+
+
+# --- spread capture (U6) ----------------------------------------------------
+
+def test_spread_capture_turns_volume_into_a_daily_pot():
+    """bitcoin-up-or-down-*: ~$92k/24h on a 1c book, pays no rewards at all.
+
+    $92,000 / $0.50 = 184,000 shares/day; at 1c of spread and a quarter of it
+    captured, that is $460/day of pot to be split by depth share.
+    """
+    assert spread_capture_daily(92_000.0, 0.01) == pytest.approx(460.0)
+
+
+def test_spread_capture_is_zero_without_volume_or_spread():
+    """A market nobody trades pays no spread, and neither does a market with
+    no spread to cross. Zero, not a small positive -- an unknown market must
+    not read as a cheap one."""
+    assert spread_capture_daily(0.0, 0.01) == 0.0
+    assert spread_capture_daily(92_000.0, 0.0) == 0.0
+
+
+def test_payout_floor_does_not_defund_a_spread_market():
+    """The $1.50 floor is the venue's minimum reward DISTRIBUTION. A spread
+    market is paid by the taker on the trade and distributes nothing, so
+    holding it to that floor would defund the only markets that trade.
+
+    Sized so the market clears the marginal floor and earns real income, but
+    lands under $1.50/day: ~$25 funded against $100 of competition on a $3/day
+    pot is $0.60/day. Applying the reward rule here drops it to zero.
+    """
+    m = {"cid": "spread", "source": "spread", "daily": 3.0,
+         "capital": 100.0, "share": 0.5, "min_dollars": 20.0}
+    out = allocate_fundable([m], budget=200.0, floor=0.02, payout_floor=1.5)
+    assert out["spread"] > 0.0
+
+    reward = dict(m, cid="reward", source="rewards")
+    out = allocate_fundable([reward], budget=200.0, floor=0.02,
+                            payout_floor=1.5)
+    assert out["reward"] == 0.0
+
+
+def test_spread_markets_still_answer_to_the_marginal_floor():
+    """Exempt from the payout floor is not exempt from earning its keep. A
+    market returning under the marginal floor is still refused -- capital
+    there is worse than idle capital whatever pays it."""
+    m = {"cid": "spread", "source": "spread", "daily": 0.5,
+         "capital": 100.0, "share": 0.01, "min_dollars": 20.0}
+    out = allocate_fundable([m], budget=200.0, floor=0.02, payout_floor=1.5)
+    assert out["spread"] == 0.0
+
+
+def test_markets_without_a_source_are_treated_as_reward_markets():
+    """Every caller that predates spread capture passes reward markets, so the
+    absent tag must keep the payout floor, not lose it."""
+    m = {"cid": "quiet", "daily": 3.0, "capital": 100.0, "share": 0.5,
+         "min_dollars": 20.0}
+    out = allocate_fundable([m], budget=200.0, floor=0.02, payout_floor=1.5)
+    assert out["quiet"] == 0.0
