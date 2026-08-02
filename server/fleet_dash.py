@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -37,6 +38,11 @@ log = logging.getLogger("fleet_dash")
 # one. Process-local by design: it is a read accelerator, not state worth
 # persisting, and a restart simply rebuilds it on the first request.
 _REBATE_CACHE: dict[str, tuple[int, float, float, int]] = {}
+# FastAPI runs a sync endpoint in a threadpool, so two polls can be in flight at
+# once. Read-modify-write on the running total is not atomic: overlapping polls
+# could both read the same checkpoint and both add the same rows. The critical
+# section is bounded by the number of NEW fills, so holding it costs nothing.
+_REBATE_LOCK = threading.Lock()
 
 app = FastAPI(title="maker fleet")
 
@@ -124,6 +130,12 @@ def _db_stats() -> dict:
 
 
 def _maker_rebate(db: Path | None = None) -> dict:
+    """Serialised entry point -- see `_maker_rebate_locked` for the substance."""
+    with _REBATE_LOCK:
+        return _maker_rebate_locked(db)
+
+
+def _maker_rebate_locked(db: Path | None = None) -> dict:
     """Maker Rebates earned on matched volume. NOT the liquidity-reward pot.
 
     Two venue programs pay a maker, and the dashboard had only ever wired one:
@@ -180,9 +192,17 @@ def _maker_rebate(db: Path | None = None) -> dict:
                 # restarted and the running total describes a different
                 # database. Start over rather than carry it across.
                 seen, earned, shares, n = 0, 0.0, 0.0, 0
+            # BOUNDED ABOVE BY THE CHECKPOINT WE ARE ABOUT TO STORE.
+            #
+            # `top` and this SELECT are separate statements, and the fleet
+            # inserts continuously while the dashboard polls every 4s. Without
+            # the upper bound a fill committed between the two was counted here
+            # but not covered by `top`, so the stored checkpoint sat below a row
+            # already added -- and the next poll counted its rebate a second
+            # time. Silent, and on a money figure.
             rows = c.execute(
-                "SELECT price, size FROM fills WHERE rowid > ? "
-                "AND (crossed = 0 OR crossed IS NULL)", (seen,)).fetchall()
+                "SELECT price, size FROM fills WHERE rowid > ? AND rowid <= ? "
+                "AND (crossed = 0 OR crossed IS NULL)", (seen, top)).fetchall()
         finally:
             # The old code leaked the handle on any query failure -- `close()`
             # sat after the statement that raises.

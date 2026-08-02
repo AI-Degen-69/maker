@@ -40,8 +40,15 @@ $strays = @(Find-FleetStrays)
 if ($strays.Count -gt 0) {
     Write-Host ""
     Write-Host "WARNING: $($strays.Count) fleet-shaped process(es) not started by this script:" -ForegroundColor Red
+    # Collapse FIRST, then bound against the collapsed length. Bounding with
+    # $_.CommandLine.Length while slicing the collapsed string throws
+    # ArgumentOutOfRangeException the moment collapsing shortens it -- and this
+    # scans arbitrary third-party processes, which is exactly where irregular
+    # spacing comes from. Under $ErrorActionPreference = "Stop" that aborts
+    # startup before the new fleet launches: a cosmetic line killing the run.
     $strays | ForEach-Object {
-        Write-Host "  PID $($_.ProcessId)  $(($_.CommandLine -replace '\s+', ' ').Substring(0, [Math]::Min(90, $_.CommandLine.Length)))" -ForegroundColor DarkGray
+        $cl = ($_.CommandLine -replace '\s+', ' ')
+        Write-Host "  PID $($_.ProcessId)  $($cl.Substring(0, [Math]::Min(90, $cl.Length)))" -ForegroundColor DarkGray
     }
     Write-Host "  Not stopping them -- they may belong to another checkout or user." -ForegroundColor DarkGray
     Write-Host "  If they are yours, stop them first: .\scripts\fleet-stop.ps1 -Strays" -ForegroundColor DarkGray

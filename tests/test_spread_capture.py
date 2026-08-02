@@ -114,6 +114,50 @@ def test_a_rerank_re_reads_the_pot_from_the_fresh_spec():
     assert st.pot == pytest.approx(rich)
 
 
+def test_a_rerank_keeps_the_spec_object_main_serialises():
+    """THE IDENTITY main() DEPENDS ON.
+
+    `main` builds `specs` and `states` from the same dicts, writes telemetry
+    through `st.spec["_live"]`, and serialises `specs` to fleet_state.json.
+    Rebinding `self.spec` to the fresh dict detached a surviving market from
+    that list, so its later `_live` writes landed somewhere `specs` no longer
+    referenced -- and the dashboard file froze at the pre-re-rank snapshot.
+    """
+    base = load_cfg()
+    original = _spec(cid="held", volume=50_000.0)
+    st = MarketState(original, base)
+    assert st.spec is original
+
+    st.spec["_live"] = {"income": 1.23}          # as `visit` would write
+    st.refresh_pot(_spec(cid="held", volume=90_000.0), base)
+
+    assert st.spec is original, "main's `specs` entry must stay the same object"
+    assert original["volume_24h"] == 90_000.0, "fresh funding must land in it"
+    assert st.spec["_live"] == {"income": 1.23}, (
+        "the fresh spec has no _live; merging it in would blank the reading")
+
+
+def test_a_rerank_refreshes_the_spec_derived_config():
+    """cfg carries min_size/max_spread/tick too; stale values disagree with the
+    spec `reallocate` reads."""
+    base = load_cfg()
+    st = MarketState(_spec(cid="cfgd", volume=50_000.0, min_size=20), base)
+    assert st.cfg.min_quote_shares == 20
+
+    st.refresh_pot(_spec(cid="cfgd", volume=50_000.0, min_size=75), base)
+    assert st.cfg.min_quote_shares == 75
+    assert int(st.spec["min_size"]) == 75
+
+
+def test_a_rerank_does_not_clobber_the_allocated_size():
+    """`quote_shares` belongs to reallocate, not to the spec refresh."""
+    base = load_cfg()
+    st = MarketState(_spec(cid="sized", volume=50_000.0), base)
+    st.cfg = replace(st.cfg, quote_shares=137)
+    st.refresh_pot(_spec(cid="sized", volume=60_000.0), base)
+    assert st.cfg.quote_shares == 137
+
+
 def test_a_rerank_can_flip_a_market_between_reward_and_spread_funding():
     """`source` is derived from the fresh spec too, not frozen at startup."""
     base = load_cfg()

@@ -27,6 +27,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from server import fleet_dash  # noqa: E402
 from server.fleet_dash import _maker_rebate  # noqa: E402
 from strategy.config import load as load_config  # noqa: E402
 
@@ -156,6 +157,58 @@ def test_polling_without_new_fills_does_not_double_count(tmp_path):
     for _ in range(5):
         again = _maker_rebate(p)
     assert again == once
+
+
+def test_a_fill_landing_mid_read_is_not_counted_twice(tmp_path):
+    """THE CHECKPOINT MUST COVER EXACTLY WHAT WAS COUNTED.
+
+    MAX(rowid) and the row SELECT are separate statements, and the fleet writes
+    continuously while the dashboard polls every 4s. A fill committed between
+    them used to be included in the rows but not covered by the stored
+    checkpoint, so the next poll added its rebate a second time -- on a money
+    figure, silently.
+
+    Simulated deterministically by inserting from a sqlite3 hook that fires
+    between the two statements, rather than hoping to lose a real race.
+    """
+    p = _db(tmp_path, [(0.50, 100.0, 0)])
+
+    inserted = []
+
+    def racer():
+        if not inserted:
+            inserted.append(True)
+            c = sqlite3.connect(p)
+            c.execute("INSERT INTO fills VALUES (0.20, 50.0, 0)")
+            c.commit()
+            c.close()
+
+    real_connect = sqlite3.connect
+
+    def connect(*a, **kw):
+        conn = real_connect(*a, **kw)
+        # Fire on the ROW SELECT, not on MAX(rowid). The callback runs just
+        # before its statement executes, so hooking MAX would insert too early
+        # -- the checkpoint would already cover the new row and no race occurs.
+        # Hooking the SELECT places the insert exactly between the two.
+        conn.set_trace_callback(
+            lambda stmt: racer() if "rowid >" in stmt else None)
+        return conn
+
+    fleet_dash.sqlite3.connect = connect
+    try:
+        first = _maker_rebate(p)
+    finally:
+        fleet_dash.sqlite3.connect = real_connect
+
+    second = _maker_rebate(p)
+
+    # Whatever the first poll saw, the second must not re-add anything.
+    full = _expect(0.50, 100.0) + _expect(0.20, 50.0)
+    assert second["fills"] == 2, "both fills counted exactly once"
+    assert second["shares"] == 150.0
+    assert second["earned"] == pytest.approx(full), (
+        f"double-counted: {second['earned']} vs {full} (first poll {first['earned']})")
 
 
 def test_a_replaced_database_restarts_the_total(tmp_path):

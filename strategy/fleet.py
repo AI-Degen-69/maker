@@ -206,12 +206,36 @@ class MarketState:
         Derived from config rather than read from the spec, so revising the
         capture assumption takes effect on the next sweep.
         """
-        self.spec = spec
-        self.daily = spec["daily"]
+        # MERGED IN PLACE, NEVER REBOUND.
+        #
+        # `main` builds `specs` and `states` from the SAME dict objects, writes
+        # live telemetry through `st.spec["_live"]`, and serialises `specs` to
+        # run/fleet_state.json. Rebinding `self.spec` to the fresh dict detached
+        # a surviving market from that list: its later `_live` writes landed in
+        # an object `specs` no longer referenced, so after the first re-rank the
+        # dashboard file kept reporting the pre-re-rank snapshot forever.
+        #
+        # `_live` is excluded from the merge because the fresh spec off disk has
+        # none, and copying that absence in would blank the current reading --
+        # `visit` reads `prev_live` to decide the merge-velocity exception.
+        if spec is not self.spec:
+            self.spec.update({k: v for k, v in spec.items() if k != "_live"})
+            # cfg carries spec-derived numbers too. Left stale they disagree
+            # with the dict `reallocate` reads `min_size` from.
+            self.cfg = replace(
+                self.cfg,
+                min_quote_shares=int(self.spec["min_size"]),
+                max_spread_from_mid=self.spec["max_spread"] / 100.0,
+                price_tick=float(self.spec["tick"]),
+                market_title=self.spec["title"],
+                market_daily_rate=self.spec["daily"])
+
+        self.daily = self.spec["daily"]
         self.source = "rewards" if self.daily > 0 else "spread"
         self.pot = self.daily if self.daily > 0 else spread_capture_daily(
-            float(spec.get("volume_24h") or 0.0),
-            float(spec.get("spread") or base_cfg.spread_capture_default_spread),
+            float(self.spec.get("volume_24h") or 0.0),
+            float(self.spec.get("spread")
+                  or base_cfg.spread_capture_default_spread),
             base_cfg.spread_capture_frac)
 
     def observe_theirs(self, ts: float, theirs: float, window_sec: float) -> None:
