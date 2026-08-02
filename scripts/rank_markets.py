@@ -138,7 +138,7 @@ def gamma_volume(session: requests.Session,
 
 
 def gamma_spread_universe(session: requests.Session,
-                          pages: int = 2, per_page: int = 250) -> list[dict]:
+                          pages: int = 2, per_page: int = 100) -> list[dict]:
     """Liquid short-dated markets that pay NO rewards, shaped like CLOB rows.
 
     `/sampling-markets` lists reward-funded markets and nothing else, so the
@@ -162,11 +162,24 @@ def gamma_spread_universe(session: requests.Session,
     """
     now = datetime.now(timezone.utc)
     out: list[dict] = []
-    for page in range(pages):
+    # ADVANCE BY WHAT THE ENDPOINT ACTUALLY RETURNED, NOT BY WHAT WE ASKED FOR.
+    #
+    # Gamma caps a page at 100 rows and ignores a larger `limit` -- measured
+    # 2026-08-02: limit=100, 250 and 500 all return exactly 100. Stepping the
+    # offset by the REQUESTED size therefore jumped a gap: at per_page=250,
+    # page 1 started at offset 250 while the response had ended at 99, so rows
+    # 100-249 were never fetched. They exist; offset=100 returns a full page.
+    #
+    # Unreachable today only because the volume floor stops the scan inside the
+    # first page -- which is luck, not a design. Tracking the real cursor makes
+    # it correct whatever the cap turns out to be.
+    offset = 0
+    page_cap: int | None = None
+    for _ in range(pages):
         params = {
             "closed": "false", "active": "true", "archived": "false",
             "order": "volume24hr", "ascending": "false",
-            "limit": per_page, "offset": page * per_page,
+            "limit": per_page, "offset": offset,
             "end_date_min": now.isoformat(),
             "end_date_max": (now + timedelta(days=MAX_DAYS_TO_RESOLVE)).isoformat(),
         }
@@ -178,11 +191,16 @@ def gamma_spread_universe(session: requests.Session,
             rows = rows.get("data") or []
         if not rows:
             break
+        offset += len(rows)
         for m in rows:
             vol = float(m.get("volume24hr") or 0.0)
             if vol < MIN_VOLUME_24H:
                 # Sorted by volume, so the first market under the floor ends
-                # the useful part of the listing.
+                # the useful part of the listing. Verified against the live
+                # endpoint 2026-08-02 with the date filters applied: 100 rows,
+                # zero inversions, and the first row under the floor had no
+                # qualifying market after it. The `order=volume24hr&
+                # ascending=false` sort survives `end_date_min`/`end_date_max`.
                 return out
             if not m.get("enableOrderBook") or not m.get("acceptingOrders"):
                 continue
@@ -220,7 +238,17 @@ def gamma_spread_universe(session: requests.Session,
                 "_volume_24h": vol,
                 "_spread": spread,
             })
-        if len(rows) < per_page:
+        # A SHORT PAGE MEANS THE LISTING ENDED -- measured against what this
+        # endpoint actually serves, not what we asked for.
+        #
+        # This compared against `per_page`, and Gamma caps a page at 100 however
+        # large a limit is requested. At the old per_page=250 every response was
+        # "short", so the loop broke after the first page every time: `pages=2`
+        # was never honoured and the scan never saw past the first 100 markets.
+        # The first response establishes the real page size.
+        if page_cap is None:
+            page_cap = len(rows)
+        if len(rows) < page_cap:
             break
     return out
 
