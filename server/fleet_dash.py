@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from strategy import store
 from strategy.config import load as load_config
+from strategy.kpi import taker_fee
 
 ROOT = Path(__file__).resolve().parent.parent
 RUN = ROOT / "run"
@@ -109,6 +110,54 @@ def _db_stats() -> dict:
         return out
     except Exception:
         return {}
+
+
+def _maker_rebate(db: Path | None = None) -> dict:
+    """Maker Rebates earned on matched volume. NOT the liquidity-reward pot.
+
+    Two venue programs pay a maker, and the dashboard had only ever wired one:
+
+      * LIQUIDITY REWARDS pay for RESTING size, sampled once a minute, filled
+        or not. That is `rent_reward`, and it reads $0.00 because every market
+        the fleet currently holds publishes clobRewards: 0 -- the program is
+        not funded on them. The zero is the truth, not a missing wire.
+      * MAKER REBATES pay a share of the taker fee on volume we MADE. An
+        unfilled resting order earns exactly zero here no matter how long it
+        rests, which is why no amount of uptime moves this number.
+
+    So this is a fills query, not a score-share integral. Quoting both off the
+    resting-size formula is the trap: applied to a spread market it multiplies
+    a spread-capture PROJECTION by uptime and reports it as a venue
+    distribution, double-counting income booked P&L already holds the moment
+    the fill lands.
+
+    Crossed fills are excluded because we were the taker on them: crediting our
+    own aggressive leg with a maker rebate would pay us for the side we are
+    also being charged the fee on.
+
+    `taker_fee` is imported rather than re-derived -- kpi.py already owns the
+    crypto_fees_v2 curve, and a second copy is a second thing to get wrong.
+    """
+    out = {"earned": 0.0, "shares": 0.0, "fills": 0, "per_share_cents": None}
+    path = DB if db is None else Path(db)
+    if not path.exists():
+        return out
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        rows = c.execute("SELECT price, size FROM fills "
+                         "WHERE crossed = 0 OR crossed IS NULL").fetchall()
+        c.close()
+    except Exception:
+        # Same contract as every other reader here: one unreadable metric must
+        # not blank the page.
+        return out
+    for price, size in rows:
+        out["earned"] += taker_fee(price or 0.0, size or 0.0) * CFG.rebate_rate
+        out["shares"] += size or 0.0
+        out["fills"] += 1
+    if out["shares"] > 0:
+        out["per_share_cents"] = 100.0 * out["earned"] / out["shares"]
+    return out
 
 
 def _realized() -> dict:
@@ -289,7 +338,17 @@ def fleet():
         rows.append({
             "title": s["title"], "slug": s.get("slug", ""),
             "url": f"https://polymarket.com/market/{s['slug']}" if s.get("slug") else "",
-            "daily": s["daily"], "min_size": s["min_size"],
+            # THE POT THAT ACTUALLY PAYS THIS MARKET. `spec["daily"]` is the
+            # reward pot alone and reads 0 for every spread market, which made
+            # the whole table report $0.00/day on markets that were filling.
+            # The fleet publishes the effective pot in live state; the spec
+            # figure is the fallback for a market not yet visited.
+            "daily": live.get("pot", s["daily"]),
+            "reward_daily": s["daily"],
+            "source": live.get("source", s.get("source",
+                                               "rewards" if s["daily"] > 0
+                                               else "spread")),
+            "min_size": s["min_size"],
             "max_spread": s["max_spread"],
             "share": live.get("share", 0.0),
             "income": live.get("income", 0.0),
@@ -308,7 +367,8 @@ def fleet():
             # sample (reward_samples only stores our_share), so this assumes
             # today's funded daily rate held constant over the whole window --
             # same assumption the live "income" projection already makes.
-            "collected_rent": h.get("avg_share", 0.0) * (s["daily"] or 0.0)
+            "collected_rent": h.get("avg_share", 0.0)
+                              * (live.get("pot", s["daily"]) or 0.0)
                               * (h.get("hours", 0.0) / 24.0),
             "age": (now - live["ts"]) if live.get("ts") else None,
             "err": live.get("err") or "",
@@ -368,6 +428,14 @@ def fleet():
     total_collected_rent = sum(r["collected_rent"] for r in rows)
     rz = _realized()
 
+    # The projection integrated over the time it was actually held, rather
+    # than whatever it happens to read this second.
+    try:
+        accrual = store.income_accrual()
+    except Exception:
+        accrual = {"accrued": 0.0, "twa_day": None, "hours": 0.0, "n": 0}
+
+    rebate = _maker_rebate()
     merged_total = sum(r["merged_shares"] for r in rows)
     try:
         vr = store.verified_ratio()
@@ -382,7 +450,11 @@ def fleet():
     # Naked value at the current bid, not the $1/$0 resolution outcome --
     # what selling out actually raises if it happened this second.
     naked_exit_total = sum(r["naked_exit_value"] for r in rows)
+    # Unfunded now means "no pot from EITHER source". A spread market has no
+    # reward rate by definition, and counting those as unfunded reported the
+    # entire working universe as dead capital.
     unfunded = [r for r in rows if not (r["daily"] or 0) > 0]
+    spread_rows = [r for r in rows if r["source"] == "spread"]
     committed_total = cap + at_risk + sum(r["pair_paid"] or 0 for r in rows)
     available_cash = max(0.0, CFG.bankroll_usd - committed_total)
     committed_overage = max(0.0, committed_total - CFG.max_committed_usd)
@@ -398,6 +470,39 @@ def fleet():
             "income_day": inc,
             "income_hour": inc / 24.0,
             "collected_rent_total": total_collected_rent,
+            # RENT SPLIT BY WHETHER IT IS OWED TO US OR MERELY MODELLED.
+            #
+            # Reward rent is money the venue distributes for resting size. It
+            # is earned but not yet in the wallet, so it is a genuine P&L term
+            # the headline is missing.
+            #
+            # Spread "rent" is not a distribution at all -- it is a projection
+            # of income that arrives BY BEING FILLED, and those same dollars
+            # are already counted in booked P&L and pair P&L the moment a fill
+            # happens. Adding it would book the same income twice, which is
+            # exactly the double-count that makes a paper strategy look
+            # profitable when it is not.
+            # MODELLED INCOME ACCRUED, integrated over time. Replaces the old
+            # `collected_rent_total`, which multiplied today's pot by the whole
+            # run's hours and so rewrote history every time a pot moved.
+            "income_accrued": accrual["accrued"],
+            "income_twa_day": accrual["twa_day"],
+            "income_hours": accrual["hours"],
+            "income_samples": accrual["n"],
+            "rent_reward": sum(r["collected_rent"] for r in rows
+                               if r["source"] == "rewards"),
+            # THE OTHER PROGRAM. `rent_reward` above is liquidity rewards, paid
+            # for resting size, and it is $0.00 whenever the fleet holds only
+            # clobRewards: 0 markets. This is Maker Rebates, paid as a share of
+            # the taker fee on volume we MADE -- disjoint from the pot, so the
+            # two add without double-counting, and additive to booked P&L
+            # because a rebate is money the venue sends on top of the fill.
+            "maker_rebate": rebate["earned"],
+            "maker_rebate_shares": rebate["shares"],
+            "maker_rebate_fills": rebate["fills"],
+            "maker_rebate_cps": rebate["per_share_cents"],
+            "rent_modelled_spread": sum(r["collected_rent"] for r in rows
+                                        if r["source"] == "spread"),
             "unfunded": len(unfunded),
             "realized": rz["realized"],
             "settled": rz["settled"],
@@ -407,6 +512,14 @@ def fleet():
             "closed_pnl": rz["closed_pnl"],
             "closed_forgone": rz["closed_forgone"],
             "locked_pair": locked,
+            # The pieces `locked_pair` is made of, published separately so the
+            # page can show the arithmetic instead of one net figure labelled
+            # as though it were a holding. A reader seeing -$13.59 under
+            # "matched shares valued at $1" cannot tell that the shares are
+            # worth $571 and cost $584.59 -- which is the actual news.
+            "pair_value": sum((r["paired"] or 0) * 1.0 for r in rows),
+            "pair_paid": sum(r["pair_paid"] or 0 for r in rows),
+            "naked_exit": naked_exit_total,
             "at_risk": at_risk,
             "net_worst": rz["realized"] + locked - at_risk,
             # Liquidate & cancel everything: booked P&L + pairs merged ($1 each)
@@ -418,6 +531,16 @@ def fleet():
             "markout_total": mk["total"],
             "markout_spread": mk["spread"],
             "markout_n": mk["n"],
+            # THE MEASURED ANSWER, as opposed to the modelled one. Spread
+            # capture is a projection until a fill proves it: `markout_spread`
+            # is the edge actually captured on filled shares (mid minus what
+            # we paid) and `markout_total` is the market then moving against
+            # us. Their sum is what being filled was worth in dollars, and it
+            # is the number that decides whether this strategy makes money.
+            "fill_edge": mk["spread"] + mk["total"],
+            "income_spread": sum(r["income"] for r in spread_rows),
+            "income_reward": inc - sum(r["income"] for r in spread_rows),
+            "markets_spread": len(spread_rows),
             "fleet_naked_budget": CFG.max_fleet_naked_usd,
             "wallet": CFG.bankroll_usd,
             "committed_total": committed_total,
@@ -493,17 +616,35 @@ PAGE = r"""<!doctype html>
  .clock{font-family:var(--mono);font-size:12px;color:var(--tx-dim)}
 
  /* ---------- hero ---------- */
- .hero{display:grid;grid-template-columns:minmax(240px,340px) 1fr;gap:1px;
+ /* The equation and the strip live in hero-main, so main takes the width and
+    the rail is capped. It was the other way round, which squeezed a one-line
+    sum into four wrapped lines while six rank bars -- five of them $0.00 --
+    stretched across two thirds of the screen. */
+ .hero{display:grid;grid-template-columns:1fr minmax(300px,380px);gap:1px;
        background:var(--line);border-bottom:1px solid var(--line)}
  .hero-main{background:var(--panel);padding:24px 28px}
  .hero-eyebrow{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--tx-dim);font-weight:600}
+ .hero-duo{display:flex;flex-wrap:wrap;gap:36px;align-items:flex-start}
  .hero-value{font-family:var(--disp);font-size:44px;font-weight:700;line-height:1.05;margin-top:8px;
              transition:color .3s ease}
- .hero-sub{font-size:12px;color:var(--tx-dim);margin-top:6px;max-width:32ch}
+ /* The sum reads as one statement or it reads as noise -- 32ch broke it
+    across four lines. Wraps only when the viewport genuinely cannot hold it. */
+ .hero-sub{font-size:13px;color:var(--tx-dim);margin-top:8px;max-width:none;
+   line-height:1.7}
  .hero-spark{width:100%;height:36px;margin-top:14px;display:block}
+ /* The five facts that decide whether this run means anything, on one line.
+    They were spread across three KPI groups, so answering "is it working?"
+    meant assembling them by eye every time. */
+ .hero-strip{display:flex;flex-wrap:wrap;gap:22px;margin-top:16px;
+   padding-top:14px;border-top:1px solid var(--line-soft)}
+ .hs{min-width:96px}
+ .hs .hs-n{font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+   color:var(--tx-dim);font-weight:600}
+ .hs .hs-v{font-family:var(--mono);font-size:17px;font-weight:600;margin-top:3px}
+ .hs .hs-s{font-size:11px;color:var(--tx-dim);margin-top:1px}
  .hero-rail{background:var(--panel);padding:24px 28px;display:flex;flex-direction:column;gap:14px}
  .hero-rail-hdr{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--tx-dim);font-weight:600}
- .rank-row{display:grid;grid-template-columns:15ch 1fr auto;align-items:center;gap:10px;font-size:12px}
+ .rank-row{display:grid;grid-template-columns:1fr 84px auto;align-items:center;gap:10px;font-size:12px}
  .rank-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--tx-dim)}
  .rank-track{height:8px;background:var(--line-soft);border-radius:4px;overflow:hidden}
  .rank-fill{height:100%;background:var(--up);border-radius:4px;transition:width .4s ease}
@@ -563,10 +704,26 @@ PAGE = r"""<!doctype html>
 </header>
 <section class="hero">
   <div class="hero-main">
-    <div class="hero-eyebrow">Net Liquidation P&L</div>
-    <div class="hero-value" id="heroValue">$0.00</div>
-    <div class="hero-sub">Realized P&L + pairs merged ($1) + naked shares sold at best bid (bids release 100% cash)</div>
+    <div class="hero-duo">
+      <div>
+        <div class="hero-eyebrow">Liquidation P&L</div>
+        <div class="hero-value" id="heroValue">$0.00</div>
+      </div>
+      <!-- The modelled side, deliberately the same size and deliberately a
+           different colour. It is income the strategy claims to have earned,
+           and it is NOT summed into the hard number to its left: for a
+           spread-funded market that income arrives by being filled, so it is
+           already inside `booked` and `pairs held`. Two figures, one hard and
+           one modelled, is the honest presentation -- adding them would book
+           the same dollars twice. -->
+      <div>
+        <div class="hero-eyebrow">Unrealized P&L <span class="dim">(Floating)</span></div>
+        <div class="hero-value proj" id="heroIncome">$0.00</div>
+      </div>
+    </div>
+    <div class="hero-sub" id="heroBridge">&nbsp;</div>
     <svg class="hero-spark" id="heroSpark" viewBox="0 0 300 36" preserveAspectRatio="none"></svg>
+    <div class="hero-strip" id="heroStrip"></div>
   </div>
   <div class="hero-rail">
     <div class="hero-rail-hdr">Which market is carrying the fleet</div>
@@ -737,7 +894,85 @@ async function tick(){
   const hv=$('heroValue');
   hv.textContent = usd(t.liquidate_now_pnl);
   hv.className = 'hero-value ' + cls(t.liquidate_now_pnl);
+  // FLOATING P&L IS A POSITION VALUE, NOT A MODEL. Unrealized P&L means what
+  // the open book is worth against what it cost -- inventory float plus
+  // unhedged float -- and that is exactly the middle of the liquidation
+  // equation below. The modelled accrual that used to sit here is a
+  // projection integrated over time; giving it a brokerage name for a live
+  // position would put a forecast where a mark-to-market belongs. It keeps
+  // its place in the income-rate tile, labelled as the benchmark it is.
+  const floating = (t.locked_pair || 0) + (t.naked_exit || 0) - (t.at_risk || 0);
+  const hi = $('heroIncome');
+  hi.textContent = usd(floating);
+  hi.className = 'hero-value ' + cls(floating);
+  // THE ARITHMETIC, SPELLED OUT. The hero used to carry a prose description
+  // of a formula while four tiles showed pieces of it under names that did
+  // not match -- so $40 realized sitting above an $18.89 headline read as a
+  // contradiction. Every term below is signed and they sum to the headline.
+  const term=(label,v)=>`<span class="${cls(v)}">${v>=0?'+':'−'}${usd(Math.abs(v))}</span> ${label}`;
+  // TWO PROGRAMS PAY A MAKER, AND BOTH BELONG IN THIS TERM.
+  //
+  // Reward rent is money the venue owes for RESTING size. Maker rebates are a
+  // share of the taker fee on volume we MADE. They are disjoint products, so
+  // they add; and neither is inside `booked`, because a rebate arrives on top
+  // of the fill rather than through its price.
+  //
+  // Spread "rent" is still NOT added: it projects income that arrives BY being
+  // filled, and a fill is already in `booked` and `pairs held`. That is the
+  // one line here that would double-count, which is why the split exists.
+  const rent = (t.rent_reward || 0) + (t.maker_rebate || 0);
+  // Naked cost and resale are one term now -- "Unhedged Float", the mark on
+  // the unpaired leg -- because a reader tracking a brokerage statement wants
+  // realized, inventory float and unhedged float, not the venue mechanics
+  // underneath each.
+  $('heroBridge').innerHTML =
+    term('Realized', t.realized) + ' &nbsp;|&nbsp; ' +
+    // Shown unconditionally now: a rebate line reading +$0.00 states that
+    // nothing held pays a rebate, which is itself the fact worth knowing on a
+    // fleet whose entire universe publishes clobRewards: 0. Hiding it left the
+    // reader unable to tell "no rebate" from "rebates not counted".
+    term('Earned Rebates', rent) + ' &nbsp;|&nbsp; ' +
+    term('Paired Unrealized', t.locked_pair) + ' &nbsp;|&nbsp; ' +
+    term('Unhedged Unrealized', t.naked_exit - t.at_risk) +
+    ` &nbsp;=&nbsp; <b>${usd(t.liquidate_now_pnl + rent)}</b> Total Liquidation P&L`;
   $('heroSpark').innerHTML = sparkline(s.share_history);
+
+  // THE STORY, IN FIVE FACTS. Ordered as the questions actually get asked:
+  // has it run long enough, is it trading, is being filled profitable, is the
+  // model believable, and has anything settled to prove it.
+  const edgePerFill = t.markout_n ? t.fill_edge / t.markout_n : null;
+  const HS=(n,v,sub,cl)=>`<div class="hs"><div class="hs-n">${n}</div>
+    <div class="hs-v ${cl||''}">${v}</div><div class="hs-s">${sub||''}</div></div>`;
+  $('heroStrip').innerHTML =
+    // Run age lives in the masthead clock beside the LIVE dot; repeating it
+    // here spent a strip slot on a number already on screen.
+    HS('Fills', String(t.fills),
+       (t.verified && t.verified.ratio !== null)
+         ? pct(t.verified.ratio)+' tape-verified' : 'no tape yet',
+       t.fills ? 'up' : 'dim') +
+    // THE VERDICT METRIC. Everything else is a projection; this is what being
+    // filled actually paid, per fill, measured from the markouts table.
+    HS('Edge / fill', edgePerFill === null ? '—' : usd(edgePerFill),
+       t.markout_n ? t.markout_n+' matured'+(t.markout_n<20?' · need 20':'') : 'awaiting horizon',
+       edgePerFill === null ? 'dim' : cls(edgePerFill)) +
+    // The projection standing next to the measurement, deliberately adjacent:
+    // if the model is right these converge, and if it is optimistic the gap
+    // is the story.
+    // TIME-WEIGHTED, not instantaneous. The live figure moved $302 -> $41
+    // inside an hour as markets were funded and defunded; whichever moment
+    // you looked at became "the" number. This one credits each level for the
+    // time it was actually held, so a rate held ten minutes counts a sixth as
+    // much as one held an hour. The spot reading stays in the sub-line,
+    // because the gap between them is itself information.
+    HS('Avg income rate',
+       t.income_twa_day === null ? '—' : usd(t.income_twa_day)+'/d',
+       t.income_twa_day === null
+         ? 'need 2 samples'
+         : 'avg over '+t.income_hours.toFixed(1)+'h · now '+usd(t.income_day),
+       'proj') +
+    HS('Settled', String(t.settled),
+       t.settled ? usd(t.realized)+' booked' : 'no ground truth yet',
+       t.settled ? 'up' : 'dim');
 
   const top = [...s.markets].sort((a,b)=>b.income-a.income).slice(0,6);
   const maxInc = Math.max(1e-9, ...top.map(m=>m.income||0));
@@ -764,28 +999,90 @@ async function tick(){
   const renderGroup = (title, tiles) => `<div><div class="kpi-hdr">${title}</div><div class="kpi-group">${tiles.join('')}</div></div>`;
 
   const t_pl = [
-    K('Projected reward',usd(t.income_day)+'/day','modelled at current score share','proj'),
-    K('Realized P&L',usd(t.realized),(t.settled?t.settled+' settled':'no settlement yet')+(t.closes?' · '+t.closes+' early close'+(t.closes===1?'':'s'):''),(t.settled||t.closes)?cls(t.realized):'dim'),
-    K('Estimated collected',usd(t.collected_rent_total),'projection, not a wallet credit','gold'),
-    K('Wallet available',usd(t.available_cash,0),'$'+usd(t.wallet,0).replace('$','')+' simulated wallet','up'),
-    K('Capital return',t.return_pct_day.toFixed(2)+'%/day','projected reward / wallet committed','proj')
+    K('Projected Daily Return',usd(t.income_day)+'/day',
+      (t.markets_spread ? usd(t.income_spread)+' spread · '+usd(t.income_reward)+' rewards'
+                        : 'modelled at current score share'),'proj'),
+    // The breakdown is named for what each half MEANS, not for the mechanic
+    // that produced it: one is edge the bot took on purpose and repeats, the
+    // other is the market happening to move afterwards and averages toward
+    // zero. "captured / drift" required already knowing that distinction.
+    K('Total Trade Alpha',usd(t.fill_edge),
+      t.markout_n ? usd(t.markout_spread)+' Spread Capture + '+usd(t.markout_total)+' Capital Gain · '+t.markout_n+' fills'
+                  : 'no matured fill yet',
+      t.markout_n ? cls(t.fill_edge) : 'dim'),
+    K('Realized P&L',usd(t.realized),
+      (t.closes?t.closes+' closed trade'+(t.closes===1?'':'s'):'no closed trades')
+        +' · '+(t.settled?t.settled+' settled':'$0.00 settled'),
+      (t.settled||t.closes)?cls(t.realized):'dim'),
+    // Deliberately fenced off. This is a MODEL of income earned so far, it is
+    // not in the headline and never was, and reading it as money is what made
+    // the P&L look like it did not add up.
+    // Income accrued is a hero figure now; carrying it here too made the same
+    // modelled number appear twice on one screen.
+    // A RANGE, NOT A POINT. The model projected $159.80 of spread income
+    // while the bot measurably captured $17.76 -- roughly 9x apart -- and
+    // showing only the model made the run look far better than it was, while
+    // showing only the measurement would ignore what the strategy is aiming
+    // at. Floor is what actually happened, ceiling is what the model claims,
+    // and the width between them is the honesty of `spread_capture_frac`.
+    //
+    // Both ends are ALREADY inside Closed P&L and Fill Edge -- this is a
+    // benchmark to judge those by, never an amount to add to them.
+    K('Expected vs Realized Yield',
+      (t.markout_n
+        ? usd(t.markout_spread)+' – '+usd(t.rent_modelled_spread + t.rent_reward)
+        : usd(t.rent_modelled_spread + t.rent_reward)),
+      (t.markout_n
+        ? 'Baseline: Pure Edge | Ceiling: Model Target · already booked on execution'
+        : 'Ceiling: Model Target · no matured fills yet'),
+      'proj'),
+    // The income the venue owes but has not paid: reward emissions on resting
+    // size plus maker rebates on matched volume. Stays a separate line and
+    // stays in the headline equation. The subtext names WHICH program is
+    // paying, because a fleet holding only clobRewards: 0 markets earns the
+    // rebate and nothing else -- and a single blended figure left the reader
+    // unable to tell that apart from "the pot is funded".
+    K('Dividend / Rebate Income',usd(rent),
+      rent > 0
+        ? [t.rent_reward > 0 ? usd(t.rent_reward)+' emissions' : null,
+           t.maker_rebate > 0
+             ? usd(t.maker_rebate)+' rebates on '+(t.maker_rebate_shares||0).toFixed(0)+' filled sh'
+             : null].filter(Boolean).join(' · ')+' · unpaid, in the headline'
+        : 'no emissions funded · no maker fills yet',
+      rent > 0 ? 'gold' : 'dim'),
+    K('Capital return',t.return_pct_day.toFixed(2)+'%/day','projected income / wallet committed','proj')
   ];
 
   const t_risk = [
-    K('Committed',usd(t.committed_total,0),`of ${usd(t.wallet,0)} simulated wallet`,t.committed_total>=t.max_committed?'alert-tx':'dim',t.committed_total>=t.max_committed),
-    K('At risk (naked)',usd(t.at_risk,0),'unpaired inventory can pay $0','down'),
-    K('Worst case',usd(t.net_worst),'realized + locked pairs − naked cost',cls(t.net_worst)),
-    K('Paired inventory',usd(t.locked_pair),'matched shares valued at $1','up'),
-    K('Markout sample',String(t.markout_n),'fills with a matured horizon',t.markout_n>=20?'up':'dim'),
+    K('Capital Deployed',usd(t.committed_total,0),`of ${usd(t.wallet,0)} simulated wallet`,t.committed_total>=t.max_committed?'alert-tx':'dim',t.committed_total>=t.max_committed),
+    // MARKET VALUE, not cost. Stated as value, the drawdown below is exactly
+    // this figure subtracted from liquidation P&L -- the two tiles reconcile
+    // by inspection. Stated as cost it does not: liquidation already nets
+    // cost against resale, so subtracting cost a second time double-counts it
+    // (-$197.89 against a true -$221.61 on the numbers of 2026-08-02).
+    K('Unhedged Exposure',usd(t.naked_exit,0),'unhedged positions market value','down'),
+    K('Worst-Case P&L',usd(t.net_worst),'P&L if value goes to $0 on all current unhedged bets',cls(t.net_worst)),
+    // NOT the size of the holding -- the profit or loss on it. The old label
+    // said "matched shares valued at $1" over a number that is the difference
+    // between that value and what we paid, so a -$13.59 loss read as though
+    // the inventory itself were negative. Both figures are now shown.
+    K('Open Positions Unrealized P&L',usd(t.locked_pair),
+      usd(t.pair_value,0)+' at $1 · paid '+usd(t.pair_paid,0),cls(t.locked_pair)),
+    K('Matured Position Horizon',String(t.markout_n),'fills with a matured mark',t.markout_n>=20?'up':'dim'),
     K('Markets exited',String(t.exited),'after adverse-selection evidence',t.exited?'down':'up',t.exited>0)
   ];
 
   const t_cap = [
-    K('Offers locked',usd(t.capital,0),'current simulated resting cash','gold'),
-    K('Markets scoring',t.scoring+' / '+t.markets,'positive projected reward',t.scoring?'up':'dim'),
+    // Unallocated cash only -- deliberately NOT buying power, which would
+    // also count collateral released by cancelling open orders.
+    K('Net Available Cash',usd(t.available_cash,0),'unallocated of '+usd(t.wallet,0)+' wallet','up'),
+    K('Open Orders Collateral',usd(t.capital,0),'cash held against resting bids','gold'),
+    K('Active Traded Bets',t.scoring+' / '+t.markets,
+      t.markets_spread ? t.markets_spread+' priced on spread capture' : 'positive projected income',
+      t.scoring?'up':'dim'),
     K('Scoring uptime',pct(t.uptime),'checks with non-zero score',thresh(t.uptime,true,0.8)),
     K('Fills',String(t.fills),'tape-confirmed + crossed','dim'),
-    K('Naked budget',usd(t.fleet_naked_budget,0),'hard fleet risk ceiling','dim'),
+    K('Max Allowed Unrealized Loss',usd(t.fleet_naked_budget,0),'hard unhedged-loss ceiling','dim'),
     K('Data health',healthy?'LIVE':'STALE',healthy?'heartbeat < 120s':'do not trust live figures',healthy?'up':'alert-tx',!healthy)
   ];
 
@@ -801,7 +1098,9 @@ async function tick(){
     let statusHtml = m.err
       ? `<span class="down bold">${m.err}</span>`
       : (m.gate === 'EXITED' ? '<span class="down bold">EXITED</span>'
-      : (isGenerating ? '<span class="up bold">SCORING</span>' : `<span class="dim">${m.why || 'not scoring'}</span>`));
+      : (isGenerating
+          ? `<span class="up bold">${m.source === 'spread' ? 'EARNING SPREAD' : 'SCORING'}</span>`
+          : `<span class="dim">${m.why || 'not earning'}</span>`));
     return `<tr class="${m.gate === 'EXITED' ? 'alert' : ''}">
       <td style="max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${m.title}">${m.url?`<a class="mkt-link" href="${m.url}" target="_blank">${m.title}</a>`:m.title}</td>
       <td class="num bold mono ${isGenerating ? 'up' : 'dim'}" style="font-size:15px">${usd(currentIncome)}</td>
