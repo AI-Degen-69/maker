@@ -127,24 +127,9 @@ class MarketState:
         self.spec = spec
         self.cid = spec["cid"]
         self.title = spec["title"]
-        self.daily = spec["daily"]
-        # WHAT THIS MARKET PAYS, AND WHAT PAYS IT.
-        #
-        # `daily` is the reward pot, and it is 0 for every market publishing
-        # clobRewards: 0 -- which is most of the ones that trade. Those are
-        # paid in spread instead, so the pot is reconstructed from volume and
-        # book width. Computed once, here, because three separate consumers
-        # need the same answer: the allocator sizes on it, the live-state
-        # income projection reports it, and the dashboard reads that.
-        #
-        # Derived from config rather than read from the spec, so revising the
-        # capture assumption takes effect on the next sweep instead of
-        # requiring a re-rank.
-        self.source = "rewards" if self.daily > 0 else "spread"
-        self.pot = self.daily if self.daily > 0 else spread_capture_daily(
-            float(spec.get("volume_24h") or 0.0),
-            float(spec.get("spread") or base_cfg.spread_capture_default_spread),
-            base_cfg.spread_capture_frac)
+        # `daily`, `source` and `pot` are all set by refresh_pot, which the
+        # re-rank calls again when the spec is rewritten. See its docstring.
+        self.refresh_pot(spec, base_cfg)
         # Each market publishes its own reward window, minimum order size and
         # tick. Quoting under a market's min_size scores exactly zero, so these
         # are load-bearing, not cosmetic.
@@ -199,6 +184,35 @@ class MarketState:
         self.gate = _gate_from_db(self.cid)
         self.markout: dict = {"verdict": "insufficient_sample",
                               "mean_per_share": None, "n": 0}
+
+    def refresh_pot(self, spec: dict, base_cfg) -> None:
+        """Re-read what this market pays from a freshly ranked spec.
+
+        WHAT THIS MARKET PAYS, AND WHAT PAYS IT.
+
+        `daily` is the reward pot, and it is 0 for every market publishing
+        clobRewards: 0 -- which is most of the ones that trade. Those are paid
+        in spread instead, so the pot is reconstructed from volume and book
+        width. Three separate consumers need the same answer: the allocator
+        sizes on it, the live-state income projection reports it, and the
+        dashboard reads that.
+
+        Called from `__init__` and again on every re-rank, because volume
+        moves. A market surviving a re-rank keeps its MarketState object, so
+        nothing else would re-read the spec -- and for a spread market the pot
+        IS the volume estimate, so a stale one sizes against volume the market
+        no longer has.
+
+        Derived from config rather than read from the spec, so revising the
+        capture assumption takes effect on the next sweep.
+        """
+        self.spec = spec
+        self.daily = spec["daily"]
+        self.source = "rewards" if self.daily > 0 else "spread"
+        self.pot = self.daily if self.daily > 0 else spread_capture_daily(
+            float(spec.get("volume_24h") or 0.0),
+            float(spec.get("spread") or base_cfg.spread_capture_default_spread),
+            base_cfg.spread_capture_frac)
 
     def observe_theirs(self, ts: float, theirs: float, window_sec: float) -> None:
         """Add one competitor-depth reading and drop anything past the window."""
@@ -943,10 +957,21 @@ def main() -> None:
             try:
                 fresh = {s["cid"]: s for s in load_specs()}
                 known = {s.cid for s in states}
+                by_cid = {s.cid: s for s in states}
                 for cid, spec in fresh.items():
                     if cid not in known:
                         states.append(MarketState(spec, base))
                         log.info("RERANK + %s", spec["title"][:40])
+                    else:
+                        # A SURVIVING MARKET KEEPS ITS OBJECT, SO ITS POT MUST
+                        # BE RE-READ EXPLICITLY. For a spread market the pot IS
+                        # the volume estimate, and `__init__` computed it once
+                        # from the spec present at process start. A market whose
+                        # 24h volume halved went on sizing and reporting against
+                        # the volume it had hours ago, for the life of the
+                        # process -- which is exactly what the periodic re-rank
+                        # exists to prevent.
+                        by_cid[cid].refresh_pot(spec, base)
                 held = [s for s in states if s.cid not in fresh
                         and (s.inv.up_shares or s.inv.down_shares)]
                 dropped = [s for s in states

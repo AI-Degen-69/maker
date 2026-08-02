@@ -86,6 +86,23 @@ $rr = Start-Process -FilePath "python" `
     -RedirectStandardError  (Join-Path $ProjectPath "logs/rerank.err.log")
 
 Start-Sleep -Seconds 6
+
+# A COUNT OF MATCHING PROCESSES IS NOT PROOF THESE TWO SURVIVED.
+#
+# $alive below counts anything matching the patterns, so a supervisor that died
+# on a bad markets.json still printed a green success line while the fleet was
+# not running. Ask the two Process objects we actually started, and name the
+# log that holds the traceback -- the crash lands in the .err.log before
+# logging is configured, which is the file nobody thinks to open.
+$sup.Refresh()
+$rr.Refresh()
+$dead = @()
+if ($sup.HasExited) { $dead += "supervisor (see logs\supervisor.err.log)" }
+if ($rr.HasExited)  { $dead += "reranker (see logs\rerank.err.log)" }
+if ($dead.Count -gt 0) {
+    throw "Fleet startup failed: $($dead -join '; ')"
+}
+
 $alive = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object { $cl = $_.CommandLine; $patterns | Where-Object { $cl -like $_ } }
 Write-Host ""

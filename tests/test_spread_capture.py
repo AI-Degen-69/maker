@@ -93,6 +93,38 @@ def test_a_zero_reward_market_with_no_volume_is_not_funded():
     assert st.cfg.quote_shares == 0
 
 
+def test_a_rerank_re_reads_the_pot_from_the_fresh_spec():
+    """For a spread market the pot IS the volume estimate, so it must move.
+
+    A market surviving a re-rank keeps its MarketState object -- the loop only
+    constructs one for a cid it has not seen. The pot was computed once in
+    __init__, so a market whose 24h volume halved kept sizing and reporting
+    against the volume observed at process start, for the life of the process.
+    """
+    base = load_cfg()
+    st = MarketState(_spec(cid="fading", volume=100_000.0), base)
+    rich = st.pot
+    assert rich > 0
+
+    st.refresh_pot(_spec(cid="fading", volume=10_000.0), base)
+    assert st.pot == pytest.approx(rich / 10.0)
+
+    # And the other direction: a market that finds volume must be re-funded.
+    st.refresh_pot(_spec(cid="fading", volume=100_000.0), base)
+    assert st.pot == pytest.approx(rich)
+
+
+def test_a_rerank_can_flip_a_market_between_reward_and_spread_funding():
+    """`source` is derived from the fresh spec too, not frozen at startup."""
+    base = load_cfg()
+    st = MarketState(_spec(cid="flip", daily=0.0, volume=50_000.0), base)
+    assert st.source == "spread"
+
+    st.refresh_pot(_spec(cid="flip", daily=40.0, volume=50_000.0), base)
+    assert st.source == "rewards"
+    assert st.pot == 40.0, "a funded pot is the venue's number, not the model's"
+
+
 def test_a_funded_market_whose_volume_dies_is_driven_back_to_zero():
     """THE CASE THE TEST ABOVE CANNOT SEE.
 
