@@ -70,6 +70,16 @@ def days_to_resolve(end_iso: Optional[str],
         return None
     now = (datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
            if now_iso else datetime.now(timezone.utc))
+    # An unqualified venue timestamp carries no offset, and subtracting an
+    # aware datetime from a naive one raises TypeError -- which the
+    # `except ValueError` above does not catch. This runs inside a
+    # ThreadPoolExecutor worker, so a single such endDate aborted the entire
+    # ranking run. Venue times are UTC by convention; assuming that keeps the
+    # arithmetic aware-vs-aware instead of raising.
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
     return (end - now).total_seconds() / 86400.0
 
 

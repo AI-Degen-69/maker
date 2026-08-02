@@ -910,9 +910,26 @@ async function tick(){
   }
 
   // ---- hero: the one number, its trend, and who's carrying it ----
+  // TWO PROGRAMS PAY A MAKER, AND BOTH BELONG IN THIS TERM.
+  //
+  // Reward rent is money the venue owes for RESTING size. Maker rebates are a
+  // share of the taker fee on volume we MADE. They are disjoint products, so
+  // they add; and neither is inside `booked`, because a rebate arrives on top
+  // of the fill rather than through its price.
+  //
+  // Spread "rent" is still NOT added: it projects income that arrives BY being
+  // filled, and a fill is already in `booked` and `pairs held`. That is the
+  // one line here that would double-count, which is why the split exists.
+  //
+  // Declared BEFORE the headline because the headline has to include it. It
+  // did not, while the bridge directly below already summed it -- so the big
+  // number and the "Total Liquidation P&L" under it disagreed by exactly the
+  // rebate, on a page whose whole job is to make that arithmetic checkable.
+  const rent = (t.rent_reward || 0) + (t.maker_rebate || 0);
+  const liquidation = t.liquidate_now_pnl + rent;
   const hv=$('heroValue');
-  hv.textContent = usd(t.liquidate_now_pnl);
-  hv.className = 'hero-value ' + cls(t.liquidate_now_pnl);
+  hv.textContent = usd(liquidation);
+  hv.className = 'hero-value ' + cls(liquidation);
   // FLOATING P&L IS A POSITION VALUE, NOT A MODEL. Unrealized P&L means what
   // the open book is worth against what it cost -- inventory float plus
   // unhedged float -- and that is exactly the middle of the liquidation
@@ -929,17 +946,6 @@ async function tick(){
   // not match -- so $40 realized sitting above an $18.89 headline read as a
   // contradiction. Every term below is signed and they sum to the headline.
   const term=(label,v)=>`<span class="${cls(v)}">${v>=0?'+':'−'}${usd(Math.abs(v))}</span> ${label}`;
-  // TWO PROGRAMS PAY A MAKER, AND BOTH BELONG IN THIS TERM.
-  //
-  // Reward rent is money the venue owes for RESTING size. Maker rebates are a
-  // share of the taker fee on volume we MADE. They are disjoint products, so
-  // they add; and neither is inside `booked`, because a rebate arrives on top
-  // of the fill rather than through its price.
-  //
-  // Spread "rent" is still NOT added: it projects income that arrives BY being
-  // filled, and a fill is already in `booked` and `pairs held`. That is the
-  // one line here that would double-count, which is why the split exists.
-  const rent = (t.rent_reward || 0) + (t.maker_rebate || 0);
   // Naked cost and resale are one term now -- "Unhedged Float", the mark on
   // the unpaired leg -- because a reader tracking a brokerage statement wants
   // realized, inventory float and unhedged float, not the venue mechanics
@@ -953,7 +959,7 @@ async function tick(){
     term('Earned Rebates', rent) + ' &nbsp;|&nbsp; ' +
     term('Paired Unrealized', t.locked_pair) + ' &nbsp;|&nbsp; ' +
     term('Unhedged Unrealized', t.naked_exit - t.at_risk) +
-    ` &nbsp;=&nbsp; <b>${usd(t.liquidate_now_pnl + rent)}</b> Total Liquidation P&L`;
+    ` &nbsp;=&nbsp; <b>${usd(liquidation)}</b> Total Liquidation P&L`;
   $('heroSpark').innerHTML = sparkline(s.share_history);
 
   // THE STORY, IN FIVE FACTS. Ordered as the questions actually get asked:

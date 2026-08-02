@@ -98,6 +98,27 @@ def test_days_to_resolve_is_none_when_the_venue_gives_no_end_date():
     assert days_to_resolve("", now_iso="2026-08-01T00:00:00Z") is None
 
 
+def test_days_to_resolve_survives_an_end_date_with_no_timezone():
+    """A naive venue timestamp must not abort the ranking run.
+
+    `fromisoformat` returns a naive datetime when the string carries no offset
+    and no Z. Subtracting an aware `now` from it raises TypeError, which the
+    function's `except ValueError` does not catch -- and `evaluate` calls this
+    inside a ThreadPoolExecutor worker, so ONE unqualified endDate from gamma
+    took down the whole run. Venue times are UTC, so it must read the same as
+    the offset-qualified form.
+    """
+    naive = days_to_resolve("2026-08-02T00:00:00", now_iso="2026-08-01T00:00:00Z")
+    aware = days_to_resolve("2026-08-02T00:00:00Z", now_iso="2026-08-01T00:00:00Z")
+    assert naive == aware == pytest.approx(1.0)
+
+
+def test_days_to_resolve_handles_a_naive_now_as_well():
+    """Both sides of the subtraction can arrive unqualified."""
+    assert days_to_resolve("2026-08-02T00:00:00",
+                           now_iso="2026-08-01T00:00:00") == pytest.approx(1.0)
+
+
 def test_days_to_resolve_is_negative_once_the_end_date_has_passed():
     d = days_to_resolve("2026-07-31T00:00:00Z", now_iso="2026-08-01T00:00:00Z")
     assert d < 0

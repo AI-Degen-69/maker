@@ -32,7 +32,10 @@ TOP = 20
 def main() -> None:
     LOG.parent.mkdir(exist_ok=True)
     while True:
-        time.sleep(INTERVAL_SEC)
+        # Rank FIRST, then sleep. Sleeping first left a newly started fleet
+        # quoting whatever markets.json happened to be on disk for a full
+        # hour -- and fleet-bg.ps1 starts the supervisor before this process,
+        # so that stale universe is exactly what it picks up.
         stamp = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
             r = subprocess.run(
@@ -44,6 +47,7 @@ def main() -> None:
             out, err = "", f"\nFAILED: {type(e).__name__}: {e}"
         with LOG.open("a", encoding="utf-8", errors="replace") as f:
             f.write(f"\n===== {stamp} =====\n{out}{err}")
+        time.sleep(INTERVAL_SEC)
 
 
 if __name__ == "__main__":
