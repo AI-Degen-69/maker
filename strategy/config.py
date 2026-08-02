@@ -199,6 +199,24 @@ class MakerConfig:
     # the line the moment anyone else quotes. 1.5x buys headroom.
     reward_floor_multiple: float = 1.5
 
+    # TRADABILITY AND HORIZON (U6). Reward yield per dollar of capital prefers
+    # a thin book by construction, and a thin book is thin because nobody
+    # trades it. Ranking on that metric alone selected a universe that, over
+    # 11.6h, printed 48 trades across 20 markets and never traded at all in 9
+    # of them -- so 74 hours of running produced 9 tape-backed fills.
+    #
+    # A market that does not trade cannot fill a resting order. That is not an
+    # argument against reward farming, which is a real strategy earning real
+    # emissions; it is an argument against measuring reward farming with
+    # fill-based instruments and reading the zeros as a maker result.
+    select_min_volume_24h_usd: float = 25_000.0
+    # A market resolving in 2027 cannot contribute a settled observation to a
+    # run measured in days, and settlement is the only ground truth this
+    # strategy has. The whole 2026-07-31 universe resolved between September
+    # 2026 and 2027, which is why `resolutions` is zero in all six databases.
+    # 7 days keeps n growing fast enough that a sample is reachable.
+    select_max_days_to_resolve: float = 7.0
+
     # How long to average competitor depth before sizing a position. One
     # snapshot sized the whole fleet on 2026-07-29 and read a competing score
     # of 35 for a market that measured 3,727 live -- a 100x error that put the

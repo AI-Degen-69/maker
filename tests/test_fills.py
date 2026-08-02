@@ -337,3 +337,90 @@ def test_drained_level_is_not_counted_as_the_best_bid():
     # and record only the 60 observed shares. Correct best bid is 0.49: the
     # market moved below us, so the whole remainder is the candidate.
     assert eng.unverified_shares() == 120.0
+
+
+# --- reconciliation: making a zero provable ---------------------------------
+#
+# The 2026-08-01 run recorded 1,027 quotes, 0 fills and 29,986 empty tape
+# reads, and could not say WHY the zero happened. "Nothing traded at our
+# price" and "plenty traded but we were behind the queue" are the same zero in
+# the fills table and completely different facts about the strategy. Every
+# resting order now leaves one reconciliation row per snapshot saying which.
+
+
+def test_a_tape_print_at_our_price_that_fills_us_is_marked_credited():
+    eng = _engine_with(0.50, 120, {0.50: 0.0})   # first in queue
+    eng.on_book("T", {0.50: 0.0, 0.49: 5.0}, 2.0, traded={0.50: 30.0})
+    r = eng.reconciliation[-1]
+    assert r.outcome == "credited"
+    assert r.credited == 30.0
+    assert r.tape_volume == 30.0
+    assert r.queue_ahead == 0.0
+
+
+def test_a_tape_print_we_sat_behind_is_marked_behind_queue():
+    """The distinction the fills table cannot make. 200 shares traded at our
+    exact price and we got none of them, because 300 were queued in front --
+    that is a queue-position result, not an absence of trading."""
+    eng = _engine_with(0.50, 120, {0.50: 300.0})
+    eng.on_book("T", {0.50: 100.0}, 2.0, traded={0.50: 200.0})
+    r = eng.reconciliation[-1]
+    assert r.outcome == "behind_queue"
+    assert r.credited == 0.0
+    assert r.tape_volume == 200.0
+    assert r.queue_ahead == 300.0
+
+
+def test_a_read_tape_with_nothing_at_our_price_is_marked_no_trade():
+    """The 2026-08-01 case: the tape was read, the market simply did not
+    trade where we were resting."""
+    eng = _engine_with(0.50, 120, {0.50: 300.0})
+    eng.on_book("T", {0.50: 300.0}, 2.0, traded={})
+    r = eng.reconciliation[-1]
+    assert r.outcome == "no_trade_at_price"
+    assert r.tape_volume == 0.0
+
+
+def test_a_trade_away_from_our_price_is_not_counted_as_a_print_for_us():
+    """Volume elsewhere in the book is not evidence about our price level."""
+    eng = _engine_with(0.50, 120, {0.50: 300.0})
+    eng.on_book("T", {0.50: 300.0}, 2.0, traded={0.45: 900.0})
+    r = eng.reconciliation[-1]
+    assert r.outcome == "no_trade_at_price"
+    assert r.tape_volume == 0.0
+
+
+def test_an_unreadable_tape_is_marked_separately_from_a_silent_one():
+    """`None` is a gap in evidence, `{}` is evidence. Collapsing them would
+    make an outage look like a quiet market."""
+    eng = _engine_with(0.50, 120, {0.50: 300.0})
+    eng.on_book("T", {0.50: 200.0}, 2.0, traded=None)
+    assert eng.reconciliation[-1].outcome == "tape_unavailable"
+
+
+def test_reconciliation_records_one_row_per_open_order_per_snapshot():
+    eng = QueueFillEngine()
+    eng.post("T", "UP", 0.50, 120, {0.50: 10.0}, 0.0)
+    eng.post("T", "UP", 0.49, 120, {0.49: 10.0}, 0.0)
+    eng.on_book("T", {0.50: 10.0, 0.49: 10.0}, 1.0, traded={})  # establishes prev
+    before = len(eng.reconciliation)
+    eng.on_book("T", {0.50: 10.0, 0.49: 10.0}, 2.0, traded={})
+    assert len(eng.reconciliation) - before == 2
+
+
+def test_reconciliation_does_not_disturb_the_fills_it_observes():
+    """Pure observation. The engine must credit exactly what it credited
+    before reconciliation existed, or the instrument is changing the reading."""
+    eng = _engine_with(0.50, 120, {0.50: 300.0})
+    fills = eng.on_book("T", {0.50: 100.0}, 2.0, traded={0.50: 400.0})
+    assert sum(f.size for f in fills) == 100.0    # 400 traded - 300 ahead
+    assert eng.open_orders()[0].queue_ahead == 0.0
+
+
+def test_no_reconciliation_row_before_the_first_delta():
+    """A single snapshot establishes `prev` and implies nothing, so it must
+    not record a 'no trade' row that would dilute the rate."""
+    eng = QueueFillEngine()
+    eng.post("T", "UP", 0.50, 120, {0.50: 10.0}, 0.0)
+    eng.on_book("T", {0.50: 10.0}, 1.0, traded={})
+    assert eng.reconciliation == []

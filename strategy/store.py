@@ -104,6 +104,29 @@ CREATE TABLE IF NOT EXISTS fill_evidence (
     unverified REAL DEFAULT 0
 );
 
+-- U6. WHY each resting order did not fill, one row per order per poll.
+-- `fill_evidence` stores the raw inputs but answers no question directly; the
+-- 11.6h run of 2026-08-01 held 29,742 evidence rows and still could not say
+-- whether its 0 fills meant "nothing traded where we rested" or "we were
+-- behind the queue". Those are opposite diagnoses -- market selection versus
+-- execution -- so the outcome is classified at decision time rather than
+-- reconstructed later from JSON blobs.
+CREATE TABLE IF NOT EXISTS fill_recon (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    condition_id TEXT,
+    token_id TEXT,
+    side TEXT,
+    price REAL,
+    tape_volume REAL,
+    queue_ahead REAL,
+    remaining REAL,
+    credited REAL,
+    -- credited | behind_queue | no_trade_at_price | tape_unavailable
+    outcome TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_fill_recon_outcome ON fill_recon (outcome);
+
 CREATE TABLE IF NOT EXISTS resolutions (
     condition_id TEXT PRIMARY KEY,
     winning_token TEXT,
@@ -363,6 +386,47 @@ def log_fill_evidence(**kw) -> None:
             (kw.get("ts") or time.time(), kw["condition_id"], kw["token_id"],
              kw.get("bids_json"), kw.get("tape_json"),
              kw.get("credited") or 0.0, kw.get("unverified") or 0.0))
+
+
+def log_fill_recon(rows: list) -> None:
+    """Persist why each resting order did or did not fill this poll.
+
+    Batched: one row per open order per token per poll is the highest-rate
+    write in the fleet, and at 20 markets it is several hundred a minute.
+    """
+    if not rows:
+        return
+    with db() as c:
+        c.executemany(
+            "INSERT INTO fill_recon (ts, condition_id, token_id, side, price, "
+            "tape_volume, queue_ahead, remaining, credited, outcome) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+
+
+def recon_summary() -> dict:
+    """Fill outcomes by cause, fleet-wide.
+
+    The number that makes a zero fill rate answerable: 'no_trade_at_price'
+    dominating is a market-selection verdict, 'behind_queue' dominating is an
+    execution verdict, and the six runs before U6 could report neither.
+    """
+    with db() as c:
+        rows = c.execute(
+            "SELECT outcome, COUNT(*), COALESCE(SUM(tape_volume),0), "
+            "COALESCE(SUM(credited),0) FROM fill_recon GROUP BY outcome"
+        ).fetchall()
+    by = {r[0]: {"n": r[1], "tape_volume": r[2], "credited": r[3]}
+          for r in rows}
+    total = sum(v["n"] for v in by.values())
+    # None, not 0.0: an empty run must not read as a measured zero.
+    saw_trade = by.get("credited", {}).get("n", 0) + \
+        by.get("behind_queue", {}).get("n", 0)
+    return {
+        "by_outcome": by,
+        "observations": total,
+        "traded_at_our_price_pct": (100.0 * saw_trade / total
+                                    if total else None),
+    }
 
 
 def verified_ratio() -> dict:

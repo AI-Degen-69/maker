@@ -417,9 +417,27 @@ def visit(st: MarketState, bot_cfg, now: float,
         if first_pass:
             traded = None      # a startup backlog is not evidence about us
         mark = len(st.engine.unverified)
+        recon_mark = len(st.engine.reconciliation)
         fills = st.engine.on_book(book["token_id"], book["bids"], now,
                                   traded=traded)
         new_unverified = st.engine.unverified[mark:]
+        new_recon = st.engine.reconciliation[recon_mark:]
+
+        # U6. Classify the outcome now, while the queue position that produced
+        # it is still known. Reconstructing "were we behind the queue?" later
+        # from `fill_evidence` is not possible -- the blob records the book,
+        # never our place in it.
+        try:
+            store.log_fill_recon([
+                (r.ts, m.condition_id, r.token_id, r.side, r.price,
+                 r.tape_volume, r.queue_ahead, r.remaining, r.credited,
+                 r.outcome) for r in new_recon])
+        except Exception as e:
+            log.warning("fill recon not recorded for %s: %s", st.title[:30], e)
+        # The engine's list is an append-only log and this loop runs every
+        # poll for the life of the process; without draining it the fleet
+        # leaks a row per order per poll for as long as it runs.
+        del st.engine.reconciliation[:]
 
         # Persist the decision inputs so a later engine change can be replayed
         # offline -- the capability whose absence forced Phase A to verify by

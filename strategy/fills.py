@@ -115,11 +115,43 @@ class Fill:
 
 
 @dataclass
+class Recon:
+    """Why one resting order did or did not fill on one snapshot.
+
+    A zero in the fills table is ambiguous, and the ambiguity is the whole
+    question. Over 11.6h the fleet recorded 1,027 quotes and 0 fills, and
+    nothing in the database distinguished "nobody traded where we were
+    resting" from "plenty traded and we were behind the queue". The first is a
+    market-selection result, the second is an execution result, and they call
+    for opposite fixes.
+
+    Outcomes:
+      'credited'          -- tape volume beyond the queue reached our order.
+      'behind_queue'      -- it traded at our price; the shares ahead took it.
+      'no_trade_at_price' -- tape was read; nothing traded at our price.
+      'tape_unavailable'  -- tape could not be read; nothing is claimed.
+    """
+    ts: float
+    token_id: str
+    price: float
+    side: str
+    tape_volume: float
+    queue_ahead: float
+    remaining: float
+    credited: float
+    outcome: str
+
+
+@dataclass
 class QueueFillEngine:
     """Applies observed book changes to our resting orders, queue-first."""
 
     orders: list[RestingOrder] = field(default_factory=list)
     fills: list[Fill] = field(default_factory=list)
+    # One row per open order per snapshot, explaining that snapshot's outcome.
+    # Pure observation: nothing here feeds back into crediting, or the
+    # instrument would be changing the reading it takes.
+    reconciliation: list[Recon] = field(default_factory=list)
     # Fills the pre-U1 delta logic WOULD have credited but the tape cannot
     # support. Never applied to inventory; recorded so the gap is measurable
     # rather than silently traded away for an under-count. These carry
@@ -274,6 +306,25 @@ class QueueFillEngine:
                         token_id=o.token_id, side=o.side, price=o.price,
                         size=shadow, ts=ts, queue_waited=o.queue_ahead,
                         reason=kind))
+
+            # Recorded BEFORE the queue advance, so `queue_ahead` is the
+            # position the order actually held when this tape was applied --
+            # after the advance it reads as though we had always been at the
+            # front, which is the one number that makes 'behind_queue'
+            # meaningful.
+            if tape is None:
+                outcome = "tape_unavailable"
+            elif t_vol <= 1e-9:
+                outcome = "no_trade_at_price"
+            elif qty > 1e-9:
+                outcome = "credited"
+            else:
+                outcome = "behind_queue"
+            self.reconciliation.append(Recon(
+                ts=ts, token_id=o.token_id, price=o.price, side=o.side,
+                tape_volume=t_vol, queue_ahead=o.queue_ahead,
+                remaining=o.remaining, credited=max(0.0, qty),
+                outcome=outcome))
 
             if qty > 1e-9:
                 made.append(self._fill(o, qty, ts, reason="tape"))
