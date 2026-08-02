@@ -36,3 +36,25 @@ __pycache__/
 
 # Freebuff Desktop app data -- local, never commit
 .freebuff/
+
+# run/ is the live fleet's working directory: SQLite databases it writes
+# continuously, their journals, archived snapshots of both, and the ranked
+# universe the rerank loop rewrites every cycle. All of it is regenerated
+# output, not source.
+#
+# The DBs are the expensive mistake to make here -- one archived snapshot is
+# 19MB of binary git cannot delta-compress, and app DBs were already untracked
+# once before (see "stop tracking app DBs in .freebuff/"). markets.json is the
+# cheap one but the more annoying: the rerank loop rewrites it on an interval,
+# so a tracked copy leaves the tree permanently dirty and every commit of it
+# captures an arbitrary instant.
+run/*.db
+run/*.db-journal
+run/*.db-wal
+run/*.db-shm
+run/archive/
+run/markets.json
+run/fleet_state.json
+# Which PIDs this checkout started, so shutdown stops its own fleet rather
+# than every fleet-shaped process on the machine. Per-machine, per-run.
+run/fleet.pids.json

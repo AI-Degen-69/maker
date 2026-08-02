@@ -25,7 +25,8 @@ from dataclasses import replace
 from pathlib import Path
 
 from strategy import gate, markout, merge, profit_take, rewards, store
-from strategy.allocate import allocate_fundable, capital_scarcity, shares_for
+from strategy.allocate import (allocate_fundable, capital_scarcity, shares_for,
+                               spread_capture_daily)
 from strategy.config import load as load_cfg
 from strategy.fills import QueueFillEngine
 from strategy.main import full_book, recent_trades
@@ -126,7 +127,9 @@ class MarketState:
         self.spec = spec
         self.cid = spec["cid"]
         self.title = spec["title"]
-        self.daily = spec["daily"]
+        # `daily`, `source` and `pot` are all set by refresh_pot, which the
+        # re-rank calls again when the spec is rewritten. See its docstring.
+        self.refresh_pot(spec, base_cfg)
         # Each market publishes its own reward window, minimum order size and
         # tick. Quoting under a market's min_size scores exactly zero, so these
         # are load-bearing, not cosmetic.
@@ -181,6 +184,59 @@ class MarketState:
         self.gate = _gate_from_db(self.cid)
         self.markout: dict = {"verdict": "insufficient_sample",
                               "mean_per_share": None, "n": 0}
+
+    def refresh_pot(self, spec: dict, base_cfg) -> None:
+        """Re-read what this market pays from a freshly ranked spec.
+
+        WHAT THIS MARKET PAYS, AND WHAT PAYS IT.
+
+        `daily` is the reward pot, and it is 0 for every market publishing
+        clobRewards: 0 -- which is most of the ones that trade. Those are paid
+        in spread instead, so the pot is reconstructed from volume and book
+        width. Three separate consumers need the same answer: the allocator
+        sizes on it, the live-state income projection reports it, and the
+        dashboard reads that.
+
+        Called from `__init__` and again on every re-rank, because volume
+        moves. A market surviving a re-rank keeps its MarketState object, so
+        nothing else would re-read the spec -- and for a spread market the pot
+        IS the volume estimate, so a stale one sizes against volume the market
+        no longer has.
+
+        Derived from config rather than read from the spec, so revising the
+        capture assumption takes effect on the next sweep.
+        """
+        # MERGED IN PLACE, NEVER REBOUND.
+        #
+        # `main` builds `specs` and `states` from the SAME dict objects, writes
+        # live telemetry through `st.spec["_live"]`, and serialises `specs` to
+        # run/fleet_state.json. Rebinding `self.spec` to the fresh dict detached
+        # a surviving market from that list: its later `_live` writes landed in
+        # an object `specs` no longer referenced, so after the first re-rank the
+        # dashboard file kept reporting the pre-re-rank snapshot forever.
+        #
+        # `_live` is excluded from the merge because the fresh spec off disk has
+        # none, and copying that absence in would blank the current reading --
+        # `visit` reads `prev_live` to decide the merge-velocity exception.
+        if spec is not self.spec:
+            self.spec.update({k: v for k, v in spec.items() if k != "_live"})
+            # cfg carries spec-derived numbers too. Left stale they disagree
+            # with the dict `reallocate` reads `min_size` from.
+            self.cfg = replace(
+                self.cfg,
+                min_quote_shares=int(self.spec["min_size"]),
+                max_spread_from_mid=self.spec["max_spread"] / 100.0,
+                price_tick=float(self.spec["tick"]),
+                market_title=self.spec["title"],
+                market_daily_rate=self.spec["daily"])
+
+        self.daily = self.spec["daily"]
+        self.source = "rewards" if self.daily > 0 else "spread"
+        self.pot = self.daily if self.daily > 0 else spread_capture_daily(
+            float(self.spec.get("volume_24h") or 0.0),
+            float(self.spec.get("spread")
+                  or base_cfg.spread_capture_default_spread),
+            base_cfg.spread_capture_frac)
 
     def observe_theirs(self, ts: float, theirs: float, window_sec: float) -> None:
         """Add one competitor-depth reading and drop anything past the window."""
@@ -277,6 +333,10 @@ def reallocate(states, base) -> dict:
     share is set by the competition, not by the pot. Big pots are big precisely
     because makers crowd them.
 
+    Two income sources, one water-fill. Reward markets are sized on their pot;
+    markets paying no rewards at all are sized on expected spread capture, and
+    only the reward ones are held to the $1.50 minimum-distribution floor.
+
     Runs only on markets that have reported a live share; a market we have not
     measured yet keeps its current size rather than being sized off a guess.
     Markets the allocator funds below their min_size get 0 and stop quoting,
@@ -284,6 +344,10 @@ def reallocate(states, base) -> dict:
     worse than capital sitting idle.
     """
     obs = []
+    # Measured markets with nothing behind them. Held separately from `obs` so
+    # they cannot influence the water-fill, then merged into `dollars` at 0.0
+    # so their size is actively driven to zero.
+    unpayable: list[str] = []
     floor = base.reward_min_payout_usd * base.reward_floor_multiple
     for s in states:
         # SIZE OFF THE COMPETITION, NOT OFF OUR OWN ORDERS.
@@ -316,11 +380,35 @@ def reallocate(states, base) -> dict:
         ref = 100.0
         ours_ref = ref * k
         total = ours_ref + avg_theirs
-        obs.append({"cid": s.cid, "daily": s.daily, "capital": ref,
+
+        # A market that pays no rent still pays a spread, and `MarketState`
+        # has already converted that into the same $/day pot, so everything
+        # here -- income, marginal, the water-fill -- is unchanged. What does
+        # NOT carry over is the $1.50 payout floor: it is the venue's minimum
+        # reward DISTRIBUTION, and a spread market makes no distribution.
+        # `source` is what tells allocate_fundable which rule applies.
+        #
+        # No reward pot and no measured volume leaves a zero pot. That is not
+        # a cheap market, it is an unknown one, and unknown must not size as
+        # zero-competition upside -- so it stays out of the water-fill.
+        #
+        # But it must NOT be dropped the way an unsampled market is. We have
+        # measured this one; `avg_theirs` above proves it. Dropping it here
+        # left its cid absent from `dollars`, and the loop below reads absence
+        # as "never sampled" and keeps the previous size -- so a spread market
+        # funded on an earlier sweep whose volume later read 0 went on quoting
+        # its funded size with no pot behind it. That is the exact failure the
+        # zeroing below exists to prevent. Recorded as unpayable instead.
+        if s.pot <= 0:
+            unpayable.append(s.cid)
+            continue
+
+        obs.append({"cid": s.cid, "daily": s.pot, "source": s.source,
+                    "capital": ref,
                     "share": (ours_ref / total) if total > 0 else 1.0,
                     "min_dollars": float(s.spec["min_size"])})
 
-    if not obs:
+    if not obs and not unpayable:
         return {}
 
     # REWARD ELIGIBILITY, applied inside the allocation rather than ahead of
@@ -348,6 +436,14 @@ def reallocate(states, base) -> dict:
     scarce = capital_scarcity(obs, dollars, base.allocation_budget,
                               base.marginal_return_floor,
                               base.scarcity_marginal_multiple)
+
+    # Merged only now, AFTER scarcity: these markets were deliberately kept out
+    # of the observation set, so they must not colour the budget-vs-floor
+    # verdict either. Present at 0.0 the loop below reads as "measured and
+    # refused" -- the same treatment a market failing the floor gets.
+    # setdefault, not assignment, so a real allocator verdict always wins.
+    for cid in unpayable:
+        dollars.setdefault(cid, 0.0)
 
     out = {}
     for s in states:
@@ -387,9 +483,18 @@ def visit(st: MarketState, bot_cfg, now: float,
     # resting-order reservation use the same fleet-wide committed total.
     committed_states = states if states is not None else [st]
     if st.market is None:
-        st.market = fetch_pinned_market(st.cid)
+        # Reward funding is not a loadability condition. The ranker already
+        # decided this market belongs in the universe, and half of it now pays
+        # spread rather than rent.
+        st.market = fetch_pinned_market(st.cid, require_rewards=False)
         if st.market is None:
-            st.err = "not funded / not accepting orders"
+            # Funding is no longer a rejection cause here: `require_rewards`
+            # is False, so an unfunded market comes back fine. What is left is
+            # closed, not accepting orders, or a token count other than 2 --
+            # and the dashboard renders this string as the market's `err`, so
+            # naming rewards sent an operator hunting a pot that was never the
+            # problem.
+            st.err = "closed / not accepting orders"
             return
     m = st.market
 
@@ -417,9 +522,27 @@ def visit(st: MarketState, bot_cfg, now: float,
         if first_pass:
             traded = None      # a startup backlog is not evidence about us
         mark = len(st.engine.unverified)
+        recon_mark = len(st.engine.reconciliation)
         fills = st.engine.on_book(book["token_id"], book["bids"], now,
                                   traded=traded)
         new_unverified = st.engine.unverified[mark:]
+        new_recon = st.engine.reconciliation[recon_mark:]
+
+        # U6. Classify the outcome now, while the queue position that produced
+        # it is still known. Reconstructing "were we behind the queue?" later
+        # from `fill_evidence` is not possible -- the blob records the book,
+        # never our place in it.
+        try:
+            store.log_fill_recon([
+                (r.ts, m.condition_id, r.token_id, r.side, r.price,
+                 r.tape_volume, r.queue_ahead, r.remaining, r.credited,
+                 r.outcome) for r in new_recon])
+        except Exception as e:
+            log.warning("fill recon not recorded for %s: %s", st.title[:30], e)
+        # The engine's list is an append-only log and this loop runs every
+        # poll for the life of the process; without draining it the fleet
+        # leaks a row per order per poll for as long as it runs.
+        del st.engine.reconciliation[:]
 
         # Persist the decision inputs so a later engine change can be replayed
         # offline -- the capability whose absence forced Phase A to verify by
@@ -771,7 +894,11 @@ def visit(st: MarketState, bot_cfg, now: float,
 
     st.spec["_live"] = {
         "share": share, "ours": ours, "theirs": theirs,
-        "income": share * st.daily,
+        # Projected income at the CURRENT score share, off whichever pot pays
+        # this market. Reading `daily` here reported $0.00/day for every
+        # spread market, which is true of its rent and false of its income.
+        "income": share * st.pot,
+        "pot": st.pot, "source": st.source,
         "capital": sum(o.price * (o.size - o.filled) for o in orders),
         "quotes": [{"side": o.side, "price": round(o.price, 4), "size": o.size}
                    for o in orders],
@@ -854,10 +981,21 @@ def main() -> None:
             try:
                 fresh = {s["cid"]: s for s in load_specs()}
                 known = {s.cid for s in states}
+                by_cid = {s.cid: s for s in states}
                 for cid, spec in fresh.items():
                     if cid not in known:
                         states.append(MarketState(spec, base))
                         log.info("RERANK + %s", spec["title"][:40])
+                    else:
+                        # A SURVIVING MARKET KEEPS ITS OBJECT, SO ITS POT MUST
+                        # BE RE-READ EXPLICITLY. For a spread market the pot IS
+                        # the volume estimate, and `__init__` computed it once
+                        # from the spec present at process start. A market whose
+                        # 24h volume halved went on sizing and reporting against
+                        # the volume it had hours ago, for the life of the
+                        # process -- which is exactly what the periodic re-rank
+                        # exists to prevent.
+                        by_cid[cid].refresh_pot(spec, base)
                 held = [s for s in states if s.cid not in fresh
                         and (s.inv.up_shares or s.inv.down_shares)]
                 dropped = [s for s in states
@@ -923,6 +1061,14 @@ def main() -> None:
             # first without the second is how a 0.256%/day return got reported
             # as 1.80%/day for a day and a half.
             committed = fleet_committed_cost(states)
+            # Sample the projection so it can be integrated over time. The
+            # instantaneous figure swings by an order of magnitude within an
+            # hour as markets are funded and defunded, so a single reading is
+            # only whichever moment the reader happened to look at.
+            try:
+                store.log_income_sample(time.time(), inc, committed)
+            except Exception as e:
+                log.warning("income sample failed: %s", e)
             log.info("sweep | %d/%d scoring | est $%.2f/day | offers $%.0f "
                      "| committed $%.0f/%.0f | naked $%.0f | funded %d/%d "
                      "| verified %s (%s)",

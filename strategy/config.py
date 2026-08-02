@@ -199,6 +199,46 @@ class MakerConfig:
     # the line the moment anyone else quotes. 1.5x buys headroom.
     reward_floor_multiple: float = 1.5
 
+    # SPREAD CAPTURE (U6). The payout floor above, and the sizing that feeds
+    # it, assume income arrives as reward emissions. The markets that actually
+    # trade -- bitcoin-up-or-down-*, ~$92k/24h -- publish clobRewards: 0, so
+    # the allocator valued them at exactly zero and the fleet instead funded a
+    # universe that printed 9 tape-backed fills in 74 hours.
+    #
+    # For those markets the income IS the spread, and
+    # `allocate.spread_capture_daily` converts it into the same $/day pot the
+    # reward path uses. These two are its inputs.
+    #
+    # Fraction of the quoted spread earned per share traded. A resting maker
+    # earns at MOST half the spread on a round trip, and less in practice,
+    # because flow that reaches a resting order is adversely selected. This is
+    # a starting hypothesis at half of that theoretical half -- to be replaced
+    # by the first real markout sample on one of these markets, exactly as
+    # every other EV parameter here is.
+    spread_capture_frac: float = 0.25
+    # Fallback quoted spread when the market spec carries none. 1c is the
+    # observed book on the up-or-down series. The estimate is most sensitive to
+    # this number, so a spec reporting its own spread is always preferred.
+    spread_capture_default_spread: float = 0.01
+
+    # TRADABILITY AND HORIZON (U6). Reward yield per dollar of capital prefers
+    # a thin book by construction, and a thin book is thin because nobody
+    # trades it. Ranking on that metric alone selected a universe that, over
+    # 11.6h, printed 48 trades across 20 markets and never traded at all in 9
+    # of them -- so 74 hours of running produced 9 tape-backed fills.
+    #
+    # A market that does not trade cannot fill a resting order. That is not an
+    # argument against reward farming, which is a real strategy earning real
+    # emissions; it is an argument against measuring reward farming with
+    # fill-based instruments and reading the zeros as a maker result.
+    select_min_volume_24h_usd: float = 25_000.0
+    # A market resolving in 2027 cannot contribute a settled observation to a
+    # run measured in days, and settlement is the only ground truth this
+    # strategy has. The whole 2026-07-31 universe resolved between September
+    # 2026 and 2027, which is why `resolutions` is zero in all six databases.
+    # 7 days keeps n growing fast enough that a sample is reachable.
+    select_max_days_to_resolve: float = 7.0
+
     # How long to average competitor depth before sizing a position. One
     # snapshot sized the whole fleet on 2026-07-29 and read a competing score
     # of 35 for a market that measured 3,727 live -- a 100x error that put the

@@ -104,6 +104,29 @@ CREATE TABLE IF NOT EXISTS fill_evidence (
     unverified REAL DEFAULT 0
 );
 
+-- U6. WHY each resting order did not fill, one row per order per poll.
+-- `fill_evidence` stores the raw inputs but answers no question directly; the
+-- 11.6h run of 2026-08-01 held 29,742 evidence rows and still could not say
+-- whether its 0 fills meant "nothing traded where we rested" or "we were
+-- behind the queue". Those are opposite diagnoses -- market selection versus
+-- execution -- so the outcome is classified at decision time rather than
+-- reconstructed later from JSON blobs.
+CREATE TABLE IF NOT EXISTS fill_recon (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    condition_id TEXT,
+    token_id TEXT,
+    side TEXT,
+    price REAL,
+    tape_volume REAL,
+    queue_ahead REAL,
+    remaining REAL,
+    credited REAL,
+    -- credited | behind_queue | no_trade_at_price | tape_unavailable
+    outcome TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_fill_recon_outcome ON fill_recon (outcome);
+
 CREATE TABLE IF NOT EXISTS resolutions (
     condition_id TEXT PRIMARY KEY,
     winning_token TEXT,
@@ -163,6 +186,25 @@ CREATE TABLE IF NOT EXISTS hedge_census (
 -- previous 60-market run measured fills only, which is why it read as flat
 -- while the actual payoff went unrecorded. our_share is what the pool pays us:
 --   payout ~= our_share * 0.20 * taker_fees_in_this_market
+-- PROJECTED INCOME, SAMPLED OVER TIME. One row per sweep, fleet-wide.
+--
+-- The dashboard's income figure is instantaneous: it is what the CURRENT
+-- positions project, and it swings from $302/day to $41/day inside an hour as
+-- markets are funded, defunded, filled and re-ranked. Read as "what the fleet
+-- earns", that is misleading in both directions -- whichever moment you happen
+-- to look at becomes the headline.
+--
+-- Sampling makes the honest quantities computable: income integrated over the
+-- time each level was actually held (dollars genuinely accrued so far), and
+-- that total divided by elapsed time (a time-weighted rate, in which a level
+-- held ten minutes counts a sixth as much as one held an hour).
+CREATE TABLE IF NOT EXISTS income_samples (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL,
+    income_day REAL,           -- projected $/day at this instant, fleet-wide
+    committed REAL             -- dollars deployed behind that projection
+);
+
 CREATE TABLE IF NOT EXISTS reward_samples (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL,
@@ -363,6 +405,107 @@ def log_fill_evidence(**kw) -> None:
             (kw.get("ts") or time.time(), kw["condition_id"], kw["token_id"],
              kw.get("bids_json"), kw.get("tape_json"),
              kw.get("credited") or 0.0, kw.get("unverified") or 0.0))
+
+
+def log_fill_recon(rows: list) -> None:
+    """Persist why each resting order did or did not fill this poll.
+
+    Batched: one row per open order per token per poll is the highest-rate
+    write in the fleet, and at 20 markets it is several hundred a minute.
+    """
+    if not rows:
+        return
+    with db() as c:
+        c.executemany(
+            "INSERT INTO fill_recon (ts, condition_id, token_id, side, price, "
+            "tape_volume, queue_ahead, remaining, credited, outcome) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+
+
+def recon_summary() -> dict:
+    """Fill outcomes by cause, fleet-wide.
+
+    The number that makes a zero fill rate answerable: 'no_trade_at_price'
+    dominating is a market-selection verdict, 'behind_queue' dominating is an
+    execution verdict, and the six runs before U6 could report neither.
+    """
+    with db() as c:
+        rows = c.execute(
+            "SELECT outcome, COUNT(*), COALESCE(SUM(tape_volume),0), "
+            "COALESCE(SUM(credited),0) FROM fill_recon GROUP BY outcome"
+        ).fetchall()
+    by = {r[0]: {"n": r[1], "tape_volume": r[2], "credited": r[3]}
+          for r in rows}
+    total = sum(v["n"] for v in by.values())
+    # None, not 0.0: an empty run must not read as a measured zero.
+    saw_trade = by.get("credited", {}).get("n", 0) + \
+        by.get("behind_queue", {}).get("n", 0)
+    # ONLY ROWS WHERE THE TAPE WAS ACTUALLY READ CAN ANSWER THE QUESTION.
+    #
+    # `tape_unavailable` is a gap in evidence, not an observation that the
+    # market was quiet. Leaving it in the denominator dragged the percentage
+    # down in proportion to tape outages, so a tape problem read as a verdict
+    # on market selection -- the exact confusion this summary exists to
+    # remove, and one the rest of the module is careful to keep apart.
+    observed = total - by.get("tape_unavailable", {}).get("n", 0)
+    return {
+        "by_outcome": by,
+        "observations": total,
+        "tape_observations": observed,
+        "traded_at_our_price_pct": (100.0 * saw_trade / observed
+                                    if observed else None),
+    }
+
+
+def log_income_sample(ts: float, income_day: float, committed: float) -> None:
+    """One fleet-wide projection reading, once per sweep."""
+    with _conn() as c:
+        c.execute("INSERT INTO income_samples (ts, income_day, committed) "
+                  "VALUES (?,?,?)", (ts, income_day, committed))
+
+
+# A sweep is ~30-60s. Anything longer than this between two samples is a gap
+# in the RUN -- a restart, a crash, a laptop asleep -- not a rate that was
+# genuinely held for that whole period. Crediting the gap would invent income
+# for hours the fleet was not quoting, which is precisely the error that makes
+# a paper run look better than the machine it ran on.
+MAX_SAMPLE_GAP_SEC = 300.0
+
+
+def income_accrual() -> dict:
+    """Integrate the projected income series over the time it was held.
+
+    Returns `accrued` (dollars the model says were earned so far), `twa_day`
+    (accrued divided by elapsed quoting time, in $/day), `hours` of credited
+    time, and `n` samples.
+
+    Each sample is credited for the interval UNTIL THE NEXT ONE, not since the
+    previous one, because a projection describes the state going forward from
+    the moment it was taken. The final sample earns nothing yet; it has no
+    interval behind it.
+
+    This is a MODEL integrated over time, not a ledger. It inherits every
+    assumption in the projection -- above all `spread_capture_frac`, which is
+    a hypothesis until enough fills mature to replace it.
+    """
+    out = {"accrued": 0.0, "twa_day": None, "hours": 0.0, "n": 0}
+    with _conn() as c:
+        rows = c.execute("SELECT ts, income_day FROM income_samples "
+                         "ORDER BY ts").fetchall()
+    out["n"] = len(rows)
+    if len(rows) < 2:
+        return out
+    secs = 0.0
+    for (t0, inc), (t1, _) in zip(rows, rows[1:]):
+        dt = (t1 or 0) - (t0 or 0)
+        if dt <= 0 or dt > MAX_SAMPLE_GAP_SEC:
+            continue
+        out["accrued"] += (inc or 0.0) * dt / 86400.0
+        secs += dt
+    out["hours"] = secs / 3600.0
+    if secs > 0:
+        out["twa_day"] = out["accrued"] * 86400.0 / secs
+    return out
 
 
 def verified_ratio() -> dict:

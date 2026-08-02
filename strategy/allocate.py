@@ -60,6 +60,46 @@ def marginal(capital: float, daily: float, T: float) -> float:
     return daily * T / ((capital + T) ** 2)
 
 
+def spread_capture_daily(volume_24h_usd: float, spread: float,
+                         capture_frac: float = 0.25,
+                         avg_price: float = 0.5) -> float:
+    """Pot-equivalent, in $/day, for a market that pays no rewards at all.
+
+    Everything else in this module is written against `daily` -- the dollars a
+    market hands out per day, split by score share. A market with
+    `clobRewards: 0` has no such pot, so every function here values it at zero
+    and the fleet never funds it. That is backwards for the markets U6 wants:
+    bitcoin-up-or-down-* pays nothing for resting and trades ~$92k in 24 hours.
+    The income is there; it arrives as spread rather than as emissions.
+
+    So a synthetic pot is computed and handed to the same machinery:
+
+        shares/day = volume_24h / avg_price
+        pot        = shares/day x spread x capture_frac
+
+    It is a pot in the same sense the reward pot is -- what the market pays out
+    in total, of which we take our depth's share -- so `income()` and
+    `marginal()` need no special case: our share still dilutes as we push size
+    in, and the water-fill compares a spread market against a reward market on
+    one axis.
+
+    `capture_frac` is the honest part of the estimate, and it is a HYPOTHESIS
+    rather than a measurement. A maker resting inside the touch earns at most
+    half the quoted spread per round trip, and earns less in practice because
+    the flow that reaches a resting order is selected against it -- which is
+    the entire subject of the markout gate. 0.25 is half of that theoretical
+    half-spread. The first real markout sample on one of these markets should
+    replace it.
+
+    `avg_price` is 0.5 because a binary pair costs $1 and volume is quoted in
+    dollars: near the middle of the book each share changes hands for about
+    half a dollar.
+    """
+    if volume_24h_usd <= 0 or spread <= 0 or avg_price <= 0 or capture_frac <= 0:
+        return 0.0
+    return (volume_24h_usd / avg_price) * spread * capture_frac
+
+
 def shares_for(dollars: float, min_size: int) -> int:
     """Turn an allocation in dollars into a per-side quote size.
 
@@ -125,6 +165,16 @@ def allocate_fundable(markets: list[dict], budget: float, floor: float,
         distribution, so a market projecting under it is not a small earner,
         it earns exactly zero.
 
+    The payout floor is a REWARD rule, and it applies only to markets earning
+    reward income. A market whose `source` is "spread" is paid by the taker who
+    lifts its offer, in the amount of the spread, on the trade -- there is no
+    distribution and therefore no minimum distribution. Applying the floor
+    there would defund exactly the liquid short-dated markets U6 added it for:
+    the venue never pays them a dollar a day because the venue never pays them
+    anything. Markets carry `source` themselves (default "rewards", so existing
+    callers are unaffected) rather than the caller passing two floors, because
+    the two kinds sit in one water-fill and are judged in one pass.
+
     Judged AT the allocation, not at a fixed probe size, because income is
     monotone in size: Taylor Swift pays $1.00/day at its 100-share minimum and
     $5.50/day at the 600 shares the budget can afford. A probe at the minimum
@@ -160,16 +210,19 @@ def allocate_fundable(markets: list[dict], budget: float, floor: float,
                 continue        # under the marginal floor; allocate said so
             T = competitor_depth(m["capital"], m["share"])
             lot = m.get("min_dollars", 0.0)
+            # Zero for spread markets: the floor is a minimum DISTRIBUTION, and
+            # spread income is not distributed.
+            pf = payout_floor if m.get("source", "rewards") == "rewards" else 0.0
             if d < lot:
                 inc = income(lot, m["daily"], T)
-                if lot <= free and inc >= payout_floor and inc / lot >= floor:
+                if lot <= free and inc >= pf and inc / lot >= floor:
                     if promote is None or inc / lot > promote[1]:
                         promote = (m["cid"], inc / lot, lot)
                 elif drop is None or inc < drop[1]:
                     drop = (m["cid"], inc)
                 continue
             inc = income(d, m["daily"], T)
-            if inc < payout_floor and (drop is None or inc < drop[1]):
+            if inc < pf and (drop is None or inc < drop[1]):
                 drop = (m["cid"], inc)
 
         if promote is not None:
