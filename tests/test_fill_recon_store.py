@@ -57,6 +57,38 @@ def test_the_summary_separates_a_quiet_market_from_a_queue_loss():
     assert s["traded_at_our_price_pct"] == 50.0
 
 
+def test_a_tape_outage_does_not_count_against_the_market():
+    """A gap in evidence is not an observation that the market was quiet.
+
+    `tape_unavailable` used to sit in the denominator, so an hour of tape
+    trouble dragged `traded_at_our_price_pct` down and a plumbing failure read
+    as a verdict on market selection -- the one confusion this summary exists
+    to remove.
+
+    One credited row and one unreadable row is 100% of what was actually
+    observed, not 50%.
+    """
+    store.log_fill_recon([
+        (1.0, "c1", "T", "UP", 0.50, 200.0, 0.0, 0.0, 1, "credited"),
+        (2.0, "c1", "T", "UP", 0.50, None, 0.0, 120.0, 0, "tape_unavailable"),
+    ])
+    s = store.recon_summary()
+    assert s["observations"] == 2, "the outage is still recorded"
+    assert s["tape_observations"] == 1, "but only one row could be read"
+    assert s["traded_at_our_price_pct"] == 100.0
+
+
+def test_an_entirely_unreadable_run_reports_none_not_zero():
+    """No readable row means no answer, which is not the same as 0%."""
+    store.log_fill_recon([
+        (1.0, "c1", "T", "UP", 0.50, None, 0.0, 120.0, 0, "tape_unavailable"),
+    ])
+    s = store.recon_summary()
+    assert s["observations"] == 1
+    assert s["tape_observations"] == 0
+    assert s["traded_at_our_price_pct"] is None
+
+
 def test_an_empty_run_reports_none_rather_than_a_measured_zero():
     assert store.recon_summary()["traded_at_our_price_pct"] is None
 

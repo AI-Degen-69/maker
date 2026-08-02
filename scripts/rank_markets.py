@@ -420,11 +420,26 @@ def main() -> None:
     # the venue had no tradeable market today or the filters are set wrong --
     # a bare count cannot, and a silent empty universe is how the fleet ended
     # up quoting markets that never traded.
+    # Bucket by GATE, not by first word. Splitting on whitespace put one gate
+    # in two buckets -- "volume unknown" landed under `volume` while "24h
+    # volume $900 < $5,000" landed under `24h` -- and "no spread income"
+    # became `no`. Labels that do not match the gates cannot answer the
+    # question this block exists to answer.
+    def _cause(reason: str) -> str:
+        r = reason.lower()
+        if "volume" in r:
+            return "volume"
+        if "horizon" in r:
+            return "horizon"
+        if "income" in r:
+            return "income"
+        return reason.split(" $")[0] or "other"
+
     causes: dict[str, int] = {}
     for r in out:
         if not r["eligible"]:
-            causes[r["reject_reason"].split(" $")[0].split(" ")[0]] = (
-                causes.get(r["reject_reason"].split(" $")[0].split(" ")[0], 0) + 1)
+            k = _cause(r["reject_reason"])
+            causes[k] = causes.get(k, 0) + 1
     print(f"scored {len(out)}, rejected {rejected} "
           f"({', '.join(f'{k}={v}' for k, v in sorted(causes.items())) or 'none'}), "
           f"wrote top {len(picked)} -> run/markets.json")

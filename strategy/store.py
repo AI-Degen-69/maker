@@ -440,11 +440,20 @@ def recon_summary() -> dict:
     # None, not 0.0: an empty run must not read as a measured zero.
     saw_trade = by.get("credited", {}).get("n", 0) + \
         by.get("behind_queue", {}).get("n", 0)
+    # ONLY ROWS WHERE THE TAPE WAS ACTUALLY READ CAN ANSWER THE QUESTION.
+    #
+    # `tape_unavailable` is a gap in evidence, not an observation that the
+    # market was quiet. Leaving it in the denominator dragged the percentage
+    # down in proportion to tape outages, so a tape problem read as a verdict
+    # on market selection -- the exact confusion this summary exists to
+    # remove, and one the rest of the module is careful to keep apart.
+    observed = total - by.get("tape_unavailable", {}).get("n", 0)
     return {
         "by_outcome": by,
         "observations": total,
-        "traded_at_our_price_pct": (100.0 * saw_trade / total
-                                    if total else None),
+        "tape_observations": observed,
+        "traded_at_our_price_pct": (100.0 * saw_trade / observed
+                                    if observed else None),
     }
 
 

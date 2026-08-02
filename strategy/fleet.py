@@ -306,6 +306,10 @@ def reallocate(states, base) -> dict:
     worse than capital sitting idle.
     """
     obs = []
+    # Measured markets with nothing behind them. Held separately from `obs` so
+    # they cannot influence the water-fill, then merged into `dollars` at 0.0
+    # so their size is actively driven to zero.
+    unpayable: list[str] = []
     floor = base.reward_min_payout_usd * base.reward_floor_multiple
     for s in states:
         # SIZE OFF THE COMPETITION, NOT OFF OUR OWN ORDERS.
@@ -348,9 +352,17 @@ def reallocate(states, base) -> dict:
         #
         # No reward pot and no measured volume leaves a zero pot. That is not
         # a cheap market, it is an unknown one, and unknown must not size as
-        # zero-competition upside -- skipped exactly like a market we have
-        # never sampled.
+        # zero-competition upside -- so it stays out of the water-fill.
+        #
+        # But it must NOT be dropped the way an unsampled market is. We have
+        # measured this one; `avg_theirs` above proves it. Dropping it here
+        # left its cid absent from `dollars`, and the loop below reads absence
+        # as "never sampled" and keeps the previous size -- so a spread market
+        # funded on an earlier sweep whose volume later read 0 went on quoting
+        # its funded size with no pot behind it. That is the exact failure the
+        # zeroing below exists to prevent. Recorded as unpayable instead.
         if s.pot <= 0:
+            unpayable.append(s.cid)
             continue
 
         obs.append({"cid": s.cid, "daily": s.pot, "source": s.source,
@@ -358,7 +370,7 @@ def reallocate(states, base) -> dict:
                     "share": (ours_ref / total) if total > 0 else 1.0,
                     "min_dollars": float(s.spec["min_size"])})
 
-    if not obs:
+    if not obs and not unpayable:
         return {}
 
     # REWARD ELIGIBILITY, applied inside the allocation rather than ahead of
@@ -386,6 +398,14 @@ def reallocate(states, base) -> dict:
     scarce = capital_scarcity(obs, dollars, base.allocation_budget,
                               base.marginal_return_floor,
                               base.scarcity_marginal_multiple)
+
+    # Merged only now, AFTER scarcity: these markets were deliberately kept out
+    # of the observation set, so they must not colour the budget-vs-floor
+    # verdict either. Present at 0.0 the loop below reads as "measured and
+    # refused" -- the same treatment a market failing the floor gets.
+    # setdefault, not assignment, so a real allocator verdict always wins.
+    for cid in unpayable:
+        dollars.setdefault(cid, 0.0)
 
     out = {}
     for s in states:
@@ -430,7 +450,13 @@ def visit(st: MarketState, bot_cfg, now: float,
         # spread rather than rent.
         st.market = fetch_pinned_market(st.cid, require_rewards=False)
         if st.market is None:
-            st.err = "not funded / not accepting orders"
+            # Funding is no longer a rejection cause here: `require_rewards`
+            # is False, so an unfunded market comes back fine. What is left is
+            # closed, not accepting orders, or a token count other than 2 --
+            # and the dashboard renders this string as the market's `err`, so
+            # naming rewards sent an operator hunting a pot that was never the
+            # problem.
+            st.err = "closed / not accepting orders"
             return
     m = st.market
 

@@ -93,6 +93,43 @@ def test_a_zero_reward_market_with_no_volume_is_not_funded():
     assert st.cfg.quote_shares == 0
 
 
+def test_a_funded_market_whose_volume_dies_is_driven_back_to_zero():
+    """THE CASE THE TEST ABOVE CANNOT SEE.
+
+    `_measured` sets quote_shares=0 before calling, so that assertion holds
+    whatever reallocate does. The reachable failure is the opposite state: a
+    spread market funded on an earlier sweep whose volume LATER reads 0. It
+    still has avg_theirs, so it is measured, and it used to be skipped -- which
+    the sizing loop reads as "never sampled" and honours by keeping the
+    previous size. The market went on quoting at its funded size with no pot
+    behind it.
+    """
+    base = load_cfg()
+    st = _measured(_spec(cid="was_live", volume=0.0), base=base)
+    # Funded last sweep, back when the tape still showed volume.
+    st.cfg = replace(st.cfg, quote_shares=120)
+    assert st.pot == 0.0, "fixture must present a market with nothing behind it"
+
+    assert reallocate([st], base).get("was_live") == 0, (
+        "a measured market with no pot must be reported at 0, not omitted")
+    assert st.cfg.quote_shares == 0, (
+        "it kept quoting its previously funded size with no pot behind it")
+
+
+def test_an_unsampled_market_still_keeps_its_size():
+    """The other half of the contract, which the fix must not break.
+
+    Absence from the allocation means "never measured" and only that. Such a
+    market keeps its current size, because sizing it off a guess is worse than
+    leaving it alone.
+    """
+    base = load_cfg()
+    st = MarketState(_spec(cid="unseen", volume=0.0), base)
+    st.cfg = replace(st.cfg, quote_shares=120)   # no observe_theirs call
+    assert reallocate([st], base).get("unseen") is None
+    assert st.cfg.quote_shares == 120
+
+
 def test_a_missing_spread_falls_back_to_the_configured_default():
     """The spec is written by the ranker and may not carry a spread yet. The
     market is still fundable off volume alone, at the 1c book the up-or-down
