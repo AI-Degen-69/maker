@@ -8,6 +8,7 @@ concentrated: measured, a single market can be a third of the total.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -26,6 +27,8 @@ CFG = load_config()
 # polling interval. Give one slow sweep room before calling the fleet dead;
 # otherwise a healthy fleet flashes STALE between every state-file write.
 STALE_AFTER_SEC = 120.0
+
+log = logging.getLogger("fleet_dash")
 
 app = FastAPI(title="maker fleet")
 
@@ -137,19 +140,34 @@ def _maker_rebate(db: Path | None = None) -> dict:
 
     `taker_fee` is imported rather than re-derived -- kpi.py already owns the
     crypto_fees_v2 curve, and a second copy is a second thing to get wrong.
+
+    `err` is the difference between "no fills yet" and "the fills table could
+    not be read". Both render $0.00, and on a MONEY figure those two must not
+    look alike -- a silent zero here reads as "we earned nothing" when the real
+    statement is "we do not know". The read still degrades rather than blanking
+    the page, but it says so, in the payload and in the log.
     """
-    out = {"earned": 0.0, "shares": 0.0, "fills": 0, "per_share_cents": None}
+    out = {"earned": 0.0, "shares": 0.0, "fills": 0, "per_share_cents": None,
+           "err": ""}
     path = DB if db is None else Path(db)
     if not path.exists():
+        # Not an error: before the first run there is no DB, and $0.00 earned
+        # is the honest answer rather than a failure to report.
         return out
     try:
         c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        rows = c.execute("SELECT price, size FROM fills "
-                         "WHERE crossed = 0 OR crossed IS NULL").fetchall()
-        c.close()
-    except Exception:
-        # Same contract as every other reader here: one unreadable metric must
-        # not blank the page.
+        try:
+            rows = c.execute("SELECT price, size FROM fills "
+                             "WHERE crossed = 0 OR crossed IS NULL").fetchall()
+        finally:
+            # The old code leaked the handle on any query failure -- `close()`
+            # sat after the statement that raises.
+            c.close()
+    except Exception as e:
+        # One unreadable metric must not blank the page, so this still returns.
+        # What it no longer does is return silently.
+        log.warning("maker rebate read failed on %s: %s", path, e)
+        out["err"] = f"{type(e).__name__}: {e}"
         return out
     for price, size in rows:
         out["earned"] += taker_fee(price or 0.0, size or 0.0) * CFG.rebate_rate
@@ -501,6 +519,7 @@ def fleet():
             "maker_rebate_shares": rebate["shares"],
             "maker_rebate_fills": rebate["fills"],
             "maker_rebate_cps": rebate["per_share_cents"],
+            "maker_rebate_err": rebate["err"],
             "rent_modelled_spread": sum(r["collected_rent"] for r in rows
                                         if r["source"] == "spread"),
             "unfunded": len(unfunded),
@@ -1042,14 +1061,18 @@ async function tick(){
     // paying, because a fleet holding only clobRewards: 0 markets earns the
     // rebate and nothing else -- and a single blended figure left the reader
     // unable to tell that apart from "the pot is funded".
-    K('Dividend / Rebate Income',usd(rent),
-      rent > 0
+    // A failed read renders as a dash, never as $0.00: on a money figure
+    // "we do not know" and "we earned nothing" are different claims.
+    K('Dividend / Rebate Income',t.maker_rebate_err ? '—' : usd(rent),
+      t.maker_rebate_err
+        ? 'rebate read failed · '+t.maker_rebate_err
+        : rent > 0
         ? [t.rent_reward > 0 ? usd(t.rent_reward)+' emissions' : null,
            t.maker_rebate > 0
              ? usd(t.maker_rebate)+' rebates on '+(t.maker_rebate_shares||0).toFixed(0)+' filled sh'
              : null].filter(Boolean).join(' · ')+' · unpaid, in the headline'
         : 'no emissions funded · no maker fills yet',
-      rent > 0 ? 'gold' : 'dim'),
+      t.maker_rebate_err ? 'alert-tx' : (rent > 0 ? 'gold' : 'dim')),
     K('Capital return',t.return_pct_day.toFixed(2)+'%/day','projected income / wallet committed','proj')
   ];
 

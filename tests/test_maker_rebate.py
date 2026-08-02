@@ -95,7 +95,7 @@ def test_resting_size_alone_earns_zero(tmp_path):
     """The whole point. No fills means no rebate, however long we quoted."""
     r = _maker_rebate(_db(tmp_path, []))
     assert r == {"earned": 0.0, "shares": 0.0, "fills": 0,
-                 "per_share_cents": None}
+                 "per_share_cents": None, "err": ""}
 
 
 def test_rebate_scales_with_price_toward_the_fee_peak(tmp_path):
@@ -116,9 +116,51 @@ def test_per_share_cents_reports_the_rate_actually_achieved(tmp_path):
 
 
 def test_missing_database_reads_as_zero_not_an_error(tmp_path):
-    """A dashboard that cannot read one metric must still render the rest."""
+    """No DB yet is not a failure -- $0.00 earned is the honest answer."""
     assert _maker_rebate(tmp_path / "absent.db") == {
-        "earned": 0.0, "shares": 0.0, "fills": 0, "per_share_cents": None}
+        "earned": 0.0, "shares": 0.0, "fills": 0, "per_share_cents": None,
+        "err": ""}
+
+
+def test_unreadable_table_reports_an_error_rather_than_a_silent_zero(tmp_path):
+    """THE DISTINCTION THAT MATTERS ON A MONEY FIGURE.
+
+    A DB that exists but has no `fills` table is a broken read, not an empty
+    one. Both produce $0.00, and the caller must be able to tell them apart --
+    otherwise the page states "we earned nothing" when the truth is "we could
+    not find out". The read still returns rather than raising, because one
+    unreadable metric must not blank the whole dashboard.
+    """
+    p = tmp_path / f"fleet{next(_seq)}.db"
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE unrelated (x INTEGER)")
+    c.commit()
+    c.close()
+    r = _maker_rebate(p)
+    assert r["earned"] == 0.0
+    assert r["err"], "a failed read must say so"
+    assert "fills" in r["err"], f"error should name the missing table: {r['err']}"
+
+
+def test_a_healthy_read_leaves_err_empty(tmp_path):
+    """The happy path must not set `err`, or the UI would show a dash."""
+    assert _maker_rebate(_db(tmp_path, [(0.50, 100.0, 0)]))["err"] == ""
+
+
+def test_connection_is_closed_even_when_the_query_fails(tmp_path):
+    """The handle used to leak: close() sat after the statement that raises.
+
+    Proven by deleting the file afterwards -- Windows refuses to unlink a file
+    an open handle still holds, so a successful delete is the evidence.
+    """
+    p = tmp_path / f"fleet{next(_seq)}.db"
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE unrelated (x INTEGER)")
+    c.commit()
+    c.close()
+    assert _maker_rebate(p)["err"]
+    p.unlink()  # raises PermissionError on Windows if the handle leaked
+    assert not p.exists()
 
 
 def test_null_columns_do_not_crash_the_reader(tmp_path):
