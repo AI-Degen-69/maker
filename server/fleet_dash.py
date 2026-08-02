@@ -30,6 +30,14 @@ STALE_AFTER_SEC = 120.0
 
 log = logging.getLogger("fleet_dash")
 
+# Running maker-rebate totals per DB path: {path: (last_rowid, earned, shares,
+# fills)}. `fills` is append-only, so carrying the total forward and reading
+# only new rows is exact, not a cached approximation -- there is no staleness
+# window to trade against. Keyed by path so a test DB cannot poison the live
+# one. Process-local by design: it is a read accelerator, not state worth
+# persisting, and a restart simply rebuilds it on the first request.
+_REBATE_CACHE: dict[str, tuple[int, float, float, int]] = {}
+
 app = FastAPI(title="maker fleet")
 
 
@@ -147,9 +155,11 @@ def _maker_rebate(db: Path | None = None) -> dict:
     statement is "we do not know". The read still degrades rather than blanking
     the page, but it says so, in the payload and in the log.
     """
-    out = {"earned": 0.0, "shares": 0.0, "fills": 0, "per_share_cents": None,
-           "err": ""}
     path = DB if db is None else Path(db)
+    key = str(path)
+    seen, earned, shares, n = _REBATE_CACHE.get(key, (0, 0.0, 0.0, 0))
+    out = {"earned": earned, "shares": shares, "fills": n,
+           "per_share_cents": None, "err": ""}
     if not path.exists():
         # Not an error: before the first run there is no DB, and $0.00 earned
         # is the honest answer rather than a failure to report.
@@ -157,8 +167,22 @@ def _maker_rebate(db: Path | None = None) -> dict:
     try:
         c = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
-            rows = c.execute("SELECT price, size FROM fills "
-                             "WHERE crossed = 0 OR crossed IS NULL").fetchall()
+            # ONLY THE ROWS WE HAVE NOT ALREADY COUNTED.
+            #
+            # `fills` is append-only -- store.py INSERTs and nothing updates or
+            # deletes -- so a running total is exact rather than an
+            # approximation, and the read is O(new fills) instead of O(all
+            # fills). The dashboard polls this every 4 seconds, so the old full
+            # scan grew without bound over a long-running fleet.
+            top = c.execute("SELECT MAX(rowid) FROM fills").fetchone()[0] or 0
+            if top < seen:
+                # The DB was replaced (archived and recreated), so rowids
+                # restarted and the running total describes a different
+                # database. Start over rather than carry it across.
+                seen, earned, shares, n = 0, 0.0, 0.0, 0
+            rows = c.execute(
+                "SELECT price, size FROM fills WHERE rowid > ? "
+                "AND (crossed = 0 OR crossed IS NULL)", (seen,)).fetchall()
         finally:
             # The old code leaked the handle on any query failure -- `close()`
             # sat after the statement that raises.
@@ -170,11 +194,13 @@ def _maker_rebate(db: Path | None = None) -> dict:
         out["err"] = f"{type(e).__name__}: {e}"
         return out
     for price, size in rows:
-        out["earned"] += taker_fee(price or 0.0, size or 0.0) * CFG.rebate_rate
-        out["shares"] += size or 0.0
-        out["fills"] += 1
-    if out["shares"] > 0:
-        out["per_share_cents"] = 100.0 * out["earned"] / out["shares"]
+        earned += taker_fee(price or 0.0, size or 0.0) * CFG.rebate_rate
+        shares += size or 0.0
+        n += 1
+    _REBATE_CACHE[key] = (top, earned, shares, n)
+    out.update(earned=earned, shares=shares, fills=n)
+    if shares > 0:
+        out["per_share_cents"] = 100.0 * earned / shares
     return out
 
 

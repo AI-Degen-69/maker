@@ -20,25 +20,32 @@ $ProjectPath = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 Set-Location $ProjectPath
 New-Item -ItemType Directory -Force -Path (Join-Path $ProjectPath "logs") | Out-Null
 
-# 1. Stop anything already running, children included. Stopping only the
+. (Join-Path $PSScriptRoot "fleet-procs.ps1")
+
+# 1. Stop the fleet WE recorded, children included. Stopping only the
 # supervisor leaves the fleet and the dashboard alive, which produces a second
 # writer on the same database and a port conflict on 8800.
-$patterns = "*strategy.supervisor*", "*strategy.fleet*", "*scripts.rerank_loop*",
-            "*uvicorn*server.fleet_dash*"
-$running = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $cl = $_.CommandLine; $patterns | Where-Object { $cl -like $_ } }
-if ($running) {
-    $running | ForEach-Object {
-        Write-Host "stopping PID $($_.ProcessId)" -ForegroundColor Yellow
-        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+#
+# Scoped to the recorded instance rather than a command-line wildcard: the old
+# pattern matched the same module name in any checkout or session on this
+# machine, so starting a fleet here could kill someone else's -- and its
+# database writer with it.
+$stopped = Stop-FleetInstance
+if ($stopped -gt 0) { Write-Host "stopped $stopped prior fleet process tree(s)" -ForegroundColor Yellow }
+
+# Anything fleet-shaped we do NOT own is reported, never killed. It may be
+# another checkout entirely; it may also be why port 8800 is busy, which the
+# operator now gets told instead of having to guess.
+$strays = @(Find-FleetStrays)
+if ($strays.Count -gt 0) {
+    Write-Host ""
+    Write-Host "WARNING: $($strays.Count) fleet-shaped process(es) not started by this script:" -ForegroundColor Red
+    $strays | ForEach-Object {
+        Write-Host "  PID $($_.ProcessId)  $(($_.CommandLine -replace '\s+', ' ').Substring(0, [Math]::Min(90, $_.CommandLine.Length)))" -ForegroundColor DarkGray
     }
-    $deadline = (Get-Date).AddSeconds(20)
-    do {
-        Start-Sleep -Milliseconds 500
-        $left = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-            Where-Object { $cl = $_.CommandLine; $patterns | Where-Object { $cl -like $_ } }
-    } while ($left -and (Get-Date) -lt $deadline)
-    if ($left) { throw "Fleet processes did not stop before the deadline." }
+    Write-Host "  Not stopping them -- they may belong to another checkout or user." -ForegroundColor DarkGray
+    Write-Host "  If they are yours, stop them first: .\scripts\fleet-stop.ps1 -Strays" -ForegroundColor DarkGray
+    Write-Host ""
 }
 
 # The dashboard cannot bind a port someone else owns, and a supervisor whose
@@ -85,6 +92,10 @@ $rr = Start-Process -FilePath "python" `
     -RedirectStandardOutput (Join-Path $ProjectPath "logs/rerank.out.log") `
     -RedirectStandardError  (Join-Path $ProjectPath "logs/rerank.err.log")
 
+# Recorded BEFORE the liveness check, so a process that dies during startup is
+# still owned and can be cleaned up by fleet-stop rather than left orphaned.
+Save-FleetInstance -Procs @{ supervisor = $sup; rerank = $rr }
+
 Start-Sleep -Seconds 6
 
 # A COUNT OF MATCHING PROCESSES IS NOT PROOF THESE TWO SURVIVED.
@@ -103,10 +114,11 @@ if ($dead.Count -gt 0) {
     throw "Fleet startup failed: $($dead -join '; ')"
 }
 
-$alive = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $cl = $_.CommandLine; $patterns | Where-Object { $cl -like $_ } }
+# Our own processes plus the supervisor's children (fleet + dashboard), rather
+# than every fleet-shaped process on the machine.
+$alive = @(Get-FleetInstance).Count + @(Get-DescendantPids -ParentId $sup.Id).Count
 Write-Host ""
-Write-Host "supervisor PID $($sup.Id) · rerank PID $($rr.Id) · $($alive.Count) processes up" -ForegroundColor Green
+Write-Host "supervisor PID $($sup.Id) · rerank PID $($rr.Id) · $alive processes up" -ForegroundColor Green
 Write-Host "dashboard  http://127.0.0.1:8800"
 Write-Host "logs       Get-Content logs\supervisor.log -Wait -Tail 20"
 Write-Host "stop       .\scripts\fleet-stop.ps1"

@@ -55,3 +55,6 @@ run/*.db-shm
 run/archive/
 run/markets.json
 run/fleet_state.json
+# Which PIDs this checkout started, so shutdown stops its own fleet rather
+# than every fleet-shaped process on the machine. Per-machine, per-run.
+run/fleet.pids.json

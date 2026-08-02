@@ -1,4 +1,4 @@
-# Stop every fleet process.
+# Stop the fleet this checkout started.
 #
 # Hidden processes cannot be closed by shutting a window, which is the point of
 # running them hidden and also the reason this script has to exist. There was
@@ -6,35 +6,67 @@
 # `fleet-start.ps1` kills the old processes only on its way to launching new
 # ones.
 #
-#   .\scripts\fleet-stop.ps1
+#   .\scripts\fleet-stop.ps1            stop the recorded fleet
+#   .\scripts\fleet-stop.ps1 -Strays    also stop fleet-shaped processes this
+#                                       checkout did not start (see below)
 #
 # The database is left exactly where it is. Stopping is not archiving.
+#
+# WHY -Strays IS OPT-IN. This script used to select processes by command-line
+# wildcard -- "*strategy.fleet*" and friends -- and force-kill everything that
+# matched. That matches the same module name in ANY checkout and ANY session on
+# the machine, so running it could take down a colleague's fleet, or a second
+# clone of your own, along with its database writer. Ownership is now recorded
+# at launch in run/fleet.pids.json and shutdown is scoped to it.
+#
+# A fleet started before that file existed, or started by hand, is not recorded
+# and will NOT be stopped by default -- it is reported instead. -Strays is how
+# you say "yes, those are mine too", which is a decision this script is not
+# entitled to make on your behalf.
+param([switch]$Strays)
 
-# The supervisor restarts a child it owns, so it must die first -- killing the
-# fleet while the supervisor lives just gets the fleet restarted.
-$ordered = @("*strategy.supervisor*", "*scripts.rerank_loop*",
-             "*strategy.fleet*", "*uvicorn*server.fleet_dash*")
+$ProjectPath = Split-Path $PSScriptRoot -Parent
+. (Join-Path $PSScriptRoot "fleet-procs.ps1")
 
-$found = $false
-foreach ($pat in $ordered) {
-    $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like $pat }
-    foreach ($p in $procs) {
-        $found = $true
-        Write-Host "stopping PID $($p.ProcessId)  $pat" -ForegroundColor Yellow
-        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+$stopped = Stop-FleetInstance
+if ($stopped -gt 0) {
+    Write-Host "fleet stopped ($stopped process tree(s))." -ForegroundColor Green
+}
+
+$strays = @(Find-FleetStrays)
+
+if ($strays.Count -eq 0) {
+    if ($stopped -eq 0) { Write-Host "nothing was running." -ForegroundColor DarkGray }
+    return
+}
+
+if (-not $Strays) {
+    Write-Host ""
+    Write-Host "$($strays.Count) fleet-shaped process(es) NOT started by this checkout:" -ForegroundColor Yellow
+    $strays | ForEach-Object {
+        $cl = ($_.CommandLine -replace '\s+', ' ')
+        Write-Host "  PID $($_.ProcessId)  $($cl.Substring(0, [Math]::Min(90, $cl.Length)))" -ForegroundColor DarkGray
     }
-    Start-Sleep -Milliseconds 400
+    Write-Host "  Left running -- they may belong to another checkout or user." -ForegroundColor DarkGray
+    Write-Host "  If they are yours: .\scripts\fleet-stop.ps1 -Strays" -ForegroundColor DarkGray
+    return
+}
+
+# Explicitly authorised. Supervisors first, so a supervisor cannot restart a
+# child we just stopped.
+Write-Host ""
+Write-Host "-Strays given: stopping $($strays.Count) unowned process(es)" -ForegroundColor Yellow
+$sups = @($strays | Where-Object { $_.CommandLine -like "*strategy.supervisor*" })
+$rest = @($strays | Where-Object { $_.CommandLine -notlike "*strategy.supervisor*" })
+foreach ($p in ($sups + $rest)) {
+    Stop-FleetTree -ProcessId $p.ProcessId -Label "(stray)"
+    Start-Sleep -Milliseconds 300
 }
 
 Start-Sleep -Seconds 2
-$left = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-    Where-Object { $cl = $_.CommandLine
-                   $ordered | Where-Object { $cl -like $_ } }
-if ($left) {
-    Write-Host "still running: $($left.ProcessId -join ', ')" -ForegroundColor Red
-} elseif ($found) {
-    Write-Host "fleet stopped." -ForegroundColor Green
+$left = @(Find-FleetStrays)
+if ($left.Count -gt 0) {
+    Write-Host "still running: $(($left.ProcessId) -join ', ')" -ForegroundColor Red
 } else {
-    Write-Host "nothing was running." -ForegroundColor DarkGray
+    Write-Host "fleet stopped." -ForegroundColor Green
 }

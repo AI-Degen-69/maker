@@ -122,6 +122,65 @@ def test_missing_database_reads_as_zero_not_an_error(tmp_path):
         "err": ""}
 
 
+def _append(p: Path, rows: list[tuple[float, float, int]]) -> None:
+    c = sqlite3.connect(p)
+    c.executemany("INSERT INTO fills VALUES (?,?,?)", rows)
+    c.commit()
+    c.close()
+
+
+def test_new_fills_accumulate_onto_the_running_total(tmp_path):
+    """The read is incremental, so it must still equal a full scan.
+
+    `fills` is append-only, so only rows past the last rowid are read. That is
+    an optimisation the caller must not be able to observe: polling twice with
+    new fills in between has to give the same answer as scanning everything.
+    """
+    p = _db(tmp_path, [(0.50, 100.0, 0)])
+    first = _maker_rebate(p)
+    assert first["fills"] == 1
+
+    _append(p, [(0.20, 50.0, 0), (0.50, 40.0, 1)])   # one maker, one crossed
+    second = _maker_rebate(p)
+
+    assert second["fills"] == 2, "the crossed fill must still be excluded"
+    assert second["shares"] == 150.0
+    assert second["earned"] == pytest.approx(_expect(0.50, 100.0)
+                                             + _expect(0.20, 50.0))
+
+
+def test_polling_without_new_fills_does_not_double_count(tmp_path):
+    """The failure mode of a running total: adding the same rows twice."""
+    p = _db(tmp_path, [(0.50, 100.0, 0), (0.20, 50.0, 0)])
+    once = _maker_rebate(p)
+    for _ in range(5):
+        again = _maker_rebate(p)
+    assert again == once
+
+
+def test_a_replaced_database_restarts_the_total(tmp_path):
+    """Archiving the DB restarts rowids, so the carried total is not ours.
+
+    Without the guard the running total would survive into a database that
+    never earned it, and new fills would stack on top of a stranger's history.
+    """
+    p = _db(tmp_path, [(0.50, 100.0, 0), (0.50, 100.0, 0)])
+    assert _maker_rebate(p)["fills"] == 2
+
+    # Recreate at the SAME path, as archiving then restarting does.
+    p.unlink()
+    c = sqlite3.connect(p)
+    c.execute("CREATE TABLE fills (price REAL, size REAL, crossed INTEGER)")
+    c.execute("INSERT INTO fills VALUES (0.20, 10.0, 0)")
+    c.commit()
+    c.close()
+
+    after = _maker_rebate(p)
+    assert after["fills"] == 1, "the new DB has one fill, not three"
+    assert after["shares"] == 10.0
+    assert after["earned"] == pytest.approx(_expect(0.20, 10.0))
+
+
 def test_unreadable_table_reports_an_error_rather_than_a_silent_zero(tmp_path):
     """THE DISTINCTION THAT MATTERS ON A MONEY FIGURE.
 
