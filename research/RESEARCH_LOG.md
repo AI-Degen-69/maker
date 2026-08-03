@@ -457,3 +457,40 @@ recoverable from the archive branch by checkout.
 
 **Verdict.** LIVE — process management and store initialization hardened; paper strategy evidence remains OPEN.
 
+### Session 14 — 2026-08-03: Per-position Unrealized and Realized P&L dashboard traceability
+
+**Question.** Can an operator identify which specific market position contributes to the floating aggregate Unrealized P&L (-$44.84) directly from the fleet table?
+
+**Method.** Added `unrealized_pnl` calculation to each market row in `server/fleet_dash.py` (summing paired float `paired * 1.0 - pair_paid` and unhedged float `naked_exit_value - naked_cost`), and rendered explicit `Unrealized P&L` and `Realized P&L` columns in the UI table.
+
+**Result.** Individual market rows now display exact color-coded floating P&L and realized P&L, providing instant traceability for aggregate floating drawdowns.
+
+### Session 15 — 2026-08-03: Dashboard UX simplification and metric definitions
+
+**Question.** Can dashboard metrics be simplified to plain stock market concepts with inline hover tooltips to improve operator interpretability?
+
+**Method.** Updated `server/fleet_dash.py` KPI titles to plain English ("Net Trade Performance", "Completed Trades Evaluated", "Target vs Actual Earnings"), added `title` attribute tooltips to all KPI cards, and simplified subtext descriptions.
+
+**Result.** Dashboard metric cards now render clear stock-market-style definitions on hover and use intuitive plain-language labels.
+
+**Verdict.** LIVE — dashboard readability and tooltip UX updated; paper strategy evidence remains OPEN.
+
+### Session 16 — 2026-08-03: Prevent stale browser HTML caching
+
+**Question.** Why were dashboard HTML updates not immediately visible upon browser refresh?
+
+**Method.** Added explicit `Cache-Control: no-cache, no-store, must-revalidate` HTTP response headers to the index route in `server/fleet_dash.py`.
+
+**Result.** Browsers fetch fresh HTML directly on every refresh without holding stale cached responses.
+
+**Verdict.** LIVE — anti-caching HTTP response headers active; paper strategy evidence remains OPEN.
+
+### Session 17 — 2026-08-03: Plain-language stock market metrics, hover tooltips, and dual yield display
+
+**Question.** Can dashboard metrics be updated to stock market analogies with explicit tooltip hover explanations and dual spot/hold-weighted yield views to eliminate operator confusion between markout drift and floating P&L?
+
+**Method.** Updated `server/fleet_dash.py` KPI cards to use stock market plain-language labels ("15-Min Markout Edge ($)", "Total Floating Unrealized P&L", "Resolution Floor (Worst Case)", "Spot Daily Yield", "Hold-Weighted Yield"), added HTML hover `title` tooltips to all hero strip tiles and KPI cards, and restarted the dashboard server process.
+
+**Result.** The dashboard UI now renders exact stock market metric definitions on hover, presents both instantaneous spot yield and solid 15h time-weighted hold rate, and explicitly breaks down total floating unrealized P&L into paired and unhedged components.
+
+**Verdict.** LIVE — dashboard readability and tooltips updated; paper strategy evidence remains OPEN.

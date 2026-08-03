@@ -511,6 +511,16 @@ def fleet():
                 if live.get("naked_side") == "DOWN" and live.get("dn_bid_as_up") is not None
                 else 0.0
             ),
+            "unrealized_pnl": (
+                ((live.get("paired", 0.0) or 0.0) * 1.0 - (live.get("pair_paid", 0.0) or 0.0)) +
+                ((
+                    live.get("naked_sh", 0.0) * live["up_bid"]
+                    if live.get("naked_side") == "UP" and live.get("up_bid") is not None
+                    else live.get("naked_sh", 0.0) * (1.0 - live["dn_bid_as_up"])
+                    if live.get("naked_side") == "DOWN" and live.get("dn_bid_as_up") is not None
+                    else 0.0
+                ) - (live.get("naked_cost", 0.0) or 0.0))
+            ),
             # cost of being filled -- the half of EV the rent line ignores
             "gate": live.get("gate", "NORMAL"),
             "markout": mk["by_market"].get(s["cid"], {}).get("mean_per_share"),
@@ -866,6 +876,8 @@ PAGE = r"""<!doctype html>
   <th class="num">Projected / day</th>
   <th class="num">Committed</th>
   <th>Position / risk</th>
+  <th class="num">Unrealized P&L</th>
+  <th class="num">Realized P&L</th>
   <th class="num">Score share</th>
   <th class="num">Uptime</th>
   <th class="num">Fills</th>
@@ -1081,38 +1093,29 @@ async function tick(){
   // has it run long enough, is it trading, is being filled profitable, is the
   // model believable, and has anything settled to prove it.
   const edgePerFill = t.markout_n ? t.fill_edge / t.markout_n : null;
-  const HS=(n,v,sub,cl)=>`<div class="hs"><div class="hs-n">${n}</div>
+  const HS=(n,v,sub,cl,tip)=>`<div class="hs" ${tip?`title="${tip}"`:''}><div class="hs-n">${n}</div>
     <div class="hs-v ${cl||''}">${v}</div><div class="hs-s">${sub||''}</div></div>`;
   $('heroStrip').innerHTML =
-    // Run age lives in the masthead clock beside the LIVE dot; repeating it
-    // here spent a strip slot on a number already on screen.
-    HS('Fills', String(t.fills),
+    HS('Active Fills', String(t.fills),
        (t.verified && t.verified.ratio !== null)
          ? pct(t.verified.ratio)+' tape-verified' : 'no tape yet',
-       t.fills ? 'up' : 'dim') +
-    // THE VERDICT METRIC. Everything else is a projection; this is what being
-    // filled actually paid, per fill, measured from the markouts table.
-    HS('Edge / fill', edgePerFill === null ? '—' : usd(edgePerFill),
-       t.markout_n ? t.markout_n+' matured'+(t.markout_n<20?' · need 20':'') : 'awaiting horizon',
-       edgePerFill === null ? 'dim' : cls(edgePerFill)) +
-    // The projection standing next to the measurement, deliberately adjacent:
-    // if the model is right these converge, and if it is optimistic the gap
-    // is the story.
-    // TIME-WEIGHTED, not instantaneous. The live figure moved $302 -> $41
-    // inside an hour as markets were funded and defunded; whichever moment
-    // you looked at became "the" number. This one credits each level for the
-    // time it was actually held, so a rate held ten minutes counts a sixth as
-    // much as one held an hour. The spot reading stays in the sub-line,
-    // because the gap between them is itself information.
-    HS('Avg income rate',
+       t.fills ? 'up' : 'dim',
+       'Fills recorded in current session') +
+    HS('Markout Edge / fill', edgePerFill === null ? '—' : usd(edgePerFill),
+       t.markout_n ? t.markout_n+' matured (15m+)'+(t.markout_n<20?' · need 20':'') : 'awaiting 15m horizon',
+       edgePerFill === null ? 'dim' : cls(edgePerFill),
+       'Average dollar gain/loss per trade 15 minutes after fill. If negative, filled orders dropped in value.') +
+    HS('Avg Income Rate (Hold Rate)',
        t.income_twa_day === null ? '—' : usd(t.income_twa_day)+'/d',
        t.income_twa_day === null
          ? 'need 2 samples'
-         : 'avg over '+t.income_hours.toFixed(1)+'h · now '+usd(t.income_day),
-       'proj') +
-    HS('Settled', String(t.settled),
+         : 'avg over '+t.income_hours.toFixed(1)+'h · spot now '+usd(t.income_day)+'/d',
+       'proj',
+       'Time-Weighted Average Yield: Solid average income rate held over time, filtering out temporary spikes from entering/exiting positions.') +
+    HS('Settled P&L', String(t.settled),
        t.settled ? usd(t.realized)+' booked' : 'no ground truth yet',
-       t.settled ? 'up' : 'dim');
+       t.settled ? 'up' : 'dim',
+       'Actual cash profit collected from resolved markets');
 
   const top = [...s.markets].sort((a,b)=>b.income-a.income).slice(0,6);
   const maxInc = Math.max(1e-9, ...top.map(m=>m.income||0));
@@ -1134,86 +1137,69 @@ async function tick(){
   $('gaugeValue').innerHTML = `<span class="${budgetAlert?'alert-tx bold':'dim'}">${usd(t.committed_total,0)} / ${usd(t.wallet,0)}</span>`+
     (budgetAlert ? ` <span class="alert-tx">· ${usd(t.committed_overage,0)} over cap</span>` : ` · ${usd(t.available_cash,0)} available`);
 
-  const K=(n,v,sub,cl,isAlert)=>`<div class="k ${isAlert?'alert':''}"><div class="n">${n}</div>
+  const K=(n,v,sub,cl,isAlert,tip)=>`<div class="k ${isAlert?'alert':''}" ${tip?`title="${tip}"`:''}><div class="n">${n}</div>
     <div class="v ${cl||''}">${v}</div><div class="s">${sub||''}</div></div>`;
   const renderGroup = (title, tiles) => `<div><div class="kpi-hdr">${title}</div><div class="kpi-group">${tiles.join('')}</div></div>`;
 
+  const totalFloating = (t.locked_pair || 0) + (t.naked_exit || 0) - (t.at_risk || 0);
+
   const t_pl = [
-    K('Projected Daily Return',usd(t.income_day)+'/day',
-      (t.markets_spread ? usd(t.income_spread)+' spread · '+usd(t.income_reward)+' rewards'
-                        : 'modelled at current score share'),'proj'),
-    // The breakdown is named for what each half MEANS, not for the mechanic
-    // that produced it: one is edge the bot took on purpose and repeats, the
-    // other is the market happening to move afterwards and averages toward
-    // zero. "captured / drift" required already knowing that distinction.
-    K('Total Trade Alpha',usd(t.fill_edge),
-      t.markout_n ? usd(t.markout_spread)+' Spread Capture + '+usd(t.markout_total)+' Capital Gain · '+t.markout_n+' fills'
-                  : 'no matured fill yet',
-      t.markout_n ? cls(t.fill_edge) : 'dim'),
+    K('Spot Daily Yield',usd(t.income_day)+'/day',
+      'Spot rate right now (' + t.return_pct_day.toFixed(1) + '%/day on cap)',
+      'proj', false,
+      'Instantaneous earning rate at this exact second based on active quote placement'),
+    K('15-Min Markout Edge ($)',usd(t.fill_edge),
+      t.markout_n ? usd(t.markout_spread)+' Discount Bought + '+usd(t.markout_total)+' 15m Price Change · '+t.markout_n+' fills'
+                  : 'no completed trades evaluated yet',
+      t.markout_n ? cls(t.fill_edge) : 'dim', false,
+      'Post-Trade Quality Check: Total value change 15m after buying. (Discount captured below market price) + (Market price movement after 15m). NOT overall portfolio P&L.'),
     K('Realized P&L',usd(t.realized),
       (t.closes?t.closes+' closed trade'+(t.closes===1?'':'s'):'no closed trades')
         +' · '+(t.settled?t.settled+' settled':'$0.00 settled'),
-      (t.settled||t.closes)?cls(t.realized):'dim'),
-    // Deliberately fenced off. This is a MODEL of income earned so far, it is
-    // not in the headline and never was, and reading it as money is what made
-    // the P&L look like it did not add up.
-    // Income accrued is a hero figure now; carrying it here too made the same
-    // modelled number appear twice on one screen.
-    // A RANGE, NOT A POINT. The model projected $159.80 of spread income
-    // while the bot measurably captured $17.76 -- roughly 9x apart -- and
-    // showing only the model made the run look far better than it was, while
-    // showing only the measurement would ignore what the strategy is aiming
-    // at. Floor is what actually happened, ceiling is what the model claims,
-    // and the width between them is the honesty of `spread_capture_frac`.
-    //
-    // Both ends are ALREADY inside Closed P&L and Fill Edge -- this is a
-    // benchmark to judge those by, never an amount to add to them.
-    K('Expected vs Realized Yield',
+      (t.settled||t.closes)?cls(t.realized):'dim', false,
+      'Actual cash profit booked and finalized from closed or settled positions'),
+    K('Target vs Actual Discount',
       (t.markout_n
         ? usd(t.markout_spread)+' – '+usd(t.rent_modelled_spread + t.rent_reward)
         : usd(t.rent_modelled_spread + t.rent_reward)),
       (t.markout_n
-        ? 'Baseline: Pure Edge | Ceiling: Model Target · already booked on execution'
-        : 'Ceiling: Model Target · no matured fills yet'),
-      'proj'),
-    // The income the venue owes but has not paid: reward emissions on resting
-    // size plus maker rebates on matched volume. Stays a separate line and
-    // stays in the headline equation. The subtext names WHICH program is
-    // paying, because a fleet holding only clobRewards: 0 markets earns the
-    // rebate and nothing else -- and a single blended figure left the reader
-    // unable to tell that apart from "the pot is funded".
-    // A failed read renders as a dash, never as $0.00: on a money figure
-    // "we do not know" and "we earned nothing" are different claims.
-    K('Dividend / Rebate Income',t.maker_rebate_err ? '—' : usd(rent),
+        ? 'Baseline: Discount Secured | Target: Model Target'
+        : 'Target: Model Target · no evaluated fills yet'),
+      'proj', false,
+      'Compares actual discount captured on filled orders against theoretical model target'),
+    K('Dividend / Fee Rebates',t.maker_rebate_err ? '—' : usd(rent),
       t.maker_rebate_err
         ? 'rebate read failed · '+t.maker_rebate_err
         : rent > 0
         ? [t.rent_reward > 0 ? usd(t.rent_reward)+' emissions' : null,
            t.maker_rebate > 0
              ? usd(t.maker_rebate)+' rebates on '+(t.maker_rebate_shares||0).toFixed(0)+' filled sh'
-             : null].filter(Boolean).join(' · ')+' · unpaid, in the headline'
+             : null].filter(Boolean).join(' · ')+' · unpaid, in headline'
         : 'no emissions funded · no maker fills yet',
-      t.maker_rebate_err ? 'alert-tx' : (rent > 0 ? 'gold' : 'dim')),
-    K('Capital return',t.return_pct_day.toFixed(2)+'%/day','projected income / wallet committed','proj')
+      t.maker_rebate_err ? 'alert-tx' : (rent > 0 ? 'gold' : 'dim'), false,
+      'Fee rebates paid back by exchange for making liquidity'),
+    K('Hold-Weighted Yield',
+      t.income_twa_day === null ? '—' : usd(t.income_twa_day)+'/day',
+      t.income_twa_day === null ? 'need 2 samples' : '15h time-weighted avg hold rate',
+      'proj', false,
+      'Solid average daily yield sustained over time, smoothing out position enter/exit noise')
   ];
 
   const t_risk = [
-    K('Capital Deployed',usd(t.committed_total,0),`of ${usd(t.wallet,0)} simulated wallet`,t.committed_total>=t.max_committed?'alert-tx':'dim',t.committed_total>=t.max_committed),
-    // MARKET VALUE, not cost. Stated as value, the drawdown below is exactly
-    // this figure subtracted from liquidation P&L -- the two tiles reconcile
-    // by inspection. Stated as cost it does not: liquidation already nets
-    // cost against resale, so subtracting cost a second time double-counts it
-    // (-$197.89 against a true -$221.61 on the numbers of 2026-08-02).
-    K('Unhedged Exposure',usd(t.naked_exit,0),'unhedged positions market value','down'),
-    K('Worst-Case P&L',usd(t.net_worst),'P&L if value goes to $0 on all current unhedged bets',cls(t.net_worst)),
-    // NOT the size of the holding -- the profit or loss on it. The old label
-    // said "matched shares valued at $1" over a number that is the difference
-    // between that value and what we paid, so a -$13.59 loss read as though
-    // the inventory itself were negative. Both figures are now shown.
-    K('Open Positions Unrealized P&L',usd(t.locked_pair),
-      usd(t.pair_value,0)+' at $1 · paid '+usd(t.pair_paid,0),cls(t.locked_pair)),
-    K('Matured Position Horizon',String(t.markout_n),'fills with a matured mark',t.markout_n>=20?'up':'dim'),
-    K('Markets exited',String(t.exited),'after adverse-selection evidence',t.exited?'down':'up',t.exited>0)
+    K('Capital Deployed',usd(t.committed_total,0),`of ${usd(t.wallet,0)} simulated wallet`,t.committed_total>=t.max_committed?'alert-tx':'dim',t.committed_total>=t.max_committed,
+      'Total capital currently locked in open bids and active inventory'),
+    K('Unhedged Exposure Value',usd(t.naked_exit,0),'unhedged positions current bid value','down', false,
+      'Current resale value of single-sided (unhedged) open positions'),
+    K('Resolution Floor (Worst Case)',usd(t.net_worst),
+      'P&L if all unhedged positions expire to $0',cls(t.net_worst), false,
+      'Final portfolio profit/loss floor if all unhedged bets expire to $0.00 at resolution, keeping past realized gains.'),
+    K('Total Floating Unrealized P&L',usd(totalFloating),
+      usd(t.locked_pair)+' paired float + '+usd(t.naked_exit - t.at_risk)+' unhedged float',cls(totalFloating), false,
+      'Current paper profit/loss on all open positions if sold right now at market price'),
+    K('Matured Trades (15m+)',String(t.markout_n),'fills with 15m+ history (need 20+)',t.markout_n>=20?'up':'dim', false,
+      'Number of completed trades older than 15 minutes used for trade quality stats.'),
+    K('Markets Exited',String(t.exited),'stopped for adverse selection',t.exited?'down':'up',t.exited>0,
+      'Markets auto-stopped due to severe post-trade price drops')
   ];
 
   const t_cap = [
@@ -1239,6 +1225,14 @@ async function tick(){
     const position = risk > 0
       ? `<span class="down bold">${risk.toFixed(0)} ${m.naked_side || 'naked'}</span><br><span class="dim">risk ${usd(m.naked_cost,0)}</span>`
       : (m.paired > 0 ? `<span class="up bold">${m.paired.toFixed(0)} paired</span>` : '<span class="dim">flat</span>');
+    const unrealized = m.unrealized_pnl || 0;
+    const hasPos = (m.paired > 0) || (m.naked_sh > 0);
+    const unrlHtml = hasPos
+      ? `<span class="${cls(unrealized)} bold mono">${usd(unrealized)}</span>`
+      : `<span class="dim">-</span>`;
+    const rzlHtml = m.closed_pnl
+      ? `<span class="${cls(m.closed_pnl)} bold mono">${usd(m.closed_pnl)}</span>`
+      : `<span class="dim">-</span>`;
     let statusHtml = m.err
       ? `<span class="down bold">${m.err}</span>`
       : (m.gate === 'EXITED' ? '<span class="down bold">EXITED</span>'
@@ -1250,6 +1244,8 @@ async function tick(){
       <td class="num bold mono ${isGenerating ? 'up' : 'dim'}" style="font-size:15px">${usd(currentIncome)}</td>
       <td class="num mono" title="Offers ${usd(m.capital,0)}">${usd(m.committed,0)}</td>
       <td>${position}</td>
+      <td class="num mono">${unrlHtml}</td>
+      <td class="num mono">${rzlHtml}</td>
       <td class="num mono">${pct(m.share,1)}</td>
       <td class="num mono ${thresh(m.uptime,true,0.8)}">${pct(m.uptime,0)}</td>
       <td class="num mono dim">${m.fills}</td>
@@ -1263,4 +1259,4 @@ tick(); setInterval(tick,4000);
 """
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return PAGE
+    return HTMLResponse(content=PAGE, headers={"Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0"})
