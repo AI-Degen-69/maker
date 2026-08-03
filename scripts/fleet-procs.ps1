@@ -36,8 +36,20 @@ function Save-FleetInstance {
         $records += [pscustomobject]@{
             name    = $name
             pid     = $p.Id
-            # Round-trip format: parsed back exactly, and comparable across
-            # culture settings.
+            # UTC TICKS ARE THE COMPARISON FIELD, and they are an integer for a
+            # reason. `started` was originally a round-trip ISO-8601 string,
+            # which ConvertFrom-Json helpfully deserialises back into a
+            # [DateTime] rather than the [string] that was written. The reader
+            # then compared a String against a DateTime, PowerShell stringified
+            # the DateTime with its DEFAULT format, and the two could never be
+            # equal -- so every recorded pid was reported "recycled" and
+            # disowned. The fleet became unkillable by its own tooling, and
+            # fleet-bg.ps1 reported its own processes as strays.
+            #
+            # An Int64 has no such alternate rendering: it round-trips through
+            # JSON as itself.
+            started_ticks = $p.StartTime.ToUniversalTime().Ticks
+            # Kept for the operator reading the file, never for comparison.
             started = $p.StartTime.ToString("o")
         }
     }
@@ -47,6 +59,36 @@ function Save-FleetInstance {
     }
     New-Item -ItemType Directory -Force -Path (Split-Path $FleetPidFile) | Out-Null
     $payload | ConvertTo-Json -Depth 4 | Set-Content -Path $FleetPidFile -Encoding UTF8
+}
+
+
+function Get-FleetStartTicks {
+    <#  A record's start time as UTC ticks, or $null if it cannot be read.
+
+        Accepts every shape the file has carried: the `started_ticks` integer
+        written now, and the older `started` field -- which ConvertFrom-Json
+        hands back as a [DateTime] but which is a [string] in a file written by
+        an older script, or by hand. Both are parsed rather than compared as
+        text, because text was the bug. #>
+    param([Parameter(Mandatory)][AllowNull()][object]$Record)
+
+    if ($null -eq $Record) { return $null }
+    if ($null -ne $Record.started_ticks) {
+        $ticks = [int64]0
+        if ([int64]::TryParse([string]$Record.started_ticks, [ref]$ticks)) {
+            return $ticks
+        }
+    }
+    $legacy = $Record.started
+    if ($null -eq $legacy) { return $null }
+    if ($legacy -is [datetime]) { return $legacy.ToUniversalTime().Ticks }
+    $dt = [datetime]::MinValue
+    if ([datetime]::TryParse([string]$legacy, [cultureinfo]::InvariantCulture,
+                             [System.Globalization.DateTimeStyles]::RoundtripKind,
+                             [ref]$dt)) {
+        return $dt.ToUniversalTime().Ticks
+    }
+    return $null
 }
 
 
@@ -67,7 +109,20 @@ function Get-FleetInstance {
     foreach ($r in @($data.procs)) {
         try { $p = Get-Process -Id $r.pid -ErrorAction Stop } catch { continue }
         # The start-time check is what makes a recycled pid safe to ignore.
-        if ($p.StartTime.ToString("o") -ne $r.started) {
+        #
+        # Compared as NUMBERS, never as rendered text. A record whose start time
+        # cannot be read at all is treated as not-ours: refusing to kill an
+        # unidentifiable process is the safe direction for this check to fail.
+        #
+        # The one-second window absorbs precision loss in transit (a JSON
+        # reader that rounds a timestamp, a file edited by hand) without
+        # weakening the guarantee: for this to admit a genuinely recycled pid,
+        # Windows would have to hand the same id to a new process starting
+        # within a second of the original -- while the original was still
+        # running, since Get-Process just found it.
+        $recorded = Get-FleetStartTicks -Record $r
+        if ($null -eq $recorded -or
+            $p.StartTime.ToUniversalTime().Ticks -ne $recorded) {
             Write-Host "pid $($r.pid) was recycled; not touching it" -ForegroundColor DarkGray
             continue
         }
@@ -190,7 +245,18 @@ function Find-FleetStrays {
 
         These may belong to another checkout or another user, so they are
         described, never stopped. The operator decides. #>
-    $ownedPids = @(Get-FleetInstance | ForEach-Object { $_.pid })
+    # OUR CHILDREN ARE NOT STRANGERS. Only the supervisor and the reranker are
+    # recorded; the supervisor spawns the fleet and the dashboard itself, and
+    # matching on the recorded pids alone reported both of those as processes
+    # "not started by this script" that "may belong to another checkout". They
+    # are ours, Stop-FleetInstance already takes them down with the tree, and
+    # naming them here sends the operator hunting a second fleet that does not
+    # exist.
+    $ownedPids = @()
+    foreach ($r in @(Get-FleetInstance)) {
+        $ownedPids += $r.pid
+        $ownedPids += @(Get-DescendantPids -ParentId $r.pid)
+    }
     Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
         Where-Object {
             $cl = $_.CommandLine

@@ -446,3 +446,14 @@ recoverable from the archive branch by checkout.
 **Result.** The row remains `filled = 25` and becomes `cancelled = 1`; the database no longer loses the executed portion when an order is released. This protects the crossed-hedge and requote accounting used by the live paper process.
 
 **Verdict.** LIVE — partial-cancel accounting is now directly tested; fill and realized-P&L evidence remains OPEN.
+
+### Session 13 — 2026-08-03: Process ownership, DB recreation recovery, and atomic fleet writes
+
+**Question.** Are process ownership checks, database recreation recovery, ranker writing, and dashboard staleness threshold comparisons robust against exact timing and concurrent invocation bugs?
+
+**Method.** Updated process start-time validation in `fleet-procs.ps1` to perform exact tick comparisons without tolerance windows. Updated `rank_markets.py` to use per-run unique temporary files with finally-block cleanup and a process-ownership check on `ranking.marker`. Updated `store.py` schema tracking to store and compare file stat identity so unlinked and recreated databases rerun schema creation. Extracted `_atomic_write_json` in `strategy/fleet.py` for atomic writes, and exposed `stale_after_sec` in `server/fleet_dash.py` for dynamic client-side slow-sweep comparison.
+
+**Result.** All 258 pytest unit tests pass cleanly, including a new test verifying schema reinitialization upon DB file unlinking and recreation.
+
+**Verdict.** LIVE — process management and store initialization hardened; paper strategy evidence remains OPEN.
+

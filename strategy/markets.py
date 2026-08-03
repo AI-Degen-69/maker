@@ -8,6 +8,23 @@ from typing import Optional
 
 import requests
 
+# (connect, read). `fetch_pinned_market` is called from inside the fleet's
+# trading loop for any market not yet loaded, and its old scalar 15s applied to
+# the connect phase as well -- one unreachable market could hold the whole
+# rotation for half a minute and push the sweep past the dashboard's 120s
+# staleness threshold.
+MARKET_TIMEOUT = (3.05, 5.0)
+EVENTS_TIMEOUT = (3.05, 5.0)
+
+# Pooled, for the same reason as strategy.main._SESSION: keep-alive instead of a
+# fresh TLS handshake per call. No retries -- a failed load is handled by the
+# caller (the market is skipped for this visit) and retrying here would spend
+# the loop's time budget silently.
+_SESSION = requests.Session()
+for _scheme in ("https://", "http://"):
+    _SESSION.mount(_scheme, requests.adapters.HTTPAdapter(
+        pool_connections=8, pool_maxsize=8, max_retries=0))
+
 
 @dataclass(frozen=True)
 class LiveMarket:
@@ -65,7 +82,7 @@ def fetch_live_market(gamma_host: str, series_slug: str) -> Optional[LiveMarket]
     """Return the single 5-min BTC market that's currently live, or None."""
     url = f"{gamma_host}/events"
     params = {"series_slug": series_slug, "closed": "false", "limit": 500}
-    r = requests.get(url, params=params, timeout=5)
+    r = _SESSION.get(url, params=params, timeout=EVENTS_TIMEOUT)
     r.raise_for_status()
     events = r.json()
 
@@ -106,7 +123,8 @@ def fetch_pinned_market(condition_id: str,
     `run/markets.json`; this function's job is only to say whether the market
     can be quoted at all.
     """
-    r = requests.get(f"https://clob.polymarket.com/markets/{condition_id}", timeout=15)
+    r = _SESSION.get(f"https://clob.polymarket.com/markets/{condition_id}",
+                     timeout=MARKET_TIMEOUT)
     r.raise_for_status()
     m = r.json()
 
@@ -139,8 +157,8 @@ def fetch_pinned_market(condition_id: str,
 def market_meta(condition_id: str) -> dict:
     """Question text, link and funded daily rate, for the dashboard header."""
     try:
-        m = requests.get(f"https://clob.polymarket.com/markets/{condition_id}",
-                         timeout=15).json()
+        m = _SESSION.get(f"https://clob.polymarket.com/markets/{condition_id}",
+                         timeout=MARKET_TIMEOUT).json()
     except Exception:
         return {}
     rw = m.get("rewards") or {}

@@ -78,4 +78,9 @@ bottom. One bullet per concrete thing done, tried, found, or broken.
 * **Kept cancellation lifecycle in the ledger.** Simulated orders now retain their quote IDs so hard-cap releases and requotes mark database rows cancelled; shallow emergency hedges also close their unfilled residual quote row.
 * **Linked maker fills back to their quote rows.** Tape-confirmed resting fills now carry the originating quote ID, and cancellation preserves partial fill quantities while closing the remaining quote lifecycle.
 * **Corrected the health label to match the 120-second stale threshold.** The dashboard now says `heartbeat < 120s` instead of retaining the old 45-second copy.
-* **Hardened the launcher handoff.** `fleet-start.ps1` now resolves its checkout from `$PSScriptRoot`, checks for unrelated port-8800 listeners, and waits for child processes and the port to clear before restarting, failing closed if either remains. Added regression tests for preserving the originating quote ID on tape-confirmed fills and for cancelling a partially filled quote without losing its filled quantity.
+* **Hardened the launch path:** `fleet-start.ps1` מחשב את ה-checkout מתוך `$PSScriptRoot` וממתין שתהליכי-הבן ופורט 8800 יתפנו לפני הפעלה מחדש, ונכשל-סגור אם אחד מהם נשאר. נוספה בדיקת רגרסיה לשימור מזהה ההצעה המקורי במילויי טייפ מאושרים.
+* **התנהגות ביטול הצעה שמולאה חלקית קיבלה כיסוי ישיר.** בדיקת store מוודאת ש־25 מניות שמולאו נשארות ב־`filled` כאשר שורת ההצעה מסומנת `cancelled = 1`.
+
+## 03/08/2026
+
+* **Hardened process ownership, database recreation handling, and ranking concurrency.** Updated `fleet-procs.ps1` to require exact start-time tick matching. Added per-run unique temp files, try/finally cleanup, and marker ownership checks to `rank_markets.py`. Updated `store.py` schema-readiness tracking to compare file stat identities so DB file recreation triggers schema init. Extracted `_atomic_write_json` helper in `fleet.py` and exposed `stale_after_sec` in `fleet_dash.py`.

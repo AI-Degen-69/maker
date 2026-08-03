@@ -70,6 +70,45 @@ def _run_started() -> float | None:
         return None
 
 
+def _pulse() -> dict:
+    """The fleet's loop heartbeat, or {} if the fleet has not published one.
+
+    Written by a background thread in `strategy.fleet` every PULSE_WRITE_SEC.
+    `loop_ts` is the trading loop's OWN last-iteration stamp, deliberately not
+    the writer thread's clock -- a wedged loop stops advancing it while the
+    thread keeps writing, so a hung fleet still reads as STALE here.
+    """
+    f = RUN / "fleet_pulse.json"
+    if not f.exists():
+        return {}
+    try:
+        p = json.loads(f.read_text(encoding="utf-8"))
+        return p if isinstance(p, dict) else {}
+    except Exception:
+        # A fleet too old to publish a pulse, or a torn read (the writer
+        # renames into place, so this should not happen). Fall back to the
+        # state file rather than calling a live fleet dead.
+        return {}
+
+
+def _heartbeat(now: float, live_ts: float, state_mtime: float,
+               pulse: dict) -> tuple[float, float | None, bool, str]:
+    """Decide how alive the fleet is: (heartbeat_ts, age, stale, source).
+
+    Pure so the decision is testable without standing up a fleet, and because
+    the previous version of it -- one expression inline in the endpoint -- was
+    wrong in a way nothing could catch.
+    """
+    loop_ts = float(pulse.get("loop_ts") or 0.0)
+    ts = max(loop_ts, live_ts, state_mtime)
+    age = (now - ts) if ts else None
+    stale = age is None or age > STALE_AFTER_SEC
+    src = ("loop" if ts and ts == loop_ts
+           else "sweep" if ts and ts == live_ts
+           else "mtime" if ts else "none")
+    return ts, age, stale, src
+
+
 def _db_heartbeat() -> float | None:
     """Most recent write timestamp from the fleet DB, if it has started."""
     if not DB.exists():
@@ -388,12 +427,20 @@ def fleet():
     live_ts = max((s.get("_live", {}).get("ts", 0) or 0
                    for s in specs), default=0.0)
     db_ts = _db_heartbeat() or 0.0
-    # The state file is the primary fleet heartbeat: it is written only after
-    # a complete sweep. DB writes are useful diagnostics, but historical DB
-    # activity must not make a dead fleet look LIVE.
-    heartbeat_ts = live_ts or (f.stat().st_mtime if f.exists() else 0.0)
-    state_age = now - heartbeat_ts if heartbeat_ts else None
-    fleet_stale = state_age is None or state_age > STALE_AFTER_SEC
+    # THE LOOP PULSE IS THE HEARTBEAT; the state file is the fallback.
+    #
+    # `fleet_state.json` is written only after a COMPLETE sweep, so it measures
+    # sweep duration, not liveness. A 20-market sweep is 50-70s healthy and one
+    # slow venue pushes it past 120s -- which is how a fleet that was trading
+    # correctly came to display "heartbeat is stale (3m26s)". `loop_ts` is
+    # stamped once per market visit (~1s) and published every 10s by a thread
+    # that does not compete with the trading loop for time.
+    #
+    # DB writes stay out of the heartbeat entirely: historical DB activity must
+    # not make a dead fleet look LIVE.
+    p = _pulse()
+    heartbeat_ts, state_age, fleet_stale, heartbeat_src = _heartbeat(
+        now, live_ts, f.stat().st_mtime if f.exists() else 0.0, p)
 
     rows = []
     for s in specs:
@@ -616,6 +663,17 @@ def fleet():
             "db_age": (now - db_ts) if db_ts else None,
             "heartbeat_ts": heartbeat_ts or None,
             "fleet_stale": fleet_stale,
+            # Which signal answered, and how far behind the sweep is running.
+            # When the fleet DOES go stale these separate "the loop stopped"
+            # from "the loop is fine but a sweep is taking minutes" -- the two
+            # have different causes and this page was previously unable to tell
+            # them apart.
+            "heartbeat_src": heartbeat_src,
+            "sweep_age": (now - live_ts) if live_ts else None,
+            "stale_after_sec": STALE_AFTER_SEC,
+            "loop_market": p.get("market") or "",
+            "loop_markets": p.get("markets"),
+            "sweeps": p.get("sweeps"),
             "exited": len([r for r in rows if r["gate"] == "EXITED"]),
             "widened": len([r for r in rows if r["gate"] == "WIDENED"]),
             "capital": cap,
@@ -951,7 +1009,18 @@ async function tick(){
     ? '<span class="up">● LIVE</span>'
     : `<span class="alert-tx">● STALE · ${hms(t.state_age)}</span>`;
   if(!healthy){
-    $('exp').textContent = `Fleet heartbeat is stale (${hms(t.state_age)} old). Displayed figures are historical, not live.`;
+    // Name the market the loop died on when we know it. The old message said
+    // only "stale", which read identically whether the process had crashed or
+    // one venue was hanging -- two different problems with two different fixes.
+    const at = t.loop_market ? ` Last market visited: ${t.loop_market}.` : '';
+    $('exp').textContent = `Fleet heartbeat is stale (${hms(t.state_age)} old). Displayed figures are historical, not live.${at}`;
+    $('exp').style.display = 'block';
+  } else if(t.sweep_age !== null && t.sweep_age > (t.stale_after_sec || 120)){
+    // Loop alive, sweep slow. Worth saying out loud rather than silently
+    // showing LIVE: per-market figures are up to this old even though the
+    // fleet is healthy, and a sweep drifting upward is the early warning that
+    // used to arrive only as a false STALE.
+    $('exp').textContent = `Fleet is live, but a full sweep is taking ${hms(t.sweep_age)}. Per-market figures lag by up to that much.`;
     $('exp').style.display = 'block';
   }
 

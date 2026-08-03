@@ -28,10 +28,35 @@ log = logging.getLogger("maker")
 
 TRADES_API = "https://data-api.polymarket.com/trades"
 
+# (connect, read) rather than one scalar. Split deliberately: a host that is not
+# answering its SYN at all is abandoned in ~3s, while a host that did answer
+# gets 5s to finish the body. The old scalar 10s applied to BOTH phases, so a
+# single unreachable endpoint could add 20s to one market visit -- three such
+# markets in a sweep is the difference between a 60s cycle and the >120s the
+# dashboard calls dead.
+BOOK_TIMEOUT = (3.05, 5.0)
+TAPE_TIMEOUT = (3.05, 5.0)
+
+# One pooled session for the process. A bare `requests.get` opens a new
+# connection per call and pays a full TCP + TLS handshake every time; the fleet
+# makes three of these per market visit, so a 20-market sweep spent 60
+# handshakes' worth of latency inside the cycle the staleness check measures.
+# Keep-alive reuses the socket instead.
+#
+# `max_retries=0` is explicit rather than incidental: retrying inside the
+# trading loop turns a slow venue into a long stall, and both callers already
+# degrade correctly on failure -- a failed book skips the market for this
+# visit, a failed tape falls back to book-only fill inference.
+_SESSION = requests.Session()
+for _scheme in ("https://", "http://"):
+    _SESSION.mount(_scheme, requests.adapters.HTTPAdapter(
+        pool_connections=8, pool_maxsize=8, max_retries=0))
+
 
 def full_book(clob_host: str, token_id: str) -> dict:
     """Full depth, not just top-of-book -- queue position needs the level sizes."""
-    r = requests.get(f"{clob_host}/book", params={"token_id": token_id}, timeout=10)
+    r = _SESSION.get(f"{clob_host}/book", params={"token_id": token_id},
+                     timeout=BOOK_TIMEOUT)
     r.raise_for_status()
     b = r.json()
     bids = {round(float(x["price"]), 4): float(x["size"]) for x in (b.get("bids") or [])}
@@ -61,8 +86,9 @@ def recent_trades(condition_id: str, seen: set, limit: int = 500) -> dict:
     """
     out: dict[str, dict[float, float]] = {}
     try:
-        r = requests.get(TRADES_API, params={"market": condition_id, "limit": limit},
-                         timeout=8)
+        r = _SESSION.get(TRADES_API,
+                         params={"market": condition_id, "limit": limit},
+                         timeout=TAPE_TIMEOUT)
         r.raise_for_status()
         rows = r.json() or []
     except Exception as e:
