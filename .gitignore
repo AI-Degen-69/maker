@@ -59,3 +59,4 @@ run/fleet_state.json
 # than every fleet-shaped process on the machine. Per-machine, per-run.
 run/fleet.pids.json
 run/fleet_pulse.json
+run/ranking.marker
