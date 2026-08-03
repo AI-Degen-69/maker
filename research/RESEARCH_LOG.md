@@ -469,7 +469,7 @@ recoverable from the archive branch by checkout.
 
 **Question.** Can dashboard metrics be simplified to plain stock market concepts with inline hover tooltips to improve operator interpretability?
 
-**Method.** Updated `server/fleet_dash.py` KPI titles to plain English ("Net Trade Performance", "Completed Trades Evaluated", "Target vs Actual Earnings"), added `title` attribute tooltips to all KPI cards, and simplified subtext descriptions.
+**Method.** Updated `server/fleet_dash.py` KPI titles to plain English ("15-Min Markout Edge ($)", "Matured Trades (15m+)", "Target vs Actual Discount"), added `title` attribute tooltips to all KPI cards, and simplified subtext descriptions.
 
 **Result.** Dashboard metric cards now render clear stock-market-style definitions on hover and use intuitive plain-language labels.
 

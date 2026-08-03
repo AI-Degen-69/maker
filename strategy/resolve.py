@@ -44,6 +44,10 @@ log = logging.getLogger("maker")
 # fleet's own thread, so a hung settlement lookup is a stalled trading loop.
 MARKET_TIMEOUT = (3.05, 5.0)
 
+# Cap on the number of markets processed per pass to avoid stalling the trading
+# loop when there's a large backlog of unresolved markets.
+MAX_RESOLVE_PER_PASS = 50
+
 # Pooled for the same reason as strategy.markets._SESSION: keep-alive rather
 # than a fresh TLS handshake per market. No retries -- a market that fails to
 # resolve this pass is asked again next pass, and retrying inside the loop
@@ -79,12 +83,16 @@ def resolve_finished(clob_host: str) -> int:
     Returns the number of markets newly recorded. Never raises, and one bad
     market never strands the ones behind it: a settlement lookup is not worth
     taking the fleet down for, and anything skipped is retried next pass.
+
+    Processes at most MAX_RESOLVE_PER_PASS markets per call to avoid stalling
+    the trading loop when there's a large backlog.
     """
     n = 0
-    for cond, slug in store.unresolved():
+    for cond, slug in store.unresolved()[:MAX_RESOLVE_PER_PASS]:
         try:
             r = _SESSION.get(f"{clob_host}/markets/{cond}",
                              timeout=MARKET_TIMEOUT)
+            r.raise_for_status()
             market = r.json()
             if not isinstance(market, dict):
                 continue

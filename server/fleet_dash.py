@@ -885,6 +885,7 @@ PAGE = r"""<!doctype html>
  </tr></thead><tbody id="rows"></tbody></table></div>
 <script>
 const $=x=>document.getElementById(x);
+const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 const usd=(v,d=2)=>v==null?'-':'$'+Number(v).toFixed(d);
 const pct=(v,d=1)=>v==null?'-':(100*v).toFixed(d)+'%';
 const cls=v=>v==null||v===0?'dim':(v>0?'up':'down');
@@ -1019,13 +1020,18 @@ async function tick(){
   $('live').innerHTML = `<span class="${activeCount > 0 ? 'up' : 'down'}">● ${activeCount}/${t.markets} scoring</span>`;
   $('health').innerHTML = healthy
     ? '<span class="up">● LIVE</span>'
-    : `<span class="alert-tx">● STALE · ${hms(t.state_age)}</span>`;
+    : (t.state_age !== null
+        ? `<span class="alert-tx">● STALE · ${hms(t.state_age)}</span>`
+        : '<span class="alert-tx">● STALE · no heartbeat</span>');
   if(!healthy){
     // Name the market the loop died on when we know it. The old message said
     // only "stale", which read identically whether the process had crashed or
     // one venue was hanging -- two different problems with two different fixes.
     const at = t.loop_market ? ` Last market visited: ${t.loop_market}.` : '';
-    $('exp').textContent = `Fleet heartbeat is stale (${hms(t.state_age)} old). Displayed figures are historical, not live.${at}`;
+    const ageMsg = t.state_age !== null
+      ? `Fleet heartbeat is stale (${hms(t.state_age)} old).`
+      : 'Fleet heartbeat is missing (no state file write recorded).';
+    $('exp').textContent = `${ageMsg} Displayed figures are historical, not live.${at}`;
     $('exp').style.display = 'block';
   } else if(t.sweep_age !== null && t.sweep_age > (t.stale_after_sec || 120)){
     // Loop alive, sweep slow. Worth saying out loud rather than silently
@@ -1121,7 +1127,7 @@ async function tick(){
   const maxInc = Math.max(1e-9, ...top.map(m=>m.income||0));
   $('rankRows').innerHTML = top.map(m=>`
     <div class="rank-row">
-      <span class="rank-name" title="${m.title}">${m.title}</span>
+      <span class="rank-name" title="${esc(m.title)}">${esc(m.title)}</span>
       <div class="rank-track"><div class="rank-fill" style="width:${Math.max(2,100*(m.income||0)/maxInc)}%"></div></div>
       <span class="rank-val mono ${m.income>0?'up':'dim'}">${usd(m.income)}</span>
     </div>`).join('') || '<span class="dim" style="font-size:12px">No markets reporting yet</span>';
@@ -1180,7 +1186,7 @@ async function tick(){
       'Fee rebates paid back by exchange for making liquidity'),
     K('Hold-Weighted Yield',
       t.income_twa_day === null ? '—' : usd(t.income_twa_day)+'/day',
-      t.income_twa_day === null ? 'need 2 samples' : '15h time-weighted avg hold rate',
+      t.income_twa_day === null ? 'need 2 samples' : (t.income_hours !== null ? t.income_hours+'h time-weighted avg hold rate' : '15h time-weighted avg hold rate'),
       'proj', false,
       'Solid average daily yield sustained over time, smoothing out position enter/exit noise')
   ];
@@ -1230,17 +1236,17 @@ async function tick(){
     const unrlHtml = hasPos
       ? `<span class="${cls(unrealized)} bold mono">${usd(unrealized)}</span>`
       : `<span class="dim">-</span>`;
-    const rzlHtml = m.closed_pnl
+    const rzlHtml = m.closes
       ? `<span class="${cls(m.closed_pnl)} bold mono">${usd(m.closed_pnl)}</span>`
       : `<span class="dim">-</span>`;
     let statusHtml = m.err
-      ? `<span class="down bold">${m.err}</span>`
+      ? `<span class="down bold">${esc(m.err)}</span>`
       : (m.gate === 'EXITED' ? '<span class="down bold">EXITED</span>'
       : (isGenerating
           ? `<span class="up bold">${m.source === 'spread' ? 'EARNING SPREAD' : 'SCORING'}</span>`
-          : `<span class="dim">${m.why || 'not earning'}</span>`));
+          : `<span class="dim">${esc(m.why || 'not earning')}</span>`));
     return `<tr class="${m.gate === 'EXITED' ? 'alert' : ''}">
-      <td style="max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${m.title}">${m.url?`<a class="mkt-link" href="${m.url}" target="_blank">${m.title}</a>`:m.title}</td>
+      <td style="max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(m.title)}">${m.url?`<a class="mkt-link" href="${esc(m.url)}" target="_blank">${esc(m.title)}</a>`:esc(m.title)}</td>
       <td class="num bold mono ${isGenerating ? 'up' : 'dim'}" style="font-size:15px">${usd(currentIncome)}</td>
       <td class="num mono" title="Offers ${usd(m.capital,0)}">${usd(m.committed,0)}</td>
       <td>${position}</td>

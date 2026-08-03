@@ -485,15 +485,34 @@ def main() -> None:
     if not args.dry_run:
         RUN.mkdir(exist_ok=True)
         marker = RUN / "ranking.marker"
+        # Validate marker both for PID liveness AND timestamp freshness
         if marker.exists():
             try:
                 mdata = json.loads(marker.read_text(encoding="utf-8"))
                 owner_pid = mdata.get("pid")
-                if owner_pid and owner_pid != os.getpid() and _pid_is_running(owner_pid):
+                marker_ts = mdata.get("ts")
+                now_ts = time.time()
+                # Stale threshold: 5 minutes. If marker is older, it's abandoned.
+                MARKER_STALE_SEC = 300
+                is_stale = (marker_ts is None or (now_ts - marker_ts) > MARKER_STALE_SEC)
+                is_dead = (owner_pid is None or not _pid_is_running(owner_pid))
+
+                if is_stale or is_dead:
+                    # Clear stale or invalid marker
+                    try:
+                        marker.unlink()
+                    except OSError:
+                        pass
+                elif owner_pid != os.getpid():
+                    # Valid, fresh marker from a different running process
                     print(f"Skipping write: concurrent ranker run detected (PID {owner_pid})")
                     return
             except Exception:
-                pass
+                # Malformed marker, clear it
+                try:
+                    marker.unlink()
+                except OSError:
+                    pass
         try:
             marker.write_text(json.dumps({"pid": os.getpid(), "ts": time.time()}), encoding="utf-8")
         except Exception:
@@ -510,6 +529,12 @@ def main() -> None:
             if tmp.exists():
                 try:
                     tmp.unlink()
+                except OSError:
+                    pass
+            # Remove the marker after successful write so subsequent runs aren't blocked
+            if marker.exists():
+                try:
+                    marker.unlink()
                 except OSError:
                     pass
 
