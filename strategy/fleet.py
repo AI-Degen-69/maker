@@ -26,7 +26,8 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from strategy import gate, markout, merge, profit_take, rewards, store
+from strategy import (gate, markout, merge, profit_take, resolve, rewards,
+                      store)
 from strategy.allocate import (allocate_fundable, capital_scarcity, shares_for,
                                spread_capture_daily)
 from strategy.config import load as load_cfg
@@ -78,6 +79,14 @@ PULSE_WRITE_SEC = 10.0
 # that a market recovering from a venue blip is picked back up within a sweep or
 # two.
 MARKET_RETRY_SEC = 60.0
+
+# How often to ask the venue which of our filled markets have closed. Settlement
+# is
+# the only ground truth this strategy has, and until a market is recorded
+# resolved its capital is never released -- but a resolution is a once-per-
+# market event on a market that has already stopped trading, so polling it any
+# faster than this spends requests the trading loop needs.
+RESOLVE_INTERVAL_SEC = 900.0
 
 
 class _Pulse:
@@ -1060,6 +1069,27 @@ def visit(st: MarketState, bot_cfg, now: float,
     }
 
 
+def _maybe_resolve(bot_cfg, last: float, now: float) -> float:
+    """Run the settlement pass at most once per RESOLVE_INTERVAL_SEC.
+
+    Returns the deadline to carry forward. The deadline advances even when the
+    pass fails: a persistently unreachable venue would otherwise be retried on
+    every iteration of the trading loop -- once per second, against dozens of
+    markets -- instead of once per interval.
+    """
+    if now - last < RESOLVE_INTERVAL_SEC:
+        return last
+    try:
+        n = resolve.resolve_finished(bot_cfg.clob_host)
+        if n:
+            log.info("RESOLVE %d market(s) settled", n)
+    except Exception as e:
+        # `resolve_finished` already swallows per-market failures; this catches
+        # only a failure of the pass itself, which must not stop the fleet.
+        log.warning("resolution pass failed: %s: %s", type(e).__name__, e)
+    return now
+
+
 def main() -> None:
     RUN.mkdir(exist_ok=True)
     base = load_cfg()
@@ -1084,6 +1114,11 @@ def main() -> None:
     gap = 2.0 / REQ_PER_SEC
     i = 0
     last_rerank = time.time()
+    # Deliberately 0.0 rather than `now`: a fleet that has just restarted is
+    # exactly when the unresolved set is most likely to contain markets that
+    # closed while it was down, and waiting a full interval to notice keeps
+    # that capital committed for another 15 minutes.
+    last_resolve = 0.0
     empty_logged = False
     while True:
         # PERIODIC RE-RANK. run/markets.json was written 2026-07-29 01:39 and
@@ -1098,6 +1133,13 @@ def main() -> None:
         # dropping a live position strands it with nothing to merge or
         # reconcile it.
         now_ts = time.time()
+
+        # SETTLEMENT. Runs before the re-rank so that a market closing this
+        # cycle is recorded resolved before the ranker is allowed to drop it:
+        # `unresolved()` is keyed off fills, not off the current market set,
+        # but recording it first keeps the two views consistent within a cycle.
+        last_resolve = _maybe_resolve(bot_cfg, last_resolve, now_ts)
+
         if now_ts - last_rerank >= base.rerank_interval_sec:
             last_rerank = now_ts
             try:
