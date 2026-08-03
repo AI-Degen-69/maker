@@ -110,6 +110,35 @@ def per_market_stats(min_sample: int) -> dict[str, dict]:
     return {cid: _stats_from_rows(rows, min_sample) for cid, rows in by.items()}
 
 
+def fleet_stats(min_sample: int) -> dict:
+    """One verdict over EVERY market's fills, on the same longest-horizon rule.
+
+    `per_market_stats` is the right instrument for evicting one market and the
+    wrong one for noticing that the whole universe is toxic. Its sample is thin
+    by construction -- markets here rotate daily, so a market can take money off
+    us for its entire life without ever reaching `markout_min_sample` fills of
+    its own. Measured 2026-08-02: 47 markout rows across 18 markets, best
+    per-market sample 7, so every market read `insufficient_sample` on every
+    cycle and the gate never moved off NORMAL.
+
+    Pooled, the same run gives n=42 -- enough to read. The caller uses this as
+    the FALLBACK verdict for a market that has none of its own, which is the
+    only way a young market inherits anything other than NORMAL.
+
+    Same `_stats_from_rows` contract as the per-market path, so the gate cannot
+    tell the two apart and needs no new branch: contaminated rows are excluded,
+    and a thin pool still returns `insufficient_sample` rather than a mean.
+    """
+    rows: list[dict] = []
+    for r in store.markout_rows():
+        matured = _matured(r)
+        if not matured:
+            continue
+        rows.append({"markout": matured[-1],
+                     "ref_mid_source": r.get("ref_mid_source")})
+    return _stats_from_rows(rows, min_sample)
+
+
 def sample_due(mids_by_cid: dict, now: float, horizons) -> int:
     """Record the mid at every horizon that has just matured.
 

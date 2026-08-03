@@ -413,6 +413,71 @@ def _affordable_cross_size(book_asks: dict, requested: float,
     return size
 
 
+def _gate_with_fleet_fallback(prev_gate: str, own_stats: dict, cfg):
+    """Advance one market's gate, borrowing the fleet verdict if it has none.
+
+    Returns `(new_gate, stats_used)`; the caller stores the stats it was
+    actually judged on so the dashboard reports the number behind the state.
+
+    Two rules, and the second is the load-bearing one:
+
+      * A market with no matured sample of its own inherits the POOLED verdict
+        instead of holding `insufficient_sample` forever. Without this the gate
+        is unreachable in practice: markets here rotate daily and, measured
+        2026-08-02, the best-sampled market of 19 matured 7 markouts against a
+        threshold of 8. Lowering the per-market minimum alone changed nothing.
+      * A borrowed verdict is capped at WIDENED. EXITED is terminal by design,
+        and a pooled reading is not evidence about THIS market -- the pooled
+        mean on that run is -4.75c/share, past the catastrophic threshold, so
+        an uncapped fallback would permanently blacklist all 19 markets at
+        once, including the three that were individually EARNING (+4.4c,
+        +5.0c, +5.3c) and had simply never reached a sample. Backing off on a
+        bad universe is right; sentencing an unmeasured market on someone
+        else's evidence is not.
+
+    A market already EXITED stays EXITED: the cap must never become a route
+    back into the book. `next_state` guarantees that independently, and the
+    `prev_gate != EXITED` guard here keeps it true even if it stops.
+    """
+    stats = own_stats
+    borrowed = False
+    if stats.get("verdict") == "insufficient_sample":
+        pooled = markout.fleet_stats(cfg.markout_fleet_min_sample)
+        if pooled.get("verdict") != "insufficient_sample":
+            stats, borrowed = pooled, True
+
+    nxt = gate.next_state(prev_gate, stats, cfg)
+    if borrowed and nxt == gate.EXITED and prev_gate != gate.EXITED:
+        nxt = gate.WIDENED
+    return nxt, stats
+
+
+def _affordable_rest_size(requested: float, price: float,
+                          available_usd: float, market_room_usd: float) -> int:
+    """Largest resting order that fits BOTH the wallet and this market's cap.
+
+    Pure, and module-level rather than inline in `visit`, for the same reason
+    `_affordable_cross_size` above is: the arithmetic is the whole fix and it
+    has to be testable without standing up a market, a book and a fill engine.
+
+    `market_room_usd` is `max_cost_per_market - inv.cost`. That cap used to be
+    enforced only in quotes.py, against inventory ALREADY held, and only on the
+    heavy side -- both readings are post-hoc, so a market holding nothing had
+    room for an order of any size. Measured 2026-08-02: a 900-share order
+    rested and filled in one print for $792 against a $400 cap, on a market
+    whose inventory was empty when it was posted.
+
+    Floors at 0 rather than going negative: an inventory already over its cap
+    has no room, and `int()` on a negative would round toward zero and quietly
+    hand back a positive-looking size.
+    """
+    if price <= 0:
+        return 0
+    room = max(float(market_room_usd), 0.0)
+    wallet = max(float(available_usd), 0.0)
+    return int(min(float(requested), wallet / price, room / price))
+
+
 def fleet_committed_cost(states) -> float:
     """Every dollar that has left the wallet or is spoken for.
 
@@ -536,7 +601,8 @@ def reallocate(states, base) -> dict:
     # still merged, marked out and reconciled. Removing it here would strand a
     # real position with nothing tending it.
     dollars = allocate_fundable(obs, base.allocation_budget,
-                                base.marginal_return_floor, floor)
+                                base.marginal_return_floor, floor,
+                                max_frac=base.max_market_frac)
 
     # Whether the BUDGET, rather than the floor, is what stopped the water-fill
     # while a market was still returning well above the floor. That is the only
@@ -725,8 +791,22 @@ def visit(st: MarketState, bot_cfg, now: float,
     stats = markout.per_market_stats(cfg.markout_min_sample).get(
         m.condition_id,
         {"verdict": "insufficient_sample", "mean_per_share": None, "n": 0})
+    # FLEET FALLBACK. A market with no verdict of its own used to hold
+    # `insufficient_sample` forever, and `gate.next_state` returns the state
+    # unchanged on that verdict -- so it sat at NORMAL for its whole life
+    # however badly the fleet as a whole was being picked off. Markets here
+    # rotate daily and almost none of them individually reach the sample.
+    #
+    # Only ever consulted when this market has nothing to say. A market with
+    # its own matured sample keeps its own verdict, including a GOOD one:
+    # the fleet reading must not overrule a market that has demonstrably
+    # earned, or one bad universe would evict its own survivors.
+    # The fleet fallback and its WIDENED cap live in `_gate_with_fleet_fallback`
+    # rather than inline here, and outside `gate.next_state` -- the state
+    # machine stays a pure function of one market's stats and knows nothing
+    # about where they came from.
     prev_gate = st.gate
-    st.gate = gate.next_state(st.gate, stats, cfg)
+    st.gate, stats = _gate_with_fleet_fallback(st.gate, stats, cfg)
     st.markout = stats
     # Persist the moment we give up on a market, and only that moment. Writing
     # every cycle would be one DB write per market per sweep for a value that
@@ -967,9 +1047,27 @@ def visit(st: MarketState, bot_cfg, now: float,
             continue
         if qi.price <= 0:
             continue
-        size = min(qi.size, int(available / qi.price))
+        # PER-MARKET NOTIONAL CAP. `max_cost_per_market` was enforced only in
+        # quotes.py, against `inv.cost` -- the inventory we ALREADY hold -- and
+        # additionally only on the heavy side (`and mine >= theirs`). Both
+        # readings are post-hoc: a market holding nothing has inv.cost 0, so a
+        # first order of any size passes. Measured 2026-08-02, one 900-share
+        # order rested and filled in a single print for $792 against a $400
+        # cap, on a market whose inventory was empty when it was posted.
+        #
+        # The binding quantity is what we hold PLUS what this order would add,
+        # and it has to be checked here, where the size is actually chosen.
+        # Sized down rather than skipped: a market at $380 of $400 can still
+        # carry a smaller order, and the min_quote_shares floor below already
+        # refuses the remainder if what is left cannot score.
+        room = max(cfg.max_cost_per_market - st.inv.cost, 0.0)
+        size = _affordable_rest_size(qi.size, qi.price, available, room)
         if size < cfg.min_quote_shares:
-            budget_blocked.append(f"{qi.side}: committed cap leaves "
+            # Name which cap bound. An operator reading "leaves 0sh" has to be
+            # able to tell a fleet-wide wallet limit from this market's own
+            # cost cap, or the dashboard shows a dead market with no cause.
+            which = ("market cost cap" if room <= available else "committed cap")
+            budget_blocked.append(f"{qi.side}: {which} leaves "
                                  f"{size:.0f}sh < {cfg.min_quote_shares} minimum")
             continue
         book = up if qi.side == "UP" else dn
