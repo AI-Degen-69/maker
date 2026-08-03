@@ -18,7 +18,10 @@ from __future__ import annotations
 import argparse
 import concurrent.futures as cf
 import json
+import os
 import sys
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -50,6 +53,16 @@ MIN_VOLUME_24H = _CFG.select_min_volume_24h_usd
 MAX_DAYS_TO_RESOLVE = _CFG.select_max_days_to_resolve
 
 GAMMA = "https://gamma-api.polymarket.com/markets"
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError, ValueError):
+        return False
 
 
 def q_min(a: float, b: float) -> float:
@@ -471,12 +484,34 @@ def main() -> None:
 
     if not args.dry_run:
         RUN.mkdir(exist_ok=True)
+        marker = RUN / "ranking.marker"
+        if marker.exists():
+            try:
+                mdata = json.loads(marker.read_text(encoding="utf-8"))
+                owner_pid = mdata.get("pid")
+                if owner_pid and owner_pid != os.getpid() and _pid_is_running(owner_pid):
+                    print(f"Skipping write: concurrent ranker run detected (PID {owner_pid})")
+                    return
+            except Exception:
+                pass
+        try:
+            marker.write_text(json.dumps({"pid": os.getpid(), "ts": time.time()}), encoding="utf-8")
+        except Exception:
+            pass
+
         # Temp file and rename: the fleet re-reads this on its own schedule and
         # a half-written file is a SystemExit on the next re-rank.
         f = RUN / "markets.json"
-        tmp = f.with_suffix(".tmp")
-        tmp.write_text(json.dumps(picked, indent=1), encoding="utf-8")
-        tmp.replace(f)
+        tmp = RUN / f"markets.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+        try:
+            tmp.write_text(json.dumps(picked, indent=1), encoding="utf-8")
+            tmp.replace(f)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
 
     ti = sum(r["est_income"] for r in picked)
     tc = sum(r["est_capital"] for r in picked)

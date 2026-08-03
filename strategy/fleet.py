@@ -116,6 +116,13 @@ class _Pulse:
                     "written_ts": time.time()}
 
 
+def _atomic_write_json(path: Path, data: Any, **dumps_kwargs: Any) -> None:
+    """Write data to path atomically using a temporary file and replace."""
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, **dumps_kwargs), encoding="utf-8")
+    tmp.replace(path)
+
+
 def _write_pulse(pulse: _Pulse) -> None:
     """Publish the pulse atomically.
 
@@ -124,9 +131,7 @@ def _write_pulse(pulse: _Pulse) -> None:
     truncated JSON object and report the fleet dead for exactly the reason the
     file exists to disprove.
     """
-    tmp = PULSE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(pulse.snapshot()), encoding="utf-8")
-    tmp.replace(PULSE_FILE)
+    _atomic_write_json(PULSE_FILE, pulse.snapshot())
 
 
 def _pulse_writer(pulse: _Pulse, stop: threading.Event,
@@ -1235,10 +1240,7 @@ def main() -> None:
             # it can reach the next heartbeat.
             try:
                 f = RUN / "fleet_state.json"
-                tmp = f.with_suffix(".tmp")
-                tmp.write_text(json.dumps([s.spec for s in states], default=str),
-                               encoding="utf-8")
-                tmp.replace(f)
+                _atomic_write_json(f, [s.spec for s in states], default=str)
             except Exception as e:
                 log.warning("fleet_state write failed: %s: %s",
                             type(e).__name__, e)

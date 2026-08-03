@@ -28,3 +28,18 @@ def test_mark_cancelled_preserves_partial_fill(monkeypatch, tmp_path):
             "SELECT filled, cancelled FROM quotes WHERE id=?", (quote_id,)
         ).fetchone()
     assert row == (25.0, 1)
+
+
+def test_store_reinitializes_schema_on_file_recreation(monkeypatch, tmp_path):
+    db_file = tmp_path / "recreate.db"
+    monkeypatch.setenv("MAKER_DB", str(db_file))
+    from strategy import store
+
+    with store.db() as c:
+        c.execute("SELECT count(*) FROM quotes")
+
+    db_file.unlink()
+
+    with store.db() as c:
+        c.execute("SELECT count(*) FROM quotes")
+

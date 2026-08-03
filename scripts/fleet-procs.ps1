@@ -121,9 +121,8 @@ function Get-FleetInstance {
         # within a second of the original -- while the original was still
         # running, since Get-Process just found it.
         $recorded = Get-FleetStartTicks -Record $r
-        $tolerance = [timespan]::FromSeconds(1).Ticks
         if ($null -eq $recorded -or
-            [math]::Abs($p.StartTime.ToUniversalTime().Ticks - $recorded) -gt $tolerance) {
+            $p.StartTime.ToUniversalTime().Ticks -ne $recorded) {
             Write-Host "pid $($r.pid) was recycled; not touching it" -ForegroundColor DarkGray
             continue
         }

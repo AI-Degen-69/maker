@@ -670,6 +670,7 @@ def fleet():
             # them apart.
             "heartbeat_src": heartbeat_src,
             "sweep_age": (now - live_ts) if live_ts else None,
+            "stale_after_sec": STALE_AFTER_SEC,
             "loop_market": p.get("market") or "",
             "loop_markets": p.get("markets"),
             "sweeps": p.get("sweeps"),
@@ -1014,7 +1015,7 @@ async function tick(){
     const at = t.loop_market ? ` Last market visited: ${t.loop_market}.` : '';
     $('exp').textContent = `Fleet heartbeat is stale (${hms(t.state_age)} old). Displayed figures are historical, not live.${at}`;
     $('exp').style.display = 'block';
-  } else if(t.sweep_age !== null && t.sweep_age > 120){
+  } else if(t.sweep_age !== null && t.sweep_age > (t.stale_after_sec || 120)){
     // Loop alive, sweep slow. Worth saying out loud rather than silently
     // showing LIVE: per-market figures are up to this old even though the
     // fleet is healthy, and a sweep drifting upward is the early warning that

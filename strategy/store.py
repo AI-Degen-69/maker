@@ -7,6 +7,7 @@ viable at all.
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -330,20 +331,27 @@ _MIGRATIONS = {
 # arise at all -- this is the backstop, not the mechanism.
 BUSY_TIMEOUT_SEC = 5.0
 
-# DB paths whose schema and column migrations have already been applied in this
-# process. Both are idempotent but neither is free: `executescript(SCHEMA)`
+# DB paths mapped to file identity (st_ino, st_ctime_ns, st_mtime_ns) whose
+# schema and column migrations have already been applied in this process.
+# Both are idempotent but neither is free: `executescript(SCHEMA)`
 # re-parses every CREATE TABLE and each migration costs a PRAGMA per table.
 # `db()` is called several times per market visit, so paying that setup on
 # every call put pure overhead into the loop whose cycle time IS the fleet's
 # liveness signal. Keyed by path rather than a bare flag, so a test that points
 # the config at a fresh DB still gets its schema created.
-_schema_ready: set[str] = set()
+_schema_ready: dict[str, tuple[int, int, int]] = {}
 
 
 def _conn() -> sqlite3.Connection:
     path = str(_cfg.db_path())
     c = sqlite3.connect(path, timeout=BUSY_TIMEOUT_SEC)
-    if path not in _schema_ready:
+    try:
+        st = os.stat(path)
+        file_id = (st.st_ino, st.st_ctime_ns, st.st_mtime_ns)
+    except OSError:
+        file_id = (0, 0, 0)
+
+    if _schema_ready.get(path) != file_id:
         # WAL lets the dashboard read while the fleet writes. Under the default
         # rollback journal a dashboard poll holds a read lock that blocks the
         # next write until that poll finishes, and the writer then sits out the
@@ -363,7 +371,7 @@ def _conn() -> sqlite3.Connection:
                 if name not in have:
                     c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
         c.commit()
-        _schema_ready.add(path)
+        _schema_ready[path] = file_id
     return c
 
 
