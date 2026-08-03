@@ -324,14 +324,46 @@ _MIGRATIONS = {
 }
 
 
+# How long a writer waits for a lock before giving up. Kept short on purpose:
+# this store is written from inside the trading loop, and a write that blocks
+# is a sweep that does not finish. With WAL enabled below contention should not
+# arise at all -- this is the backstop, not the mechanism.
+BUSY_TIMEOUT_SEC = 5.0
+
+# DB paths whose schema and column migrations have already been applied in this
+# process. Both are idempotent but neither is free: `executescript(SCHEMA)`
+# re-parses every CREATE TABLE and each migration costs a PRAGMA per table.
+# `db()` is called several times per market visit, so paying that setup on
+# every call put pure overhead into the loop whose cycle time IS the fleet's
+# liveness signal. Keyed by path rather than a bare flag, so a test that points
+# the config at a fresh DB still gets its schema created.
+_schema_ready: set[str] = set()
+
+
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(str(_cfg.db_path()))
-    c.executescript(SCHEMA)
-    for table, cols in _MIGRATIONS.items():
-        have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
-        for name, decl in cols.items():
-            if name not in have:
-                c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    path = str(_cfg.db_path())
+    c = sqlite3.connect(path, timeout=BUSY_TIMEOUT_SEC)
+    if path not in _schema_ready:
+        # WAL lets the dashboard read while the fleet writes. Under the default
+        # rollback journal a dashboard poll holds a read lock that blocks the
+        # next write until that poll finishes, and the writer then sits out the
+        # busy timeout inside `visit()` -- seconds of stall in the trading loop
+        # caused by somebody looking at a web page. The setting is a property of
+        # the database file, so it only has to be applied once per path.
+        try:
+            c.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.Error:
+            # A filesystem that cannot do WAL (some network mounts) makes for a
+            # slower fleet, not a broken one. Keep the rollback journal.
+            pass
+        c.executescript(SCHEMA)
+        for table, cols in _MIGRATIONS.items():
+            have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+            for name, decl in cols.items():
+                if name not in have:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+        c.commit()
+        _schema_ready.add(path)
     return c
 
 

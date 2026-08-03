@@ -15,6 +15,7 @@ worst on that metric is roughly 7x at identical risk.
 """
 from __future__ import annotations
 
+import argparse
 import concurrent.futures as cf
 import json
 import sys
@@ -382,10 +383,39 @@ def evaluate(session: requests.Session, rate: float, m: dict,
     }
 
 
+def _positive_int(v: str) -> int:
+    n = int(v)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return n
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    """Parse the command line BEFORE any network work happens.
+
+    This used to be a hand-rolled scan of sys.argv for "--top", which meant
+    `--help` was not a flag the script recognised -- it was silently ignored,
+    and asking for usage instead ran the whole pipeline: a few hundred requests
+    against the venue, ending in an overwrite of run/markets.json. A mistyped
+    flag did the same, and `--top` with no value raised IndexError. argparse
+    turns all three into a usage error, and exits before the first request.
+    """
+    p = argparse.ArgumentParser(
+        prog="python -m scripts.rank_markets",
+        description=__doc__.split("\n\n")[0],
+        epilog="Writes the winners to run/markets.json, which strategy.fleet "
+               "reads as its market universe.")
+    p.add_argument("--top", type=_positive_int, default=20, metavar="N",
+                   help="how many markets to write (default: 20)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="score and print the ranking, but leave "
+                        "run/markets.json untouched")
+    return p.parse_args(argv)
+
+
 def main() -> None:
-    top = 20
-    if "--top" in sys.argv:
-        top = int(sys.argv[sys.argv.index("--top") + 1])
+    args = parse_args()
+    top = args.top
 
     s = requests.Session()
     data = s.get("https://clob.polymarket.com/sampling-markets", timeout=30).json()
@@ -439,8 +469,14 @@ def main() -> None:
     eligible.sort(key=lambda r: -r["return_pct_day"])
     picked = eligible[:top]
 
-    RUN.mkdir(exist_ok=True)
-    (RUN / "markets.json").write_text(json.dumps(picked, indent=1), encoding="utf-8")
+    if not args.dry_run:
+        RUN.mkdir(exist_ok=True)
+        # Temp file and rename: the fleet re-reads this on its own schedule and
+        # a half-written file is a SystemExit on the next re-rank.
+        f = RUN / "markets.json"
+        tmp = f.with_suffix(".tmp")
+        tmp.write_text(json.dumps(picked, indent=1), encoding="utf-8")
+        tmp.replace(f)
 
     ti = sum(r["est_income"] for r in picked)
     tc = sum(r["est_capital"] for r in picked)
@@ -470,7 +506,8 @@ def main() -> None:
             causes[k] = causes.get(k, 0) + 1
     print(f"scored {len(out)}, rejected {rejected} "
           f"({', '.join(f'{k}={v}' for k, v in sorted(causes.items())) or 'none'}), "
-          f"wrote top {len(picked)} -> run/markets.json")
+          f"{'would write' if args.dry_run else 'wrote'} top {len(picked)}"
+          f" -> run/markets.json")
     print(f"gates: 24h volume >= ${MIN_VOLUME_24H:,.0f}, "
           f"resolves within {MAX_DAYS_TO_RESOLVE:.0f}d, "
           f"income >= ${MIN_PAYOUT * FLOOR_MULTIPLE:.2f}/day\n")

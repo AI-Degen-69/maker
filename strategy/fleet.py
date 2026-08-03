@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -48,6 +50,95 @@ log = logging.getLogger("fleet")
 # Two book requests per market visit. This budget keeps us far under any sane
 # public rate limit even at 40 markets.
 REQ_PER_SEC = 2.0
+
+# HEARTBEAT.
+#
+# The dashboard declares the fleet dead when it has not seen progress for
+# STALE_AFTER_SEC (120s), and the only thing it could see was
+# run/fleet_state.json -- written once per COMPLETE sweep. A healthy 20-market
+# sweep is 50-70s, so a single slow venue pushed the write past two minutes and
+# a fleet that was trading correctly reported STALE with figures the operator
+# was told not to trust.
+#
+# The pulse separates "the loop is alive" from "a sweep finished". The trading
+# loop stamps an in-memory `_Pulse` once per iteration -- roughly every second,
+# before any network or DB work, so nothing in the body can skip it -- and a
+# background thread copies that stamp to disk on a fixed cadence.
+#
+# The thread publishes the LOOP's timestamp, never its own. Writing time.time()
+# would keep reporting a healthy fleet after the trading loop had wedged, which
+# is the single failure this indicator exists to catch. `written_ts` is carried
+# alongside purely so a reader can tell "the loop stopped" from "the whole
+# process died".
+PULSE_FILE = RUN / "fleet_pulse.json"
+PULSE_WRITE_SEC = 10.0
+
+# Cooldown before re-attempting a market whose metadata would not load. Long
+# enough that a closed market stops costing a request per rotation, short enough
+# that a market recovering from a venue blip is picked back up within a sweep or
+# two.
+MARKET_RETRY_SEC = 60.0
+
+
+class _Pulse:
+    """Last-known progress of the trading loop, shared with the writer thread.
+
+    Small enough to guard with one lock: the loop holds it for the duration of
+    three assignments, so the writer never waits measurably and the loop never
+    waits on the writer's disk I/O -- which is the whole point of moving the
+    write off the loop thread.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._ts = time.time()
+        self._iterations = 0
+        self._sweeps = 0
+        self._market = ""
+        self._markets = 0
+
+    def touch(self, market: str, markets: int) -> None:
+        with self._lock:
+            self._ts = time.time()
+            self._iterations += 1
+            self._market = market
+            self._markets = markets
+
+    def sweep_done(self) -> None:
+        with self._lock:
+            self._sweeps += 1
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            return {"loop_ts": self._ts, "iterations": self._iterations,
+                    "sweeps": self._sweeps, "market": self._market,
+                    "markets": self._markets, "pid": os.getpid(),
+                    "written_ts": time.time()}
+
+
+def _write_pulse(pulse: _Pulse) -> None:
+    """Publish the pulse atomically.
+
+    Written to a temp file and renamed because the dashboard reads this on an
+    unrelated schedule; a reader that catches a partial write would parse a
+    truncated JSON object and report the fleet dead for exactly the reason the
+    file exists to disprove.
+    """
+    tmp = PULSE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(pulse.snapshot()), encoding="utf-8")
+    tmp.replace(PULSE_FILE)
+
+
+def _pulse_writer(pulse: _Pulse, stop: threading.Event,
+                  interval: float = PULSE_WRITE_SEC) -> None:
+    """Copy the loop's pulse to disk every `interval` seconds until stopped."""
+    while not stop.wait(interval):
+        try:
+            _write_pulse(pulse)
+        except Exception as e:
+            # A heartbeat that cannot be written is not worth taking the fleet
+            # down for, and this thread has no other job -- try again next tick.
+            log.warning("pulse write failed: %s: %s", type(e).__name__, e)
 
 
 def _inventory_from_db(cid: str) -> Inventory:
@@ -145,6 +236,12 @@ class MarketState:
             market_daily_rate=spec["daily"],
         )
         self.market = None
+        # Earliest time we may try loading this market again. A market that is
+        # closed, or whose metadata endpoint is timing out, costs a full request
+        # on EVERY visit while returning nothing -- twenty of those turn a 60s
+        # sweep into a multi-minute one and the dashboard reports the fleet
+        # dead. Retrying on a cooldown instead keeps a broken market cheap.
+        self.market_retry_ts = 0.0
         self.engine = QueueFillEngine()
         # Rehydrate from the fills table instead of starting at zero. Fills are
         # persisted, inventory was not, so every restart silently dropped the
@@ -483,6 +580,13 @@ def visit(st: MarketState, bot_cfg, now: float,
     # resting-order reservation use the same fleet-wide committed total.
     committed_states = states if states is not None else [st]
     if st.market is None:
+        if now < st.market_retry_ts:
+            # Still cooling down from a failed load. Return without spending a
+            # request: the loop's time budget is what the dashboard measures as
+            # liveness, and a market that was closed ten seconds ago is not
+            # worth re-asking about on every rotation.
+            return
+        st.market_retry_ts = now + MARKET_RETRY_SEC
         # Reward funding is not a loadability condition. The ranker already
         # decided this market belongs in the universe, and half of it now pays
         # spread rather than rent.
@@ -960,9 +1064,22 @@ def main() -> None:
     log.info("fleet starting | %d markets | $%.0f/day funded | offset %.1fc",
              len(states), sum(s["daily"] for s in specs), 100 * base.reward_offset)
 
+    # Start the heartbeat before the first visit, and publish once immediately:
+    # a dashboard polled during startup should see a fresh pulse rather than a
+    # missing file for the first PULSE_WRITE_SEC.
+    pulse = _Pulse()
+    stop_pulse = threading.Event()
+    threading.Thread(target=_pulse_writer, args=(pulse, stop_pulse),
+                     name="fleet-pulse", daemon=True).start()
+    try:
+        _write_pulse(pulse)
+    except Exception as e:
+        log.warning("initial pulse write failed: %s: %s", type(e).__name__, e)
+
     gap = 2.0 / REQ_PER_SEC
     i = 0
     last_rerank = time.time()
+    empty_logged = False
     while True:
         # PERIODIC RE-RANK. run/markets.json was written 2026-07-29 01:39 and
         # the fleet ran against it for a day and a half while competitors
@@ -1012,8 +1129,33 @@ def main() -> None:
                 log.warning("rerank failed, keeping current markets: %s: %s",
                             type(e).__name__, e)
 
+        if not states:
+            # Every market dropped, or the ranker has not written a usable
+            # markets.json yet. `states[i % 0]` would take the process down;
+            # idling keeps it and its heartbeat alive so the next re-rank can
+            # refill the fleet. The pulse still advances -- the loop IS running,
+            # it just has nothing to visit, and the empty market count on the
+            # pulse is what tells the operator which of the two it is.
+            pulse.touch("", 0)
+            # Logged on the transition only. At one iteration per second an
+            # unconditional warning here fills the log faster than the re-rank
+            # interval that would clear it.
+            if not empty_logged:
+                log.warning("no markets in fleet; waiting for re-rank")
+                empty_logged = True
+            time.sleep(gap)
+            continue
+        if empty_logged:
+            log.info("markets restored: %d in fleet", len(states))
+            empty_logged = False
+
         st = states[i % len(states)]
         i += 1
+        # THE HEARTBEAT TOUCHPOINT. Stamped before the visit, not after, so a
+        # market that throws, times out or returns early still counts as a live
+        # cycle -- the loop's health is whether it is cycling, not whether this
+        # particular venue answered.
+        pulse.touch(st.title[:40], len(states))
         try:
             # Both totals are recomputed per visit rather than per sweep: a
             # fill in the market visited two seconds ago has already changed
@@ -1076,8 +1218,30 @@ def main() -> None:
                      committed, base.max_committed_usd,
                      fleet_naked_cost(states), funded, len(states),
                      vr_txt, fills_txt)
-            (RUN / "fleet_state.json").write_text(
-                json.dumps(specs, default=str), encoding="utf-8")
+            pulse.sweep_done()
+            # SERIALISE FROM `states`, NOT FROM `specs`. `specs` is the list
+            # read at startup and it was never kept in step with the re-rank:
+            # a market the ranker ADDED got a MarketState but no entry here, so
+            # its live telemetry never reached the dashboard, and a market the
+            # ranker DROPPED kept its final `_live` in the file forever. Reading
+            # the states list makes the file exactly the set being traded.
+            #
+            # Written via a temp file and renamed because the dashboard reads
+            # this on its own schedule; json.loads on a half-written file throws
+            # and the page then reports the fleet as not running.
+            #
+            # Wrapped for the same reason every other sweep-end step is: a full
+            # disk must degrade the dashboard, not stop the trading loop before
+            # it can reach the next heartbeat.
+            try:
+                f = RUN / "fleet_state.json"
+                tmp = f.with_suffix(".tmp")
+                tmp.write_text(json.dumps([s.spec for s in states], default=str),
+                               encoding="utf-8")
+                tmp.replace(f)
+            except Exception as e:
+                log.warning("fleet_state write failed: %s: %s",
+                            type(e).__name__, e)
         time.sleep(gap)
 
 
