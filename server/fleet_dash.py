@@ -109,6 +109,28 @@ def _heartbeat(now: float, live_ts: float, state_mtime: float,
     return ts, age, stale, src
 
 
+def _sweep_duration(pulse: dict, now: float,
+                    live_ts: float) -> float | None:
+    """How long a full sweep is taking, in seconds.
+
+    Prefers what the fleet MEASURED. `sweep_sec` is the last completed sweep;
+    `sweep_elapsed` is the one in progress, and the larger of the two is
+    returned so a sweep that has wedged reports its true cost immediately
+    rather than the healthy duration of the sweep before it.
+
+    Falls back to `now - live_ts` -- the freshest per-market payload -- only
+    for a fleet too old to publish either field. That fallback is the original
+    calculation and it OVERSTATES the sweep whenever a market fails to load,
+    which is why it is no longer the primary source.
+    """
+    done = pulse.get("sweep_sec")
+    running = pulse.get("sweep_elapsed")
+    measured = [float(v) for v in (done, running) if v is not None]
+    if measured:
+        return max(measured)
+    return (now - live_ts) if live_ts else None
+
+
 def _db_heartbeat() -> float | None:
     """Most recent write timestamp from the fleet DB, if it has started."""
     if not DB.exists():
@@ -355,7 +377,8 @@ def _markout_stats() -> dict:
     restart -- the fills happened whether or not the process that recorded
     them is still running.
     """
-    out: dict = {"by_market": {}, "total": 0.0, "spread": 0.0, "n": 0}
+    out: dict = {"by_market": {}, "total": 0.0, "spread": 0.0, "n": 0,
+                 "matured_n": 0}
     if not DB.exists():
         return out
     try:
@@ -377,6 +400,14 @@ def _markout_stats() -> dict:
             ref = r["ref_mid"]
             if ref is None:
                 continue
+            # THE GATE'S OWN SAMPLE COUNT, which is stricter than `n` below.
+            # `n` accepts any matured horizon, so a fill counts the moment h0
+            # (5m) lands. The fleet gate reads the h1 (1h) mark, so a dashboard
+            # reporting `n` against the 25-fill threshold overstates progress
+            # toward activation. Counted separately, on the same contaminated/
+            # missing-ref exclusions the aggregates use.
+            if r["mid_h1"] is not None:
+                out["matured_n"] += 1
             drift = mid - ref
             spread = ref - (r["fill_price"] or 0.0)
             b = out["by_market"].setdefault(
@@ -653,6 +684,11 @@ def fleet():
             "markout_total": mk["total"],
             "markout_spread": mk["spread"],
             "markout_n": mk["n"],
+            # Fills whose 1h (h1) mark has landed, and the fleet-wide sample the
+            # markout gate needs before it will act on them. Published as a pair
+            # so the page never hardcodes the threshold.
+            "matured_n": mk["matured_n"],
+            "gate_min_sample": CFG.markout_fleet_min_sample,
             # THE MEASURED ANSWER, as opposed to the modelled one. Spread
             # capture is a projection until a fill proves it: `markout_spread`
             # is the edge actually captured on filled shares (mid minus what
@@ -679,7 +715,21 @@ def fleet():
             # have different causes and this page was previously unable to tell
             # them apart.
             "heartbeat_src": heartbeat_src,
-            "sweep_age": (now - live_ts) if live_ts else None,
+            # SWEEP DURATION IS MEASURED BY THE FLEET, NOT DERIVED HERE.
+            #
+            # This used to be `now - max(_live.ts)`, which is the age of the
+            # freshest per-market payload and not a sweep duration at all.
+            # `visit` returns early -- without writing `_live` -- for a market
+            # it cannot load, so once markets started expiring the figure grew
+            # without bound: a fleet completing a sweep every 21 seconds was
+            # reported as "a full sweep is taking 30m41s", and the operator was
+            # sent hunting a bottleneck in a loop that did not have one.
+            "sweep_age": _sweep_duration(p, now, live_ts),
+            # The old quantity, under a name that says what it is: how stale
+            # the per-market FIGURES are. Distinct from sweep duration whenever
+            # some markets are unreadable, which is exactly when the two were
+            # being confused.
+            "data_age": (now - live_ts) if live_ts else None,
             "stale_after_sec": STALE_AFTER_SEC,
             "loop_market": p.get("market") or "",
             "loop_markets": p.get("markets"),
@@ -792,6 +842,7 @@ PAGE = r"""<!doctype html>
  .gauge-fill{height:100%;border-radius:7px;background:var(--up);transition:width .4s ease,background .4s ease}
  .gauge-cap{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--tx-faint)}
  .gauge-value{font-family:var(--mono);font-size:12px;color:var(--tx-dim);min-width:16ch;text-align:right}
+ .sample-blocks{font-size:13px;letter-spacing:.06em;white-space:nowrap;line-height:1}
 
  /* ---------- kpi groups ---------- */
  .kpi-wrapper{display:flex;flex-direction:column;gap:18px;padding:20px 24px;
@@ -867,6 +918,16 @@ PAGE = r"""<!doctype html>
   <div class="gauge-label">Wallet committed</div>
   <div class="gauge-track"><div class="gauge-fill" id="gaugeFill"></div><div class="gauge-cap" id="gaugeCap"></div></div>
   <div class="gauge-value" id="gaugeValue"></div>
+</div>
+<!-- SAMPLE PROGRESS. The markout gate cannot act on a thin sample, so until
+     this bar fills the fleet's verdicts are noise and every markout tile below
+     is provisional. Sitting beside the wallet gauge because "can I trust these
+     numbers yet?" is asked at the same moment as "how much is committed?". -->
+<div class="gauge-strip" id="sampleStrip">
+  <div class="gauge-label">Sample size</div>
+  <div class="sample-blocks mono" id="sampleBlocks"></div>
+  <div class="gauge-track"><div class="gauge-fill" id="sampleFill"></div></div>
+  <div class="gauge-value" id="sampleValue"></div>
 </div>
 <div class="kpi-wrapper" id="agg"></div>
 <div class="exp-err" id="exp"></div>
@@ -1016,6 +1077,10 @@ async function tick(){
 
   const t=s.totals;
   const activeCount = s.markets.filter(m => (m.income || 0) > 0).length;
+  // Markets the fleet visited and could not read. `visit` now records the
+  // failure on every early-return path, so this counts markets that are
+  // actually broken rather than markets that merely have no data yet.
+  const unreadable = s.markets.filter(m => m.err).length;
   const healthy = !t.fleet_stale;
   $('live').innerHTML = `<span class="${activeCount > 0 ? 'up' : 'down'}">● ${activeCount}/${t.markets} scoring</span>`;
   $('health').innerHTML = healthy
@@ -1034,11 +1099,20 @@ async function tick(){
     $('exp').textContent = `${ageMsg} Displayed figures are historical, not live.${at}`;
     $('exp').style.display = 'block';
   } else if(t.sweep_age !== null && t.sweep_age > (t.stale_after_sec || 120)){
-    // Loop alive, sweep slow. Worth saying out loud rather than silently
-    // showing LIVE: per-market figures are up to this old even though the
-    // fleet is healthy, and a sweep drifting upward is the early warning that
-    // used to arrive only as a false STALE.
+    // Loop alive, sweep genuinely slow. This now reads the duration the fleet
+    // MEASURED, so it means what it says; the old version derived it from the
+    // freshest per-market payload and reported 30m41s against a fleet that was
+    // completing a sweep every 21 seconds.
     $('exp').textContent = `Fleet is live, but a full sweep is taking ${hms(t.sweep_age)}. Per-market figures lag by up to that much.`;
+    $('exp').style.display = 'block';
+  } else if(unreadable > 0){
+    // THE CONDITION THAT USED TO MASQUERADE AS A SLOW SWEEP. The loop is fine
+    // and the sweep is fast; some markets simply cannot be read, so their
+    // figures are frozen at whenever they last answered. Naming the count and
+    // the age of the stalest data points at the real fix -- the universe --
+    // instead of at the loop.
+    const dataMsg = t.data_age !== null ? ` Their figures are up to ${hms(t.data_age)} old.` : '';
+    $('exp').textContent = `Fleet is live and sweeping in ${hms(t.sweep_age || 0)}, but ${unreadable}/${t.markets} markets are unreadable (closed, or the book will not load).${dataMsg}`;
     $('exp').style.display = 'block';
   }
 
@@ -1142,6 +1216,27 @@ async function tick(){
   $('gaugeCap').style.left = capPct+'%';
   $('gaugeValue').innerHTML = `<span class="${budgetAlert?'alert-tx bold':'dim'}">${usd(t.committed_total,0)} / ${usd(t.wallet,0)}</span>`+
     (budgetAlert ? ` <span class="alert-tx">· ${usd(t.committed_overage,0)} over cap</span>` : ` · ${usd(t.available_cash,0)} available`);
+
+  // ---- markout sample progress (n / gate threshold) ----
+  // Counts fills whose 1h mark has landed, not every fill on the tape: the
+  // gate reads h1, so anything earlier is a fill the gate cannot see yet.
+  const gateN = t.matured_n || 0;
+  const gateNeed = t.gate_min_sample || 25;
+  const gateReady = gateN >= gateNeed;
+  const gatePct = Math.min(100, 100 * gateN / gateNeed);
+  const CELLS = 10, filled = Math.round(CELLS * gatePct / 100);
+  $('sampleBlocks').innerHTML =
+    `<span class="${gateReady?'up':'gold'}">${'█'.repeat(filled)}</span>` +
+    `<span class="dim">${'░'.repeat(CELLS - filled)}</span>`;
+  const sf = $('sampleFill');
+  sf.style.width = gatePct + '%';
+  sf.style.background = gateReady ? 'var(--up)' : 'var(--gold)';
+  $('sampleValue').innerHTML =
+    `<span class="${gateReady?'up bold':'gold bold'}">${gateN}/${gateNeed}</span>` +
+    ` <span class="dim">(Matured Fills) · ${gatePct.toFixed(0)}%</span>`;
+  $('sampleStrip').title = gateReady
+    ? `Fleet markout gate is armed: ${gateN} fills have a matured 1h mark (threshold ${gateNeed}).`
+    : `Fleet markout gate stays inactive until ${gateNeed} fills have a matured 1h mark. ${gateNeed - gateN} to go.`;
 
   const K=(n,v,sub,cl,isAlert,tip)=>`<div class="k ${isAlert?'alert':''}" ${tip?`title="${tip}"`:''}><div class="n">${n}</div>
     <div class="v ${cl||''}">${v}</div><div class="s">${sub||''}</div></div>`;

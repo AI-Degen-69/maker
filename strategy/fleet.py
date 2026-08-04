@@ -105,6 +105,14 @@ class _Pulse:
         self._sweeps = 0
         self._market = ""
         self._markets = 0
+        # Wall time of the last COMPLETED sweep, measured here rather than
+        # inferred by the dashboard. The page used to derive sweep duration
+        # from the freshest per-market `_live` timestamp, which is not a sweep
+        # duration at all: a market that fails to load never writes `_live`,
+        # so that figure grew without bound and a fleet cycling every 21s was
+        # reported as "a full sweep is taking 30m41s".
+        self._sweep_start = time.time()
+        self._sweep_sec: float | None = None
 
     def touch(self, market: str, markets: int) -> None:
         with self._lock:
@@ -115,13 +123,24 @@ class _Pulse:
 
     def sweep_done(self) -> None:
         with self._lock:
+            now = time.time()
             self._sweeps += 1
+            self._sweep_sec = now - self._sweep_start
+            self._sweep_start = now
 
     def snapshot(self) -> dict:
         with self._lock:
             return {"loop_ts": self._ts, "iterations": self._iterations,
                     "sweeps": self._sweeps, "market": self._market,
                     "markets": self._markets, "pid": os.getpid(),
+                    # None until the first sweep completes: no observation is
+                    # not a zero, and a fleet 10 markets into its first sweep
+                    # must not publish a duration it has not measured.
+                    "sweep_sec": self._sweep_sec,
+                    # How long the sweep IN PROGRESS has been running. A sweep
+                    # that wedges shows up here immediately instead of waiting
+                    # for a completion that never arrives.
+                    "sweep_elapsed": time.time() - self._sweep_start,
                     "written_ts": time.time()}
 
 
@@ -375,6 +394,26 @@ def load_specs() -> list[dict]:
         raise SystemExit("run/markets.json missing -- run: "
                          "python -m scripts.rank_markets")
     return json.loads(f.read_text(encoding="utf-8"))
+
+
+def specs_mtime() -> float:
+    """When the ranker last rewrote the universe, or 0.0 if it never has.
+
+    The adoption trigger. A timer alone cannot do this job: the fleet and the
+    ranker start together, the fleet reads whatever markets.json is on disk at
+    that instant, and the ranker's first write lands a minute or two later --
+    so with a one-hour interval the fleet spends its first hour quoting the
+    universe it was explicitly restarted to replace. Observed on 2026-08-04:
+    a fresh file arrived 19 seconds after boot and all 20 markets still read
+    "closed / not accepting orders".
+
+    Returns 0.0 rather than raising: a missing file is already handled by the
+    caller, and a stat that fails must not stop the loop.
+    """
+    try:
+        return (RUN / "markets.json").stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def fleet_naked_cost(states) -> float:
@@ -650,6 +689,28 @@ def reallocate(states, base) -> dict:
     return out
 
 
+def _stamp_failure(st: MarketState, now: float, err: str) -> None:
+    """Record on the market's live payload that this visit produced nothing.
+
+    `visit` returns early on three paths -- retry cooldown, an unloadable
+    market, a failed book fetch -- and all three are ABOVE the `_live` write at
+    the end of the function. A market that has been closed since yesterday
+    therefore kept whatever `_live` it last succeeded with, or none at all, and
+    the dashboard rendered it as data that was merely old rather than as a
+    market the fleet cannot read.
+
+    `ts` is deliberately NOT touched: it dates the FIGURES, and stamping it
+    here would make a market that has failed for six hours look freshly
+    measured. `err_ts` dates the failure, so the page can say both things.
+    """
+    live = st.spec.get("_live")
+    if not isinstance(live, dict):
+        live = {}
+        st.spec["_live"] = live
+    live["err"] = err
+    live["err_ts"] = now
+
+
 def visit(st: MarketState, bot_cfg, now: float,
           fleet_naked_usd: float = 0.0, committed_usd: float = 0.0,
           states=None) -> None:
@@ -665,6 +726,7 @@ def visit(st: MarketState, bot_cfg, now: float,
             # request: the loop's time budget is what the dashboard measures as
             # liveness, and a market that was closed ten seconds ago is not
             # worth re-asking about on every rotation.
+            _stamp_failure(st, now, st.err or "market unloadable (cooling down)")
             return
         st.market_retry_ts = now + MARKET_RETRY_SEC
         # Reward funding is not a loadability condition. The ranker already
@@ -679,6 +741,7 @@ def visit(st: MarketState, bot_cfg, now: float,
             # naming rewards sent an operator hunting a pot that was never the
             # problem.
             st.err = "closed / not accepting orders"
+            _stamp_failure(st, now, st.err)
             return
     m = st.market
 
@@ -687,6 +750,7 @@ def visit(st: MarketState, bot_cfg, now: float,
         dn = full_book(bot_cfg.clob_host, m.down_token)
     except Exception as e:
         st.err = f"book fetch: {e}"
+        _stamp_failure(st, now, st.err)
         return
     st.err = ""
 
@@ -1212,6 +1276,9 @@ def main() -> None:
     gap = 2.0 / REQ_PER_SEC
     i = 0
     last_rerank = time.time()
+    # The universe we are actually trading, dated. Adoption is driven by this
+    # changing rather than by the interval alone -- see `specs_mtime`.
+    specs_mtime_seen = specs_mtime()
     # Deliberately 0.0 rather than `now`: a fleet that has just restarted is
     # exactly when the unresolved set is most likely to contain markets that
     # closed while it was down, and waiting a full interval to notice keeps
@@ -1238,10 +1305,26 @@ def main() -> None:
         # but recording it first keeps the two views consistent within a cycle.
         last_resolve = _maybe_resolve(bot_cfg, last_resolve, now_ts)
 
-        if now_ts - last_rerank >= base.rerank_interval_sec:
+        # ADOPT WHEN THE FILE CHANGES, NOT ONLY WHEN THE TIMER FIRES. The
+        # ranker's write IS the event; the interval is now just a floor that
+        # keeps the old behaviour if the file is rewritten with identical
+        # content. Waiting for the timer meant a fleet restarted specifically
+        # to pick up a fresh universe traded the stale one for a full hour.
+        mtime = specs_mtime()
+        if (now_ts - last_rerank >= base.rerank_interval_sec
+                or (mtime and mtime != specs_mtime_seen)):
+            if mtime != specs_mtime_seen:
+                log.info("RERANK adopting markets.json rewritten %.0fs ago",
+                         max(0.0, now_ts - mtime))
             last_rerank = now_ts
             try:
                 fresh = {s["cid"]: s for s in load_specs()}
+                # Marked seen only once it PARSED. A read that caught the
+                # ranker mid-write raises here, and recording the mtime before
+                # that would retire the trigger for a file we never adopted --
+                # the fleet would then wait out the full interval holding the
+                # universe it was trying to replace.
+                specs_mtime_seen = mtime
                 known = {s.cid for s in states}
                 by_cid = {s.cid: s for s in states}
                 for cid, spec in fresh.items():
