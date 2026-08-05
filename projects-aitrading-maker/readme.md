@@ -1,3 +1,13 @@
+---
+type: note
+title: polymarket-maker
+captured_at: '2026-08-05T00:21:54.142Z'
+captured_via: capture-cli
+ingested_via: put_page
+ingested_at: '2026-08-05T00:22:00.477Z'
+source_kind: put_page
+---
+
 # polymarket-maker
 
 Paper-trading simulation of a **maker** strategy on Polymarket's 5-minute
@@ -97,10 +107,9 @@ Judging that needs a fresh run after the fix.
 
 gbrain-linked pages (retrieved via `gbrain think` / `gbrain search`):
 
-- [[2026-07-29-maker-ev-system]] — EV system implementation plan
-- [[2026-07-29-maker-ev-system-design]] — EV system design spec
-- [[2026-07-29-profit-take-supervisor]] — profit-take supervisor plan
-- [[2026-07-29-profit-take-supervisor-design]] — profit-take supervisor design spec
+- [[maker-ev-system]] — EV system implementation plan
+- [[maker-ev-system-design]] — EV system design spec
+- [[profit-take-supervisor]] — profit-take supervisor plan
+- [[profit-take-supervisor-design]] — profit-take supervisor design spec
 - [[he_research_log]] / [[he_research_summary]] — Hebrew research notebook (EN + HE)
 - [[research_log]] / [[research_summary]] — research lab notebook
-

@@ -446,6 +446,37 @@ def _share_history(n: int = 24) -> list[float]:
         return []
 
 
+def _resting_by_side(quotes: list) -> dict:
+    """Fold `quotes` into per-side RESTING shares and dollars.
+
+    `quotes` is one entry per live order (strategy/fleet.py) shaped
+    ``{"side": "UP"|"DOWN", "price": float, "size": float, "filled": float}``.
+    What is still on the book is ``size - filled`` -- the same denominator
+    `capital` uses -- so a fully-filled order contributes nothing here
+    instead of being billed as depth we no longer have.
+
+        quotes                          ->  aggregate
+        [{UP,   .48, size 140, fill 9}]     up_shares 131.0   up_usd 62.88
+        [{DOWN, .48, size 131, fill 0}]     dn_shares 131.0   dn_usd 62.88
+        []                                  all four 0.0
+
+    A side with nothing resting stays 0.0. The cell renders that as "no
+    order", which is deliberately NOT the same pixel as a balanced book.
+    """
+    out = {"up_shares": 0.0, "up_usd": 0.0, "dn_shares": 0.0, "dn_usd": 0.0}
+    for q in quotes or []:
+        side = q.get("side")
+        key = "up" if side == "UP" else "dn" if side == "DOWN" else None
+        if key is None:
+            continue
+        resting = (q.get("size") or 0.0) - (q.get("filled") or 0.0)
+        if resting <= 0:
+            continue
+        out[f"{key}_shares"] += resting
+        out[f"{key}_usd"] += (q.get("price") or 0.0) * resting
+    return out
+
+
 @app.get("/api/fleet")
 def fleet():
     f = RUN / "fleet_state.json"
@@ -502,6 +533,11 @@ def fleet():
                           + (live.get("naked_cost", 0.0) or 0.0)
                           + (live.get("pair_paid", 0.0) or 0.0)),
             "quotes": live.get("quotes", []),
+            # Per-side RESTING depth, folded out of `quotes` so the table
+            # cell does not re-derive it on every 4s tick. Same
+            # `size - filled` denominator as `capital` above, so the two
+            # can never disagree about what is still on the book.
+            **_resting_by_side(live.get("quotes", [])),
             "fills": h.get("fills", 0),
             "uptime": h.get("uptime", 0.0),
             "samples": h.get("samples", 0),
@@ -871,6 +907,31 @@ PAGE = r"""<!doctype html>
  tr.alert td{background:rgba(255,92,92,.05)}
  .mkt-link{color:var(--tx);text-decoration:none;font-weight:500}
  .mkt-link:hover{color:var(--gold);text-decoration:underline}
+
+ /* ---------- depth cell ---------- */
+ /* Fourth instance of the fill-bar idiom already used by the wallet gauge,
+    the sample gauge and the rank rail. Same tokens, same 9-10px height, so
+    it reads as part of the page rather than a bolted-on widget. */
+ .dc{min-width:186px;max-width:230px}
+ .dc-mid{position:relative;transform:translateX(-50%);display:inline-block;
+   font-family:var(--mono);font-size:13px;font-weight:600;
+   font-variant-numeric:tabular-nums;margin-bottom:4px;white-space:nowrap}
+ .dc-mid .dim{font-family:var(--body);font-size:10px;letter-spacing:.07em;
+   text-transform:uppercase;font-weight:600}
+ .dc-stale-tag{font-size:10px}
+ .dc-bar{position:relative;display:flex;height:9px;border-radius:var(--r-sm);
+   overflow:hidden;background:var(--line-soft)}
+ .dc-up{background:var(--up)}
+ .dc-dn{background:var(--down)}
+ /* The true boundary. The label above clamps at 14/86% so it cannot fall out
+    of the cell; this tick does not, so an extreme split still reads honestly. */
+ .dc-tick{position:absolute;top:-2px;bottom:-2px;width:1px;
+   background:var(--tx-faint);transform:translateX(-.5px)}
+ .dc-legs{margin-top:5px;font-family:var(--mono);font-size:11px;
+   font-variant-numeric:tabular-nums;line-height:1.5}
+ .dc-legs div{white-space:nowrap}
+ .dc-stale .dc-bar{opacity:.35}
+ .dc-stale .dc-legs{color:var(--tx-dim)}
 </style></head><body>
 <header class="mast">
   <div class="mast-id"><b>◆</b> Maker Fleet</div>
@@ -935,7 +996,7 @@ PAGE = r"""<!doctype html>
  <thead><tr>
   <th>Market</th>
   <th class="num">Projected / day</th>
-  <th class="num">Committed</th>
+  <th>Resting depth &amp; mid</th>
   <th>Position / risk</th>
   <th class="num">Unrealized P&L</th>
   <th class="num">Realized P&L</th>
@@ -956,32 +1017,61 @@ const hms=s=>{s=Math.max(0,Math.floor(s));
   const p=n=>String(n).padStart(2,'0');
   return h?`${h}h ${p(m)}m ${p(x)}s`:`${m}m ${p(x)}s`;};
 
-function ladder(m){
-  const mid=m.mid_up, bid=m.up_bid, ask=m.up_ask;
-  if(mid==null||bid==null||ask==null) return '<span class="dim">No two-sided book</span>';
-  const v=(m.max_spread||4.5)/100;
-  const half=Math.max(v*1.35, (ask-bid)*0.75, 0.01);
-  const lo=mid-half, hi=mid+half, W=hi-lo;
-  const x=p=>Math.max(0,Math.min(100,100*(p-lo)/W));
-  const tag=(p,cls,lbl,top)=>p==null?'':
-    `<span style="position:absolute;left:${x(p)}%;top:${top}px;transform:translateX(-50%)">
-       <span class="${cls}" style="font-family:var(--mono);font-weight:700;font-size:10.5px;white-space:nowrap;text-shadow:0 1px 2px rgba(0,0,0,.9)">${lbl}</span></span>`;
-  const mark=(p,color,top,h)=>p==null?'':
-    `<span style="position:absolute;left:${x(p)}%;top:${top}px;width:2px;height:${h}px;
-       background:${color};transform:translateX(-50%)"></span>`;
-  const wl=x(mid-v), wr=x(mid+v);
-  return `<div style="position:relative;height:38px;width:100%;max-width:280px">
-    <div style="position:absolute;left:${wl}%;width:${wr-wl}%;top:12px;height:12px;
-         background:var(--up-soft);border-left:1px solid #24463f;border-right:1px solid #24463f"></div>
-    <div style="position:absolute;left:0;right:0;top:17px;height:1px;background:var(--line)"></div>
-    ${mark(mid,'#4a5568',10,16)}
-    ${mark(bid,'var(--tx-faint)',13,10)}${mark(ask,'var(--tx-faint)',13,10)}
-    ${mark(m.our_up,'var(--proj)',8,20)}
-    ${mark(m.our_dn_as_up,'var(--down)',8,20)}
-    ${tag(m.our_up,'proj',(m.our_up!=null?m.our_up.toFixed(3):''),27)}
-    ${tag(m.our_dn_as_up,'down',(m.our_dn_as_up!=null?m.our_dn_as_up.toFixed(3):''),27)}
-    ${tag(mid,'dim','mid',-2)}
-  </div>`;
+// The price-axis `ladder()` used to live here: it plotted mid, bid/ask and
+// our two resting orders at their true prices. It was never called from any
+// render path, and depthCell() below now answers the same question with the
+// opposite framing -- capital split rather than price position. Kept in git
+// history rather than as a second unreferenced renderer.
+
+// depthCell -- per-market resting depth for the fleet table.
+//
+//        Mid 48.0c            <- label rides the UP/DOWN boundary
+//   [==== up ====|== dn ==]   <- capital split, 9px, aria-hidden
+//   U $63: 131 Sh @ 48.0c     <- one line per side, tabular
+//   D $63: 131 Sh @ 48.0c
+//
+// Every number is visible text, never tooltip-only. Zero resting capital
+// renders an EMPTY trough, never a 50/50 bar: a market holding no orders
+// and a market holding perfectly balanced orders must not share a pixel.
+function depthCell(m){
+  const upUsd=m.up_usd||0, dnUsd=m.dn_usd||0, total=upUsd+dnUsd;
+  const stale=(m.age!=null && m.age>120) ? Math.round(m.age/60) : 0;
+  const midTxt = m.mid_up==null ? '&mdash;' : (m.mid_up*100).toFixed(1)+'¢';
+  const midCls = (total>0 && !stale) ? '' : 'dim';
+  // No resting capital: EXITED, spread too thin, or not scoring. One line,
+  // no bar, no fabricated split.
+  if(total<=0){
+    const why = m.gate==='EXITED' ? 'orders pulled on exit' : 'no resting orders';
+    return `<div class="dc"><div class="dc-mid" style="left:50%"><span class="dim">Mid</span> `
+      + `<span class="dim">${midTxt}</span></div>`
+      + `<div class="dc-bar" aria-hidden="true"></div>`
+      + `<div class="dc-legs"><div class="dim">${why}</div></div></div>`;
+  }
+  // 2dp: this string is rebuilt for every row every 4s, and 16 significant
+  // digits of float noise in a style attribute helps nobody.
+  const upPct = +((upUsd/total)*100).toFixed(2);
+  // The label clamps so it cannot overflow the cell; the tick stays at the
+  // TRUE boundary, so a clamped label never misreports where capital divides.
+  const labelPct = Math.min(Math.max(upPct,14),86);
+  const cents=v=>v==null?'&mdash;':(v*100).toFixed(1)+'¢';
+  const leg=(tag,cls,dollars,shares,price)=> shares>0
+    ? `<div><span class="${cls} bold">${tag}</span> ${usd(dollars,0)}: `
+      + `${Math.round(shares)} Sh @ ${cents(price)}</div>`
+    : `<div class="dim"><span class="bold">${tag}</span> none resting</div>`;
+  return `<div class="dc${stale?' dc-stale':''}">`
+    + `<div class="dc-mid" style="left:${labelPct}%"><span class="dim">Mid</span> `
+      + (midCls?`<span class="${midCls}">${midTxt}</span>`:midTxt)
+      + (stale?` <span class="alert-tx dc-stale-tag">stale ${stale}m</span>`:'')
+    + `</div>`
+    + `<div class="dc-bar" aria-hidden="true">`
+      + `<div class="dc-up" style="width:${upPct}%"></div>`
+      + `<div class="dc-dn" style="width:${100-upPct}%"></div>`
+      + `<div class="dc-tick" style="left:${upPct}%"></div>`
+    + `</div>`
+    + `<div class="dc-legs">`
+      + leg('U','up',upUsd,m.up_shares,m.our_up)
+      + leg('D','down',dnUsd,m.dn_shares,m.our_dn_as_up)
+    + `</div></div>`;
 }
 
 function capBar(m){
@@ -1343,7 +1433,7 @@ async function tick(){
     return `<tr class="${m.gate === 'EXITED' ? 'alert' : ''}">
       <td style="max-width:300px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${esc(m.title)}">${m.url?`<a class="mkt-link" href="${esc(m.url)}" target="_blank">${esc(m.title)}</a>`:esc(m.title)}</td>
       <td class="num bold mono ${isGenerating ? 'up' : 'dim'}" style="font-size:15px">${usd(currentIncome)}</td>
-      <td class="num mono" title="Offers ${usd(m.capital,0)}">${usd(m.committed,0)}</td>
+      <td>${depthCell(m)}</td>
       <td>${position}</td>
       <td class="num mono">${unrlHtml}</td>
       <td class="num mono">${rzlHtml}</td>

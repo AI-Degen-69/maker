@@ -53,10 +53,29 @@ for _scheme in ("https://", "http://"):
         pool_connections=8, pool_maxsize=8, max_retries=0))
 
 
+class BookGone(Exception):
+    """The venue holds no orderbook at all for this token.
+
+    `/book` answers 404 with `{"error": "No orderbook exists for the requested
+    token id"}` once every maker has pulled off a token, which is what happens
+    the moment an outcome stops being in doubt. The market itself keeps
+    reporting `active: true, accepting_orders: true` until UMA finalises it days
+    later, so nothing else in the system can tell this apart from a market that
+    is merely quiet.
+
+    A distinct type rather than a generic HTTPError because the two mean
+    opposite things to the caller: a timeout or a 5xx is a venue blip worth
+    retrying every rotation, while this is terminal -- there is no book to quote
+    into and no bid to exit against, only settlement to wait for.
+    """
+
+
 def full_book(clob_host: str, token_id: str) -> dict:
     """Full depth, not just top-of-book -- queue position needs the level sizes."""
     r = _SESSION.get(f"{clob_host}/book", params={"token_id": token_id},
                      timeout=BOOK_TIMEOUT)
+    if r.status_code == 404:
+        raise BookGone(token_id)
     r.raise_for_status()
     b = r.json()
     bids = {round(float(x["price"]), 4): float(x["size"]) for x in (b.get("bids") or [])}

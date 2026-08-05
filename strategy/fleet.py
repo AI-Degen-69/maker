@@ -32,7 +32,7 @@ from strategy.allocate import (allocate_fundable, capital_scarcity, shares_for,
                                spread_capture_daily)
 from strategy.config import load as load_cfg
 from strategy.fills import QueueFillEngine
-from strategy.main import full_book, recent_trades
+from strategy.main import BookGone, full_book, recent_trades
 from strategy.markets import fetch_pinned_market
 from strategy.net_config import load_net as load_bot_cfg
 from strategy.quotes import Inventory, decide_quotes, mid_price
@@ -79,6 +79,32 @@ PULSE_WRITE_SEC = 10.0
 # that a market recovering from a venue blip is picked back up within a sweep or
 # two.
 MARKET_RETRY_SEC = 60.0
+
+# How many consecutive `/book` 404s before a market is called decided rather
+# than broken. One is not evidence: the venue can 404 a token mid-deploy, and
+# labelling a live market "awaiting settlement" would hide a real outage behind
+# a reassuring string. Three consecutive rotations is the same answer over
+# roughly one to three minutes.
+BOOK_GONE_STREAK = 3
+
+# Cooldown once that verdict is reached. Nothing about a deleted book changes on
+# a trading timescale -- it returns only if the market itself reopens -- so this
+# exists to stop spending two requests per rotation on a market that cannot be
+# quoted, while still noticing a reopen within five minutes.
+BOOK_GONE_RETRY_SEC = 300.0
+
+# How many consecutive `/book` 404s before a market is called decided rather
+# than broken. One is not evidence: the venue can 404 a token mid-deploy, and
+# labelling a live market "awaiting settlement" would hide a real outage behind
+# a reassuring string. Three consecutive rotations is ~1-3 minutes of the same
+# answer from both tokens.
+BOOK_GONE_STREAK = 3
+
+# Cooldown once that verdict is reached. Nothing about a deleted book changes on
+# a trading timescale -- it comes back only if the market itself reopens -- so
+# this exists to stop spending two requests per rotation on a market that cannot
+# be quoted, while still noticing a reopen within five minutes.
+BOOK_GONE_RETRY_SEC = 300.0
 
 # How often to ask the venue which of our filled markets have closed. Settlement
 # is
@@ -275,6 +301,13 @@ class MarketState:
         # sweep into a multi-minute one and the dashboard reports the fleet
         # dead. Retrying on a cooldown instead keeps a broken market cheap.
         self.market_retry_ts = 0.0
+        # Consecutive `/book` 404s, and the cooldown they earn once the streak
+        # is long enough to be believed. Separate from `market_retry_ts`: the
+        # metadata endpoint keeps answering perfectly for these markets -- it is
+        # only the book that is gone -- so the load path never cools them down
+        # and every rotation paid two requests for a 404 forever.
+        self.book_gone = 0
+        self.book_retry_ts = 0.0
         self.engine = QueueFillEngine()
         # Rehydrate from the fills table instead of starting at zero. Fills are
         # persisted, inventory was not, so every restart silently dropped the
@@ -711,6 +744,50 @@ def _stamp_failure(st: MarketState, now: float, err: str) -> None:
     live["err_ts"] = now
 
 
+def _settling_status(st: MarketState) -> str:
+    """What to show for a market whose book the venue has deleted.
+
+    Not an error string. The fleet is not failing to read this market -- there
+    is nothing left to read, because the outcome stopped being in doubt and the
+    makers went home. The only remaining event is settlement, so the page says
+    that, and says whether we are waiting on it holding something or holding
+    nothing. An operator seeing `book fetch: 404 Client Error ...` against a
+    market they can see resolved on the venue reads it as a broken fleet.
+    """
+    shares = (st.inv.up_shares or 0.0) + (st.inv.down_shares or 0.0)
+    if shares <= 0:
+        return "outcome decided -- awaiting resolution"
+    side = "UP" if (st.inv.up_shares or 0.0) >= (st.inv.down_shares or 0.0) \
+        else "DOWN"
+    return (f"outcome decided -- holding {shares:.0f} {side}, "
+            "awaiting settlement")
+
+
+def _stamp_waiting(st: MarketState, now: float, why: str) -> None:
+    """Record a market as waiting on settlement rather than as broken.
+
+    Mirrors `_stamp_failure` -- same `_live` payload, same refusal to touch `ts`
+    -- with two deliberate differences. `err` is CLEARED, because the dashboard
+    counts non-empty `err` as "markets are unreadable" in its banner and paints
+    the status cell red; neither is true here. `err_ts` is still stamped, so the
+    page can date how long the market has been in this state.
+    """
+    live = st.spec.get("_live")
+    if not isinstance(live, dict):
+        live = {}
+        st.spec["_live"] = live
+    live["err"] = ""
+    live["why"] = why
+    live["err_ts"] = now
+    # A market with no book has no resting orders and no quotes, and leaving the
+    # last successful sweep's numbers in place reported capital as committed to
+    # offers that the venue deleted along with the book.
+    live["quotes"] = []
+    live["capital"] = 0
+    live["income"] = 0.0
+    live["share"] = 0.0
+
+
 def visit(st: MarketState, bot_cfg, now: float,
           fleet_naked_usd: float = 0.0, committed_usd: float = 0.0,
           states=None) -> None:
@@ -745,14 +822,45 @@ def visit(st: MarketState, bot_cfg, now: float,
             return
     m = st.market
 
+    if now < st.book_retry_ts:
+        # Already judged decided. Re-asking the venue on every rotation cannot
+        # change the answer before the cooldown, and the two requests it costs
+        # come out of the sweep time the dashboard reads as liveness.
+        _stamp_waiting(st, now, _settling_status(st))
+        return
+
     try:
         up = full_book(bot_cfg.clob_host, m.up_token)
         dn = full_book(bot_cfg.clob_host, m.down_token)
+    except BookGone:
+        # The book is not slow or unreachable -- it does not exist. That happens
+        # when an outcome is settled in fact but not yet on chain: the venue
+        # keeps the market `active` and `accepting_orders` until UMA finalises
+        # it, so nothing here can quote, nothing can exit (no bid to sell into),
+        # and the position simply waits to be paid $1 or $0.
+        st.book_gone += 1
+        if st.book_gone >= BOOK_GONE_STREAK:
+            st.book_retry_ts = now + BOOK_GONE_RETRY_SEC
+            # Cleared, not set: this is a market state, not a fleet fault, and
+            # `st.err` is what the reward-sample path and the page treat as
+            # "this market is broken".
+            st.err = ""
+            _stamp_waiting(st, now, _settling_status(st))
+        else:
+            # Still inside the benefit of the doubt. Reported as the plain fact
+            # observed rather than as a verdict not yet earned.
+            st.err = "book fetch: no orderbook (venue returned 404)"
+            _stamp_failure(st, now, st.err)
+        return
     except Exception as e:
         st.err = f"book fetch: {e}"
         _stamp_failure(st, now, st.err)
         return
     st.err = ""
+    # A book that answers is the only thing that clears the verdict, so a market
+    # that reopens is quoted again on the next rotation after its cooldown.
+    st.book_gone = 0
+    st.book_retry_ts = 0.0
 
     # Fills are decided by the TAPE, not by the book emptying: a level that
     # vanishes on cancellations must fill us nothing.
@@ -1180,7 +1288,11 @@ def visit(st: MarketState, bot_cfg, now: float,
         "income": share * st.pot,
         "pot": st.pot, "source": st.source,
         "capital": sum(o.price * (o.size - o.filled) for o in orders),
-        "quotes": [{"side": o.side, "price": round(o.price, 4), "size": o.size}
+        # `filled` rides along so consumers can compute RESTING size
+        # (size - filled) the same way `capital` above does. Without it the
+        # dashboard would bill a fully-filled order as still resting.
+        "quotes": [{"side": o.side, "price": round(o.price, 4),
+                    "size": o.size, "filled": o.filled}
                    for o in orders],
         "up_sh": st.inv.up_shares, "dn_sh": st.inv.down_shares,
         "up_avg": st.inv.avg("UP"), "dn_avg": st.inv.avg("DOWN"),
