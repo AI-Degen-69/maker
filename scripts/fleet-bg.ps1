@@ -90,42 +90,49 @@ $sup = Start-Process -FilePath "python" `
     -RedirectStandardOutput (Join-Path $ProjectPath "logs/supervisor.out.log") `
     -RedirectStandardError  (Join-Path $ProjectPath "logs/supervisor.err.log")
 
-# The universe is short-dated by construction: without this, every market in
-# run/markets.json resolves inside a day and the fleet quotes a dead file while
-# reporting a perfectly healthy heartbeat.
-$rr = Start-Process -FilePath "python" `
-    -ArgumentList "-m", "scripts.rerank_loop" `
-    -WorkingDirectory $ProjectPath -WindowStyle Hidden -PassThru `
-    -RedirectStandardOutput (Join-Path $ProjectPath "logs/rerank.out.log") `
-    -RedirectStandardError  (Join-Path $ProjectPath "logs/rerank.err.log")
+# THE RANKER IS NO LONGER STARTED HERE. It used to run as a sibling of the
+# supervisor, which meant nothing restarted it when it died -- and on
+# 2026-08-03 it died at 17:08 and run/markets.json was not rewritten for 28.5
+# hours. The universe is short-dated by construction, so by then half of it had
+# settled and the fleet was quoting closed markets while reporting a perfectly
+# healthy heartbeat. It is now a supervised child in `strategy.supervisor`,
+# alongside the fleet and the dashboard; starting it here as well would put two
+# rankers on the machine writing the same file.
 
 # Recorded BEFORE the liveness check, so a process that dies during startup is
 # still owned and can be cleaned up by fleet-stop rather than left orphaned.
-Save-FleetInstance -Procs @{ supervisor = $sup; rerank = $rr }
+Save-FleetInstance -Procs @{ supervisor = $sup }
 
 Start-Sleep -Seconds 6
 
-# A COUNT OF MATCHING PROCESSES IS NOT PROOF THESE TWO SURVIVED.
+# A COUNT OF MATCHING PROCESSES IS NOT PROOF THE SUPERVISOR SURVIVED.
 #
 # $alive below counts anything matching the patterns, so a supervisor that died
 # on a bad markets.json still printed a green success line while the fleet was
-# not running. Ask the two Process objects we actually started, and name the
-# log that holds the traceback -- the crash lands in the .err.log before
-# logging is configured, which is the file nobody thinks to open.
+# not running. Ask the Process object we actually started, and name the log
+# that holds the traceback -- the crash lands in the .err.log before logging is
+# configured, which is the file nobody thinks to open.
 $sup.Refresh()
-$rr.Refresh()
-$dead = @()
-if ($sup.HasExited) { $dead += "supervisor (see logs\supervisor.err.log)" }
-if ($rr.HasExited)  { $dead += "reranker (see logs\rerank.err.log)" }
-if ($dead.Count -gt 0) {
-    throw "Fleet startup failed: $($dead -join '; ')"
+if ($sup.HasExited) {
+    throw "Fleet startup failed: supervisor (see logs\supervisor.err.log)"
+}
+
+# The ranker is a supervised child now, so its absence is a real failure rather
+# than a cosmetic one: without it the universe silently ages out. The
+# supervisor restarts it, but it must be RUNNING before this script claims
+# success, or a ranker that crashes on every start looks like a healthy fleet.
+$rrPid = @(Get-DescendantPids -ParentId $sup.Id | ForEach-Object {
+    (Get-CimInstance Win32_Process -Filter "ProcessId = $_" -ErrorAction SilentlyContinue)
+} | Where-Object { $_.CommandLine -like "*scripts.rerank_loop*" })
+if ($rrPid.Count -eq 0) {
+    Write-Host "WARNING: ranker not up yet; check logs\supervisor.log and logs\rerank.log" -ForegroundColor Yellow
 }
 
 # Our own processes plus the supervisor's children (fleet + dashboard), rather
 # than every fleet-shaped process on the machine.
 $alive = @(Get-FleetInstance).Count + @(Get-DescendantPids -ParentId $sup.Id).Count
 Write-Host ""
-Write-Host "supervisor PID $($sup.Id) · rerank PID $($rr.Id) · $alive processes up" -ForegroundColor Green
+Write-Host "supervisor PID $($sup.Id) · $alive processes up (fleet, dash, rerank)" -ForegroundColor Green
 Write-Host "dashboard  http://127.0.0.1:8800"
 Write-Host "logs       Get-Content logs\supervisor.log -Wait -Tail 20"
 Write-Host "stop       .\scripts\fleet-stop.ps1"

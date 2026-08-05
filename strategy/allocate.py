@@ -116,7 +116,7 @@ def shares_for(dollars: float, min_size: int) -> int:
 
 
 def allocate(markets: list[dict], budget: float, floor: float,
-             step: float = 5.0) -> dict[str, float]:
+             step: float = 5.0, max_frac: float = 1.0) -> dict[str, float]:
     """Water-fill: hand each increment to whichever market currently has the
     highest marginal return, until the budget is exhausted or no market clears
     the floor.
@@ -128,28 +128,48 @@ def allocate(markets: list[dict], budget: float, floor: float,
     `markets` items need `cid`, `daily`, `capital`, `share`; `capital` and
     `share` are the CURRENT observation, used only to infer the competition.
     Returns dollars per market.
+
+    `max_frac` bounds any ONE market's share of the budget, and it exists
+    because this function was read as a diversifier and is not one. Marginal
+    return is daily*T/(capital+T)^2, which is nearly FLAT in capital whenever
+    competitor depth T dominates our own size -- so the argmax never changes
+    hands and one market absorbs every increment. Measured 2026-08-02: a single
+    market took the entire $900 budget, `shares_for` turned it into a 900-share
+    order, and it filled in one print for $792 -- 79% of a $1,000 wallet,
+    against a nominal $400 per-market cost cap.
+
+    A full market is SKIPPED, not a reason to stop: the budget should keep
+    flowing to the next-best market, which is the entire point of the cap.
+    Defaults to 1.0 so existing callers keep the old behaviour and only the
+    fleet runner, which has a configured fraction, opts in.
     """
     T = {m["cid"]: competitor_depth(m["capital"], m["share"]) for m in markets}
     daily = {m["cid"]: m["daily"] for m in markets}
     out = {m["cid"]: 0.0 for m in markets}
+    cap = budget * max_frac if max_frac < 1.0 else float("inf")
 
     spent = 0.0
     while spent < budget:
         best, best_marginal = None, floor
         for cid in out:
+            # Full markets leave the auction entirely. Comparing one and then
+            # refusing to award it would stall the loop on a market that can
+            # never take another dollar.
+            if out[cid] + step > cap:
+                continue
             mg = marginal(out[cid], daily[cid], T[cid])
             if mg > best_marginal:
                 best, best_marginal = cid, mg
         if best is None:
-            break          # nothing left worth funding
+            break          # nothing worth funding, or everything is full
         out[best] += step
         spent += step
     return out
 
 
 def allocate_fundable(markets: list[dict], budget: float, floor: float,
-                      payout_floor: float, step: float = 5.0
-                      ) -> dict[str, float]:
+                      payout_floor: float, step: float = 5.0,
+                      max_frac: float = 1.0) -> dict[str, float]:
     """Water-fill, then drop whatever the funded size cannot actually earn on,
     and redistribute what that frees. Every input cid appears in the result;
     the ones that survived nothing are 0.0.
@@ -199,9 +219,20 @@ def allocate_fundable(markets: list[dict], budget: float, floor: float,
     live = list(markets)
     fixed: dict[str, float] = {}          # markets held at their minimum lot
     out = {m["cid"]: 0.0 for m in markets}
+    # The concentration cap is a property of the BUDGET, so it is computed once
+    # against the full budget rather than against the shrinking `free` -- if it
+    # tracked `free`, each promotion would tighten the cap on everyone left and
+    # the limit would depend on the order markets happened to be promoted in.
+    cap = budget * max_frac if max_frac < 1.0 else float("inf")
     while True:
         free = max(budget - sum(fixed.values()), 0.0)
-        dollars = allocate(live, free, floor, step) if live else {}
+        # Re-expressed as a fraction of `free`, because that is the budget
+        # `allocate` actually sees. Clamping its OUTPUT instead would cap the
+        # right markets and then throw the freed dollars away -- the water-fill
+        # has to know a market is full while it still has increments to hand
+        # out, or the surplus never reaches the next-best market.
+        frac = 1.0 if cap == float("inf") or free <= 0 else min(cap / free, 1.0)
+        dollars = allocate(live, free, floor, step, max_frac=frac) if live else {}
 
         promote, drop = None, None
         for m in live:
@@ -215,7 +246,13 @@ def allocate_fundable(markets: list[dict], budget: float, floor: float,
             pf = payout_floor if m.get("source", "rewards") == "rewards" else 0.0
             if d < lot:
                 inc = income(lot, m["daily"], T)
-                if lot <= free and inc >= pf and inc / lot >= floor:
+                # `lot <= cap` closes the obvious way back into the bug this
+                # cap exists to stop: the promotion path funds an indivisible
+                # minimum OUTSIDE the water-fill, so without it a market whose
+                # venue minimum exceeds the concentration limit would be handed
+                # that minimum in full. A market we cannot fund without
+                # breaching the limit is one we do not fund.
+                if lot <= free and lot <= cap and inc >= pf and inc / lot >= floor:
                     if promote is None or inc / lot > promote[1]:
                         promote = (m["cid"], inc / lot, lot)
                 elif drop is None or inc < drop[1]:

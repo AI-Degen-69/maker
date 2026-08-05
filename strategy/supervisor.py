@@ -40,6 +40,15 @@ CHILDREN = {
     "fleet": [sys.executable, "-m", "strategy.fleet"],
     "dash": [sys.executable, "-m", "uvicorn", "server.fleet_dash:app",
              "--host", "127.0.0.1", "--port", "8800"],
+    # THE RANKER, which `fleet-bg.ps1` used to start as an UNSUPERVISED
+    # sibling. It died on 2026-08-03 at 17:08 and nothing restarted it, so
+    # run/markets.json went 28.5 hours without a rewrite while the fleet
+    # re-read it every cycle. The U6 universe is short-dated by construction:
+    # half of it had settled, `visit` was returning "closed / not accepting
+    # orders" for 10 of 20 markets, and the loop, the heartbeat and the sweep
+    # line all read perfectly healthy at $0.00/day. That is the same silent
+    # death this supervisor was written for; the ranker belongs under it.
+    "rerank": [sys.executable, "-m", "scripts.rerank_loop"],
 }
 
 

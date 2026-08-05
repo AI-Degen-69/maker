@@ -105,6 +105,14 @@ class _Pulse:
         self._sweeps = 0
         self._market = ""
         self._markets = 0
+        # Wall time of the last COMPLETED sweep, measured here rather than
+        # inferred by the dashboard. The page used to derive sweep duration
+        # from the freshest per-market `_live` timestamp, which is not a sweep
+        # duration at all: a market that fails to load never writes `_live`,
+        # so that figure grew without bound and a fleet cycling every 21s was
+        # reported as "a full sweep is taking 30m41s".
+        self._sweep_start = time.time()
+        self._sweep_sec: float | None = None
 
     def touch(self, market: str, markets: int) -> None:
         with self._lock:
@@ -115,13 +123,24 @@ class _Pulse:
 
     def sweep_done(self) -> None:
         with self._lock:
+            now = time.time()
             self._sweeps += 1
+            self._sweep_sec = now - self._sweep_start
+            self._sweep_start = now
 
     def snapshot(self) -> dict:
         with self._lock:
             return {"loop_ts": self._ts, "iterations": self._iterations,
                     "sweeps": self._sweeps, "market": self._market,
                     "markets": self._markets, "pid": os.getpid(),
+                    # None until the first sweep completes: no observation is
+                    # not a zero, and a fleet 10 markets into its first sweep
+                    # must not publish a duration it has not measured.
+                    "sweep_sec": self._sweep_sec,
+                    # How long the sweep IN PROGRESS has been running. A sweep
+                    # that wedges shows up here immediately instead of waiting
+                    # for a completion that never arrives.
+                    "sweep_elapsed": time.time() - self._sweep_start,
                     "written_ts": time.time()}
 
 
@@ -377,6 +396,26 @@ def load_specs() -> list[dict]:
     return json.loads(f.read_text(encoding="utf-8"))
 
 
+def specs_mtime() -> float:
+    """When the ranker last rewrote the universe, or 0.0 if it never has.
+
+    The adoption trigger. A timer alone cannot do this job: the fleet and the
+    ranker start together, the fleet reads whatever markets.json is on disk at
+    that instant, and the ranker's first write lands a minute or two later --
+    so with a one-hour interval the fleet spends its first hour quoting the
+    universe it was explicitly restarted to replace. Observed on 2026-08-04:
+    a fresh file arrived 19 seconds after boot and all 20 markets still read
+    "closed / not accepting orders".
+
+    Returns 0.0 rather than raising: a missing file is already handled by the
+    caller, and a stat that fails must not stop the loop.
+    """
+    try:
+        return (RUN / "markets.json").stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def fleet_naked_cost(states) -> float:
     """Dollars of unhedged inventory across the whole fleet.
 
@@ -411,6 +450,71 @@ def _affordable_cross_size(book_asks: dict, requested: float,
         remaining -= take
         budget -= take * price
     return size
+
+
+def _gate_with_fleet_fallback(prev_gate: str, own_stats: dict, cfg):
+    """Advance one market's gate, borrowing the fleet verdict if it has none.
+
+    Returns `(new_gate, stats_used)`; the caller stores the stats it was
+    actually judged on so the dashboard reports the number behind the state.
+
+    Two rules, and the second is the load-bearing one:
+
+      * A market with no matured sample of its own inherits the POOLED verdict
+        instead of holding `insufficient_sample` forever. Without this the gate
+        is unreachable in practice: markets here rotate daily and, measured
+        2026-08-02, the best-sampled market of 19 matured 7 markouts against a
+        threshold of 8. Lowering the per-market minimum alone changed nothing.
+      * A borrowed verdict is capped at WIDENED. EXITED is terminal by design,
+        and a pooled reading is not evidence about THIS market -- the pooled
+        mean on that run is -4.75c/share, past the catastrophic threshold, so
+        an uncapped fallback would permanently blacklist all 19 markets at
+        once, including the three that were individually EARNING (+4.4c,
+        +5.0c, +5.3c) and had simply never reached a sample. Backing off on a
+        bad universe is right; sentencing an unmeasured market on someone
+        else's evidence is not.
+
+    A market already EXITED stays EXITED: the cap must never become a route
+    back into the book. `next_state` guarantees that independently, and the
+    `prev_gate != EXITED` guard here keeps it true even if it stops.
+    """
+    stats = own_stats
+    borrowed = False
+    if stats.get("verdict") == "insufficient_sample":
+        pooled = markout.fleet_stats(cfg.markout_fleet_min_sample)
+        if pooled.get("verdict") != "insufficient_sample":
+            stats, borrowed = pooled, True
+
+    nxt = gate.next_state(prev_gate, stats, cfg)
+    if borrowed and nxt == gate.EXITED and prev_gate != gate.EXITED:
+        nxt = gate.WIDENED
+    return nxt, stats
+
+
+def _affordable_rest_size(requested: float, price: float,
+                          available_usd: float, market_room_usd: float) -> int:
+    """Largest resting order that fits BOTH the wallet and this market's cap.
+
+    Pure, and module-level rather than inline in `visit`, for the same reason
+    `_affordable_cross_size` above is: the arithmetic is the whole fix and it
+    has to be testable without standing up a market, a book and a fill engine.
+
+    `market_room_usd` is `max_cost_per_market - inv.cost`. That cap used to be
+    enforced only in quotes.py, against inventory ALREADY held, and only on the
+    heavy side -- both readings are post-hoc, so a market holding nothing had
+    room for an order of any size. Measured 2026-08-02: a 900-share order
+    rested and filled in one print for $792 against a $400 cap, on a market
+    whose inventory was empty when it was posted.
+
+    Floors at 0 rather than going negative: an inventory already over its cap
+    has no room, and `int()` on a negative would round toward zero and quietly
+    hand back a positive-looking size.
+    """
+    if price <= 0:
+        return 0
+    room = max(float(market_room_usd), 0.0)
+    wallet = max(float(available_usd), 0.0)
+    return int(min(float(requested), wallet / price, room / price))
 
 
 def fleet_committed_cost(states) -> float:
@@ -536,7 +640,8 @@ def reallocate(states, base) -> dict:
     # still merged, marked out and reconciled. Removing it here would strand a
     # real position with nothing tending it.
     dollars = allocate_fundable(obs, base.allocation_budget,
-                                base.marginal_return_floor, floor)
+                                base.marginal_return_floor, floor,
+                                max_frac=base.max_market_frac)
 
     # Whether the BUDGET, rather than the floor, is what stopped the water-fill
     # while a market was still returning well above the floor. That is the only
@@ -584,6 +689,28 @@ def reallocate(states, base) -> dict:
     return out
 
 
+def _stamp_failure(st: MarketState, now: float, err: str) -> None:
+    """Record on the market's live payload that this visit produced nothing.
+
+    `visit` returns early on three paths -- retry cooldown, an unloadable
+    market, a failed book fetch -- and all three are ABOVE the `_live` write at
+    the end of the function. A market that has been closed since yesterday
+    therefore kept whatever `_live` it last succeeded with, or none at all, and
+    the dashboard rendered it as data that was merely old rather than as a
+    market the fleet cannot read.
+
+    `ts` is deliberately NOT touched: it dates the FIGURES, and stamping it
+    here would make a market that has failed for six hours look freshly
+    measured. `err_ts` dates the failure, so the page can say both things.
+    """
+    live = st.spec.get("_live")
+    if not isinstance(live, dict):
+        live = {}
+        st.spec["_live"] = live
+    live["err"] = err
+    live["err_ts"] = now
+
+
 def visit(st: MarketState, bot_cfg, now: float,
           fleet_naked_usd: float = 0.0, committed_usd: float = 0.0,
           states=None) -> None:
@@ -599,6 +726,7 @@ def visit(st: MarketState, bot_cfg, now: float,
             # request: the loop's time budget is what the dashboard measures as
             # liveness, and a market that was closed ten seconds ago is not
             # worth re-asking about on every rotation.
+            _stamp_failure(st, now, st.err or "market unloadable (cooling down)")
             return
         st.market_retry_ts = now + MARKET_RETRY_SEC
         # Reward funding is not a loadability condition. The ranker already
@@ -613,6 +741,7 @@ def visit(st: MarketState, bot_cfg, now: float,
             # naming rewards sent an operator hunting a pot that was never the
             # problem.
             st.err = "closed / not accepting orders"
+            _stamp_failure(st, now, st.err)
             return
     m = st.market
 
@@ -621,6 +750,7 @@ def visit(st: MarketState, bot_cfg, now: float,
         dn = full_book(bot_cfg.clob_host, m.down_token)
     except Exception as e:
         st.err = f"book fetch: {e}"
+        _stamp_failure(st, now, st.err)
         return
     st.err = ""
 
@@ -725,8 +855,22 @@ def visit(st: MarketState, bot_cfg, now: float,
     stats = markout.per_market_stats(cfg.markout_min_sample).get(
         m.condition_id,
         {"verdict": "insufficient_sample", "mean_per_share": None, "n": 0})
+    # FLEET FALLBACK. A market with no verdict of its own used to hold
+    # `insufficient_sample` forever, and `gate.next_state` returns the state
+    # unchanged on that verdict -- so it sat at NORMAL for its whole life
+    # however badly the fleet as a whole was being picked off. Markets here
+    # rotate daily and almost none of them individually reach the sample.
+    #
+    # Only ever consulted when this market has nothing to say. A market with
+    # its own matured sample keeps its own verdict, including a GOOD one:
+    # the fleet reading must not overrule a market that has demonstrably
+    # earned, or one bad universe would evict its own survivors.
+    # The fleet fallback and its WIDENED cap live in `_gate_with_fleet_fallback`
+    # rather than inline here, and outside `gate.next_state` -- the state
+    # machine stays a pure function of one market's stats and knows nothing
+    # about where they came from.
     prev_gate = st.gate
-    st.gate = gate.next_state(st.gate, stats, cfg)
+    st.gate, stats = _gate_with_fleet_fallback(st.gate, stats, cfg)
     st.markout = stats
     # Persist the moment we give up on a market, and only that moment. Writing
     # every cycle would be one DB write per market per sweep for a value that
@@ -967,9 +1111,27 @@ def visit(st: MarketState, bot_cfg, now: float,
             continue
         if qi.price <= 0:
             continue
-        size = min(qi.size, int(available / qi.price))
+        # PER-MARKET NOTIONAL CAP. `max_cost_per_market` was enforced only in
+        # quotes.py, against `inv.cost` -- the inventory we ALREADY hold -- and
+        # additionally only on the heavy side (`and mine >= theirs`). Both
+        # readings are post-hoc: a market holding nothing has inv.cost 0, so a
+        # first order of any size passes. Measured 2026-08-02, one 900-share
+        # order rested and filled in a single print for $792 against a $400
+        # cap, on a market whose inventory was empty when it was posted.
+        #
+        # The binding quantity is what we hold PLUS what this order would add,
+        # and it has to be checked here, where the size is actually chosen.
+        # Sized down rather than skipped: a market at $380 of $400 can still
+        # carry a smaller order, and the min_quote_shares floor below already
+        # refuses the remainder if what is left cannot score.
+        room = max(cfg.max_cost_per_market - st.inv.cost, 0.0)
+        size = _affordable_rest_size(qi.size, qi.price, available, room)
         if size < cfg.min_quote_shares:
-            budget_blocked.append(f"{qi.side}: committed cap leaves "
+            # Name which cap bound. An operator reading "leaves 0sh" has to be
+            # able to tell a fleet-wide wallet limit from this market's own
+            # cost cap, or the dashboard shows a dead market with no cause.
+            which = ("market cost cap" if room <= available else "committed cap")
+            budget_blocked.append(f"{qi.side}: {which} leaves "
                                  f"{size:.0f}sh < {cfg.min_quote_shares} minimum")
             continue
         book = up if qi.side == "UP" else dn
@@ -1114,6 +1276,9 @@ def main() -> None:
     gap = 2.0 / REQ_PER_SEC
     i = 0
     last_rerank = time.time()
+    # The universe we are actually trading, dated. Adoption is driven by this
+    # changing rather than by the interval alone -- see `specs_mtime`.
+    specs_mtime_seen = specs_mtime()
     # Deliberately 0.0 rather than `now`: a fleet that has just restarted is
     # exactly when the unresolved set is most likely to contain markets that
     # closed while it was down, and waiting a full interval to notice keeps
@@ -1140,10 +1305,26 @@ def main() -> None:
         # but recording it first keeps the two views consistent within a cycle.
         last_resolve = _maybe_resolve(bot_cfg, last_resolve, now_ts)
 
-        if now_ts - last_rerank >= base.rerank_interval_sec:
+        # ADOPT WHEN THE FILE CHANGES, NOT ONLY WHEN THE TIMER FIRES. The
+        # ranker's write IS the event; the interval is now just a floor that
+        # keeps the old behaviour if the file is rewritten with identical
+        # content. Waiting for the timer meant a fleet restarted specifically
+        # to pick up a fresh universe traded the stale one for a full hour.
+        mtime = specs_mtime()
+        if (now_ts - last_rerank >= base.rerank_interval_sec
+                or (mtime and mtime != specs_mtime_seen)):
+            if mtime != specs_mtime_seen:
+                log.info("RERANK adopting markets.json rewritten %.0fs ago",
+                         max(0.0, now_ts - mtime))
             last_rerank = now_ts
             try:
                 fresh = {s["cid"]: s for s in load_specs()}
+                # Marked seen only once it PARSED. A read that caught the
+                # ranker mid-write raises here, and recording the mtime before
+                # that would retire the trigger for a file we never adopted --
+                # the fleet would then wait out the full interval holding the
+                # universe it was trying to replace.
+                specs_mtime_seen = mtime
                 known = {s.cid for s in states}
                 by_cid = {s.cid: s for s in states}
                 for cid, spec in fresh.items():

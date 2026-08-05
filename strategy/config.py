@@ -103,7 +103,26 @@ class MakerConfig:
     markout_horizons: tuple[float, ...] = (300.0, 3600.0, 21600.0)
     # Below this many fills the mean is dominated by noise on a thin book, and
     # evicting a sound market on noise costs real rent.
-    markout_min_sample: int = 20
+    #
+    # Was 20, which was unreachable. Measured over the 2026-08-02 fleet run:
+    # 58 fills produced 47 markout rows across 18 markets, and the BEST
+    # sampled market matured 7. `per_market_stats` therefore returned
+    # `insufficient_sample` for every market on every cycle, `next_state`
+    # returns the state unchanged on that verdict, and `gate_state` stayed
+    # NORMAL for the entire run -- `market_gate` finished with zero rows. A
+    # gate that cannot fire is not a conservative gate, it is an absent one.
+    # 8 keeps a real noise floor while letting the state machine run.
+    markout_min_sample: int = 8
+    # FLEET-WIDE markout sample. The per-market number above is thin by
+    # nature on a universe that rotates daily, so a market can be toxic for
+    # its whole life without ever qualifying for a verdict of its own. The
+    # fleet aggregate matures far faster -- n=42 against a per-market best of
+    # 7 on the same run -- so a market with no verdict of its own inherits
+    # the fleet's rather than defaulting to NORMAL.
+    #
+    # Higher than the per-market floor on purpose: this reading gates every
+    # market at once, so acting on it early is the more expensive mistake.
+    markout_fleet_min_sample: int = 25
     # Half the ~1c edge a paired quote earns: losing more than this per share
     # means the fill was unprofitable before inventory risk even starts.
     markout_widen_threshold: float = -0.005
@@ -123,6 +142,22 @@ class MakerConfig:
     marginal_return_floor: float = 0.02
     # Leave wallet headroom for inventory and order-lifecycle timing.
     allocation_budget: float = 900.0
+    # Ceiling on any ONE market's share of that budget.
+    #
+    # The water-fill was written as a diversifier and is not one. `marginal`
+    # is daily*T/(capital+T)^2, which is nearly FLAT in capital whenever
+    # competitor depth T dominates our size -- so the argmax never changes
+    # and a single market absorbs every increment. Measured 2026-08-02: one
+    # market took the full $900 budget, `shares_for` turned it into a
+    # 900-share order, and it filled in one print for $792 -- 79% of a
+    # $1,000 wallet, 1.98x the $400 per-market cost cap.
+    #
+    # 0.15 puts the floor at roughly seven concurrently funded markets. That
+    # number is set by the variance, not by taste: per-fill markout measured
+    # -$7.58 with a standard deviation of $56.68, so at full concentration a
+    # single fill moves the book by more than the entire expected edge of a
+    # hundred fills and no mean is readable at any sample size.
+    max_market_frac: float = 0.15
     # Set per-market by the fleet each cycle: NORMAL | WIDENED | EXITED.
     gate_state: str = "NORMAL"
 
