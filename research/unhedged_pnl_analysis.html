@@ -1,0 +1,5145 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ניתוח זליגת P&amp;L — Maker Fleet</title>
+<style>
+:root{
+  --bg:#0b0e14; --panel:#121722; --line:#232c3d;
+  --fg:#e6edf7; --dim:#8b97ad; --dim2:#5c6880;
+  --good:#3fb950; --bad:#f85149; --warn:#d29922; --info:#58a6ff; --acc:#bc8cff;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);
+  font-family:"Segoe UI",system-ui,-apple-system,sans-serif;line-height:1.65;
+  font-size:15px}
+.wrap{max-width:1180px;margin:0 auto;padding:32px 20px 80px}
+h1{font-size:30px;margin:0 0 6px;letter-spacing:-.4px}
+h2{font-size:21px;margin:56px 0 4px;padding-top:20px;border-top:1px solid var(--line)}
+h3{font-size:16px;margin:28px 0 8px;color:var(--fg)}
+.sub{color:var(--dim);margin:0 0 28px;font-size:14px}
+.mono{font-family:"Cascadia Mono",Consolas,monospace;font-variant-numeric:tabular-nums}
+.num{font-family:"Cascadia Mono",Consolas,monospace;font-variant-numeric:tabular-nums;direction:ltr;display:inline-block}
+p{margin:10px 0}
+.good{color:var(--good)} .bad{color:var(--bad)} .warn{color:var(--warn)}
+.dim{color:var(--dim)} .info{color:var(--info)} .acc{color:var(--acc)}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(178px,1fr));gap:12px;margin:20px 0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+.card .k{font-size:11.5px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px}
+.card .v{font-size:25px;font-weight:600;margin-top:3px;direction:ltr;text-align:right;
+  font-family:"Cascadia Mono",Consolas,monospace;font-variant-numeric:tabular-nums}
+.card .n{font-size:12px;color:var(--dim2);margin-top:2px}
+
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:18px 20px;margin:18px 0}
+.chart{width:100%;overflow-x:auto}
+svg{display:block;max-width:100%;height:auto}
+svg text{font-family:"Cascadia Mono",Consolas,monospace;fill:var(--dim)}
+
+.note{border:1px solid #1e3350;background:#0f1826;padding:12px 15px;
+  margin:14px 0;border-radius:8px;font-size:14px}
+.note.bad{border-color:#43201f;background:#1d1113}
+.note.good{border-color:#1c3524;background:#0f1a12}
+.note.warn{border-color:#3d2f0d;background:#1c1709}
+.note b{color:var(--fg)}
+.lbl{display:inline-block;font-size:11px;padding:1px 7px;border-radius:20px;
+  border:1px solid var(--line);color:var(--dim);margin-inline-start:6px;vertical-align:middle}
+
+table{width:100%;border-collapse:collapse;font-size:13px;margin:12px 0}
+th,td{padding:6px 9px;border-bottom:1px solid var(--line);text-align:right}
+th{color:var(--dim);font-weight:500;font-size:11.5px;text-transform:uppercase;
+  letter-spacing:.5px;position:sticky;top:0;background:var(--panel);z-index:1}
+td.n{font-family:"Cascadia Mono",Consolas,monospace;font-variant-numeric:tabular-nums;direction:ltr}
+tr.flag td{background:#1d1113}
+tr.flag2 td{background:#1c1709}
+.scroll{max-height:520px;overflow:auto;border:1px solid var(--line);border-radius:10px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:var(--dim);margin:8px 0 0}
+.legend i{width:11px;height:11px;border-radius:3px;display:inline-block;
+  margin-inline-end:5px;vertical-align:-1px}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:820px){.two{grid-template-columns:1fr}}
+code{background:#1b2130;padding:1px 5px;border-radius:4px;font-size:13px;
+  font-family:"Cascadia Mono",Consolas,monospace;direction:ltr;display:inline-block}
+ul{margin:8px 0;padding-inline-start:22px} li{margin:5px 0}
+.tt{font-size:12px;color:var(--dim2);margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>היכן נזל הכסף — ניתוח פורנזי של ה-Unhedged Drag</h1>
+<p class="sub" id="sub"></p>
+
+<div id="app"></div>
+
+<h2>נספח: מקורות הנתונים</h2>
+<div class="panel">
+<p class="dim" style="font-size:13.5px">
+כל מספר במסמך נגזר משני מקורות בלבד, בקריאה בלבד:
+<code>run/fleet.db</code> (טבלאות <code>fills</code>, <code>markouts</code>, <code>quotes</code>,
+<code>closes</code>, <code>resolutions</code>) ו-<code>run/fleet_state.json</code>
+(פוזיציות חיות: <code>naked_sh</code>, <code>naked_cost</code>, <code>up_bid</code>,
+<code>dn_bid</code>, <code>paired</code>, <code>pair_paid</code>).
+הגדרות ה-P&amp;L זהות בדיוק לאלה של <code>server/fleet_dash.py</code> — כדי שהמסמך והדשבורד
+לא יוכלו לסתור זה את זה. ה-Drift מחושב כ-<code>mid_later − ref_mid</code>
+לפי <code>strategy/markout.py:drift_per_share</code>, כלומר <b>ללא</b> ה-offset שלנו מתחת ל-mid.
+</p>
+</div>
+
+</div>
+<script>
+const DATA = {
+ "totals": {
+  "now": 1785916641.76064,
+  "realized": 116.33104053060083,
+  "paired_float": -32.60799255508517,
+  "at_risk": 345.32583925551575,
+  "naked_exit": 122.00898159300006,
+  "unhedged_float": -223.31685766251567,
+  "naked_win_case": 168.5868637444843,
+  "naked_lose_case": -345.32583925551575,
+  "markets": 23,
+  "fills": 57,
+  "quotes": 10853,
+  "closes": 9,
+  "resolutions": 16,
+  "cost": 2063.56347324,
+  "fills_span_h": 40.9032171954049,
+  "liquidation": -139.593809687
+ },
+ "live": [
+  {
+   "cid": "0x7b02186cfb0200f6db3c8cf645334a94e13e4efe0015f3616e632647f088b93c",
+   "slug": "wta-kalinsk-kessler-2026-08-04",
+   "title": "National Bank Open: Anna Kalinskaya vs McCartney Kessler",
+   "days_to_resolve": 6.87,
+   "volume_24h": 535179.22,
+   "gate": "WIDENED",
+   "up_sh": 14.0,
+   "dn_sh": 107.41,
+   "up_avg": 0.48,
+   "dn_avg": 0.54,
+   "paired": 14.0,
+   "pair_paid": 14.280000000000001,
+   "paired_float": -0.28000000000000114,
+   "naked_side": "DOWN",
+   "naked_sh": 93.41,
+   "naked_cost": 50.4414,
+   "naked_exit": 0.0,
+   "naked_float": -50.4414,
+   "mark": "unreadable",
+   "up_bid": 0.999,
+   "up_ask": null,
+   "dn_bid": null,
+   "dn_ask": 0.001,
+   "sides_readable": 0,
+   "markout": -0.045202702702702706,
+   "markout_n": 37,
+   "fills": 2,
+   "why": "outcome decided -- holding 121 DOWN, awaiting settlement",
+   "close_why": "no two-sided book",
+   "merge_why": "hold: 2.00c/sh over parity exceeds the 1.00c cap -- velocity not evaluated",
+   "pairing_rate": 0.0,
+   "naked_win": 42.968599999999995,
+   "naked_lose": -50.4414
+  },
+  {
+   "cid": "0xe493e01d21535bfd02a4a8957015288abce314a9b489ee3ec7ae797e6df30b4e",
+   "slug": "lol-maz-mg1-2026-08-04",
+   "title": "LoL: Maze Gaming vs Malvinas Gaming (BO5) - LRS Playoffs",
+   "days_to_resolve": 0.08,
+   "volume_24h": 31904.65,
+   "gate": "WIDENED",
+   "up_sh": 233.39729599999998,
+   "dn_sh": 0.0,
+   "up_avg": 0.8151936731949114,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "UP",
+   "naked_sh": 233.39729599999998,
+   "naked_cost": 190.26399904,
+   "naked_exit": 0.0,
+   "naked_float": -190.26399904,
+   "mark": "unreadable",
+   "up_bid": null,
+   "up_ask": null,
+   "dn_bid": null,
+   "dn_ask": null,
+   "sides_readable": 0,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 2,
+   "why": "UP: no two-sided book; DOWN: no two-sided book",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": 0.0,
+   "naked_win": 43.133296959999996,
+   "naked_lose": -190.26399904
+  },
+  {
+   "cid": "0x975e068bb98f4a0fccdecea1b1cc5feb1f3774cc23f2d683449eff3b63dd1fda",
+   "slug": "clf-vil-lu-2026-08-05-total-0pt5",
+   "title": "CF Villarreal C vs. Levante UD: O/U 0.5",
+   "days_to_resolve": 0.04,
+   "volume_24h": 49634.67,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.95,
+   "up_ask": 0.96,
+   "dn_bid": 0.04,
+   "dn_ask": 0.05,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0xfd5d06a9a3782e73859ea1bbcfc729b88f92da9a117f0550ac450d11efd46b28",
+   "slug": "elon-musk-of-tweets-july-31-august-7-160-179",
+   "title": "Will Elon Musk post 160-179 tweets from July 31 to August 7, 2026?",
+   "days_to_resolve": 2.37,
+   "volume_24h": 42299.7,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.18,
+   "up_ask": 0.181,
+   "dn_bid": 0.819,
+   "dn_ask": 0.82,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0xa3abb41b7c84b9a4d34afe02c850c844284bbd12947939367e6ad55f853e6509",
+   "slug": "clf-vil-lu-2026-08-05-exact-score-0-0",
+   "title": "Exact Score: CF Villarreal C 0 - 0 Levante UD?",
+   "days_to_resolve": 0.04,
+   "volume_24h": 116269.0,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.061,
+   "up_ask": 0.077,
+   "dn_bid": 0.923,
+   "dn_ask": 0.939,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0x6c1f3473f35702f00796b4ade45689570c86e933497501b99f81762be94ccf4e",
+   "slug": "clf-vil-lu-2026-08-05-total-5pt5",
+   "title": "CF Villarreal C vs. Levante UD: O/U 5.5",
+   "days_to_resolve": 0.04,
+   "volume_24h": 35647.61,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.1,
+   "up_ask": 0.11,
+   "dn_bid": 0.89,
+   "dn_ask": 0.9,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0xc5fac43fb2ceb6e88c4badb230421d6f5f3a3cdfe170d5b5469445d1747d960d",
+   "slug": "elon-musk-of-tweets-july-31-august-7-180-199",
+   "title": "Will Elon Musk post 180-199 tweets from July 31 to August 7, 2026?",
+   "days_to_resolve": 2.37,
+   "volume_24h": 29867.93,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.41,
+   "up_ask": 0.42,
+   "dn_bid": 0.58,
+   "dn_ask": 0.59,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0xa16d0696a3cedc7d8faeb1e03eb036bddccc3cae473b0604c19548f7ca7d480a",
+   "slug": "bitcoin-up-or-down-on-august-5-2026",
+   "title": "Bitcoin Up or Down on August 5?",
+   "days_to_resolve": 0.37,
+   "volume_24h": 89420.43,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.46,
+   "up_ask": 0.47,
+   "dn_bid": 0.53,
+   "dn_ask": 0.54,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0xa949b772fc184ba556271d1de621a5654382e2d310d549ae25bb50d5fc6c6de1",
+   "slug": "clf-vil-lu-2026-08-05-draw",
+   "title": "Will CF Villarreal C vs. Levante UD end in a draw?",
+   "days_to_resolve": 0.04,
+   "volume_24h": 43426.39,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.28,
+   "up_ask": 0.29,
+   "dn_bid": 0.71,
+   "dn_ask": 0.72,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0xa07afa604d35aa9defce63ed7ec32f8b0514aa423a12e87ff3f6771479d21672",
+   "slug": "cs2-js1-bca-2026-08-05",
+   "title": "Counter-Strike: Johnny Speeds vs Betclic Apogee Esports (BO3) - Stake Pulse Beat I Playoff",
+   "days_to_resolve": 0.37,
+   "volume_24h": 78042.78,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.43,
+   "up_ask": 0.44,
+   "dn_bid": 0.56,
+   "dn_ask": 0.57,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "slug": "mlb-tb-col-2026-08-04",
+   "title": "Tampa Bay Rays vs. Colorado Rockies",
+   "days_to_resolve": 6.9,
+   "volume_24h": 569022.02,
+   "gate": "WIDENED",
+   "up_sh": 205.0,
+   "dn_sh": 135.0,
+   "up_avg": 0.45439024390243904,
+   "dn_avg": 0.68,
+   "paired": 135.0,
+   "pair_paid": 153.14268292682928,
+   "paired_float": -18.14268292682928,
+   "naked_side": "UP",
+   "naked_sh": 70.0,
+   "naked_cost": 31.807317073170733,
+   "naked_exit": 69.93,
+   "naked_float": 38.12268292682927,
+   "mark": "bid",
+   "up_bid": 0.999,
+   "up_ask": null,
+   "dn_bid": null,
+   "dn_ask": 0.001,
+   "sides_readable": 0,
+   "markout": -0.0525625,
+   "markout_n": 40,
+   "fills": 3,
+   "why": "outcome decided -- holding 340 UP, awaiting settlement",
+   "close_why": "no two-sided book",
+   "merge_why": "hold: 13.44c/sh over parity exceeds the 1.00c cap -- velocity not evaluated",
+   "pairing_rate": 0.0,
+   "naked_win": 38.192682926829264,
+   "naked_lose": -31.807317073170733
+  },
+  {
+   "cid": "0x2cea3b76ed5f00d19f275e88bd16f759a7a481c72888ec3965ef85a80ed76717",
+   "slug": "bitcoin-above-64k-on-august-5-2026",
+   "title": "Will the price of Bitcoin be above $64,000 on August 5?",
+   "days_to_resolve": 0.37,
+   "volume_24h": 26366.17,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.55,
+   "up_ask": 0.56,
+   "dn_bid": 0.44,
+   "dn_ask": 0.45,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "title": "LoL: Dplus KIA Challengers vs Nongshim Esports Academy (BO3) - LCK Challengers League Roun",
+   "days_to_resolve": 0.16,
+   "volume_24h": 173269.23,
+   "gate": "WIDENED",
+   "up_sh": 7.41,
+   "dn_sh": 72.58,
+   "up_avg": 0.91,
+   "dn_avg": 0.4683383852300909,
+   "paired": 7.41,
+   "pair_paid": 10.213487434554974,
+   "paired_float": -2.803487434554974,
+   "naked_side": "DOWN",
+   "naked_sh": 65.17,
+   "naked_cost": 30.521612565445025,
+   "naked_exit": 0.19551000000000018,
+   "naked_float": -30.326102565445026,
+   "mark": "bid",
+   "up_bid": 0.996,
+   "up_ask": 0.997,
+   "dn_bid": 0.003,
+   "dn_ask": 0.004,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 6,
+   "why": "UP: committed cap leaves 0sh < 5 minimum",
+   "close_why": "hold: net -41.33c/sh under -0.50c [capital scarce]",
+   "merge_why": "hold: 37.83c/sh over parity exceeds the 1.00c cap -- velocity not evaluated",
+   "pairing_rate": 0.055561729081009,
+   "naked_win": 34.64838743455498,
+   "naked_lose": -30.521612565445025
+  },
+  {
+   "cid": "0x65b7ed8d9cf83e14a02c99ef51a3f9bdaa79bdbccd299e072ea53d370d903c8d",
+   "slug": "lol-sha-dia3-2026-08-05",
+   "title": "LoL: Shark Attack vs DIA Ozarox Esports (BO3) - TCL Play-Ins",
+   "days_to_resolve": 0.56,
+   "volume_24h": 33355.7,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.24,
+   "up_ask": 0.26,
+   "dn_bid": 0.74,
+   "dn_ask": 0.76,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0x3556f8790c6f28a9f61d4b41c5c1b8c09d4f01c4d6cba7be50438b6f1c17bf24",
+   "slug": "lol-bro2-ns-2026-08-05-game-handicap-home-1pt5",
+   "title": "Game Handicap: NS (-1.5) vs HANJIN BRION (+1.5)",
+   "days_to_resolve": 0.29,
+   "volume_24h": 66139.99,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.44,
+   "up_ask": 0.45,
+   "dn_bid": 0.55,
+   "dn_ask": 0.56,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0xf57902fb236a32a52a6230e8c7c46d0ecd13cd04b43fb48064007666b0ef1ce5",
+   "slug": "dota2-1win-bb4-2026-08-05",
+   "title": "Dota 2: 1win vs BetBoom Team (BO3) - 1win Essence Playoffs",
+   "days_to_resolve": 0.33,
+   "volume_24h": 1133109.87,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.46,
+   "up_ask": 0.47,
+   "dn_bid": 0.53,
+   "dn_ask": 0.54,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "UP: committed cap leaves 0sh < 5 minimum; DOWN: committed cap leaves 0sh < 5 minimum",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0x15729342cc865cb9d96f9d1b91464a489125bc70c6cc0569fe0d5d214a7fcece",
+   "slug": "cs2-ntr-cyb-2026-08-05",
+   "title": "Counter-Strike: Nuclear TigeRES vs CYBERSHOKE Prospects (BO3) - NODWIN Clutch Series Playo",
+   "days_to_resolve": 0.54,
+   "volume_24h": 35709.66,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.73,
+   "up_ask": 0.74,
+   "dn_bid": 0.26,
+   "dn_ask": 0.27,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0x1a1b583bc9c778eb169b2bc78a04630a50398be880548276804c5e2a05f4eaa9",
+   "slug": "lol-dkc-nsea-2026-08-05-game1",
+   "title": "LoL: Dplus KIA Challengers vs Nongshim Esports Academy - Game 1 Winner",
+   "days_to_resolve": 0.08,
+   "volume_24h": 66570.65,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.002,
+   "up_ask": 0.009,
+   "dn_bid": 0.991,
+   "dn_ask": 0.998,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "title": "LoL: BNK FearX Youth vs Kiwoom DRX Challengers (BO3) - LCK Challengers League Rounds 3-4 T",
+   "days_to_resolve": 0.16,
+   "volume_24h": 93110.1,
+   "gate": "WIDENED",
+   "up_sh": 135.0,
+   "dn_sh": 186.93540700000005,
+   "up_avg": 0.27,
+   "dn_avg": 0.8143097940274143,
+   "paired": 135.0,
+   "pair_paid": 146.3818221937009,
+   "paired_float": -11.381822193700913,
+   "naked_side": "DOWN",
+   "naked_sh": 51.935407000000055,
+   "naked_cost": 42.291510576899974,
+   "naked_exit": 51.88347159300005,
+   "naked_float": 9.591961016100079,
+   "mark": "bid",
+   "up_bid": null,
+   "up_ask": 0.001,
+   "dn_bid": 0.999,
+   "dn_ask": null,
+   "sides_readable": 0,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 8,
+   "why": "UP: no two-sided book; DOWN: no two-sided book",
+   "close_why": "no two-sided book",
+   "merge_why": "hold: 8.43c/sh over parity exceeds the 1.00c cap -- velocity not evaluated",
+   "pairing_rate": 0.25682264191073856,
+   "naked_win": 9.643896423100081,
+   "naked_lose": -42.291510576899974
+  },
+  {
+   "cid": "0xa6d016ba329b99b89bc4170baa70fa24420a8e09860e39dacddc6471c0641884",
+   "slug": "dota2-tr7-re-2026-08-05",
+   "title": "Dota 2: Team Resilience vs Rune Eaters (BO3) - Games of the Future Playoffs",
+   "days_to_resolve": 0.29,
+   "volume_24h": 35271.56,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.45,
+   "up_ask": 0.46,
+   "dn_bid": 0.54,
+   "dn_ask": 0.55,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0xdf81e7d8988eb38bea52982e1ce34fc08ea197993c103b4e28535924f6ffd2db",
+   "slug": "cs2-tl1-fnc-2026-08-05",
+   "title": "Counter-Strike: Liquid vs fnatic (BO3) - Stake Pulse Beat I Playoffs",
+   "days_to_resolve": 0.5,
+   "volume_24h": 57933.59,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.65,
+   "up_ask": 0.66,
+   "dn_bid": 0.34,
+   "dn_ask": 0.35,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0xc1714a28decf72cdfa86c4c7421c3002bcfed119f79ad527e5cc96e833738e1b",
+   "slug": "lol-hle1-gen-2026-08-05",
+   "title": "LoL: Hanwha Life Esports vs Gen.G (BO3) - LCK Round 3-4 Legend Group",
+   "days_to_resolve": 0.37,
+   "volume_24h": 223642.24,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.51,
+   "up_ask": 0.52,
+   "dn_bid": 0.48,
+   "dn_ask": 0.49,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  },
+  {
+   "cid": "0x86042c6d2bedc0752e60a3a590cdbc0e57d82a0996a46a171109eed0a7c1f479",
+   "slug": "uel-pao1-and-2026-08-06-pao1",
+   "title": "Will PAOK win on 2026-08-06?",
+   "days_to_resolve": 1.44,
+   "volume_24h": 28816.47,
+   "gate": "WIDENED",
+   "up_sh": 0.0,
+   "dn_sh": 0.0,
+   "up_avg": 0.0,
+   "dn_avg": 0.0,
+   "paired": 0.0,
+   "pair_paid": 0.0,
+   "paired_float": 0.0,
+   "naked_side": "",
+   "naked_sh": 0.0,
+   "naked_cost": 0.0,
+   "naked_exit": 0.0,
+   "naked_float": 0.0,
+   "mark": "flat",
+   "up_bid": 0.55,
+   "up_ask": 0.56,
+   "dn_bid": 0.44,
+   "dn_ask": 0.45,
+   "sides_readable": 2,
+   "markout": -0.052375,
+   "markout_n": 52,
+   "fills": 0,
+   "why": "unfunded by the allocator -- quoting nothing",
+   "close_why": "no paired shares",
+   "merge_why": "no paired shares",
+   "pairing_rate": null,
+   "naked_win": 0.0,
+   "naked_lose": -0.0
+  }
+ ],
+ "realized_rows": [
+  {
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "pnl": 50.098802169999956,
+   "cost": 184.85119783000005,
+   "kind": "settled",
+   "closes": 1,
+   "closed_pnl": 29.748495292127654
+  },
+  {
+   "cid": "0xa3bd770f42c926f9b4b9435068cb2472a7a106b77da66bb4521bf483d1cb4d85",
+   "slug": "lol-rs-deer-2026-08-03",
+   "pnl": -4.25,
+   "cost": 4.25,
+   "kind": "settled",
+   "closes": 0,
+   "closed_pnl": 0.0
+  },
+  {
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "pnl": -31.423900000000007,
+   "cost": 115.3739,
+   "kind": "settled",
+   "closes": 1,
+   "closed_pnl": 22.2221237113402
+  },
+  {
+   "cid": "0x2498c20721a62f1ff81a432a2c85f98af1d598ba4a8ab1cc258b0405cf10c67f",
+   "slug": "cs2-mouzn-mis-2026-08-03",
+   "pnl": -41.98201309999999,
+   "cost": 151.7407981,
+   "kind": "settled",
+   "closes": 0,
+   "closed_pnl": 0.0
+  },
+  {
+   "cid": "0xda75a4a463bd90f0a3bea1b9a0cc29db8475cebce79954f6f827c362dd908542",
+   "slug": "will-bitcoin-dip-to-62k-on-august-3",
+   "pnl": 4.900320000000009,
+   "cost": 130.04968,
+   "kind": "settled",
+   "closes": 1,
+   "closed_pnl": 0.3179200000000016
+  },
+  {
+   "cid": "0x8992f7316a12ca75e5a25c92721f402bdd3b1ee92610d1a9d8f581af3e9143c2",
+   "slug": "wta-boisson-ruzic-2026-08-02",
+   "pnl": 4.2,
+   "cost": 1.7999999999999998,
+   "kind": "settled",
+   "closes": 0,
+   "closed_pnl": 0.0
+  },
+  {
+   "cid": "0x88d2251f33c6e5745edc2424a79578fcbd289667790514b04da8a0392154e539",
+   "slug": "atp-zheng-kecmano-2026-08-02",
+   "pnl": -23.9232,
+   "cost": 23.9232,
+   "kind": "settled",
+   "closes": 0,
+   "closed_pnl": 0.0
+  },
+  {
+   "cid": "0x700dceb5257c664de091156f768a4024e2817ad1b41ca7302efdee9e6ebd6a69",
+   "slug": "elon-musk-of-tweets-july-28-august-4-240-259",
+   "pnl": -8.956799999999998,
+   "cost": 8.956799999999998,
+   "kind": "settled",
+   "closes": 0,
+   "closed_pnl": 0.0
+  },
+  {
+   "cid": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "slug": "elon-musk-of-tweets-july-28-august-4-220-239",
+   "pnl": 68.34159999999999,
+   "cost": 193.3884,
+   "kind": "settled",
+   "closes": 1,
+   "closed_pnl": 28.681515012605995
+  },
+  {
+   "cid": "0xfd08056dee526375e4a4ec411cd1dc0026ca76413a7ee135a658b6a8e8f219b9",
+   "slug": "elon-musk-of-tweets-july-28-august-4-200-219",
+   "pnl": -3.1204,
+   "cost": 3.1204,
+   "kind": "settled",
+   "closes": 0,
+   "closed_pnl": 0.0
+  },
+  {
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "pnl": 32.391999999999996,
+   "cost": 289.608,
+   "kind": "settled",
+   "closes": 0,
+   "closed_pnl": 0.0
+  },
+  {
+   "cid": "0xdf4aaa4d15ba71baed89b18edc53f8b05d2611320f674ea0ed5a1e34753592b3",
+   "slug": "atp-shang-rublev-2026-08-04",
+   "pnl": -11.9,
+   "cost": 11.9,
+   "kind": "settled",
+   "closes": 0,
+   "closed_pnl": 0.0
+  },
+  {
+   "cid": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "slug": "cs2-gls1-meiano-2026-08-04",
+   "pnl": 42.2,
+   "cost": 127.75,
+   "kind": "settled",
+   "closes": 1,
+   "closed_pnl": 30.999999999999996
+  },
+  {
+   "cid": "0xe493e01d21535bfd02a4a8957015288abce314a9b489ee3ec7ae797e6df30b4e",
+   "slug": "lol-maz-mg1-2026-08-04",
+   "pnl": 43.133296959999996,
+   "cost": 190.26399904,
+   "kind": "settled",
+   "closes": 0,
+   "closed_pnl": 0.0
+  },
+  {
+   "cid": "0x7b02186cfb0200f6db3c8cf645334a94e13e4efe0015f3616e632647f088b93c",
+   "slug": "wta-kalinsk-kessler-2026-08-04",
+   "pnl": -50.7214,
+   "cost": 64.7214,
+   "kind": "settled",
+   "closes": 0,
+   "closed_pnl": 0.0
+  },
+  {
+   "cid": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "slug": "mlb-tb-col-2026-08-04",
+   "pnl": 20.049999999999983,
+   "cost": 184.95000000000002,
+   "kind": "settled",
+   "closes": 0,
+   "closed_pnl": 0.0
+  },
+  {
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "pnl": 0.5499999999999996,
+   "cost": 4.4,
+   "kind": "closed_unresolved",
+   "closes": 1,
+   "closed_pnl": 0.5499999999999996
+  },
+  {
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "pnl": 26.7427345006009,
+   "cost": 143.1072654993991,
+   "kind": "closed_unresolved",
+   "closes": 3,
+   "closed_pnl": 26.7427345006009
+  }
+ ],
+ "markouts": [
+  {
+   "ts": 1785767635.2963874,
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "side": "DOWN",
+   "fill_price": 0.52,
+   "size": 100.0,
+   "ref_mid": 0.54,
+   "src": "venue_clean",
+   "h0": 0.06999999999999995,
+   "h1": -0.040000000000000036,
+   "h2": null,
+   "last_drift": -0.040000000000000036,
+   "horizons_matured": 2,
+   "total_markout": -0.020000000000000018,
+   "capture": 0.020000000000000018,
+   "age_h": 41.39068451457553,
+   "done": 0
+  },
+  {
+   "ts": 1785767683.6773078,
+   "cid": "0xa3bd770f42c926f9b4b9435068cb2472a7a106b77da66bb4521bf483d1cb4d85",
+   "slug": "lol-rs-deer-2026-08-03",
+   "side": "UP",
+   "fill_price": 0.85,
+   "size": 5.0,
+   "ref_mid": 0.87,
+   "src": "venue_clean",
+   "h0": 0.0050000000000000044,
+   "h1": 0.0050000000000000044,
+   "h2": -0.867,
+   "last_drift": -0.867,
+   "horizons_matured": 3,
+   "total_markout": -0.847,
+   "capture": 0.020000000000000018,
+   "age_h": 41.37724537001716,
+   "done": 1
+  },
+  {
+   "ts": 1785767942.8505037,
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "side": "DOWN",
+   "fill_price": 0.58,
+   "size": 135.0,
+   "ref_mid": 0.61,
+   "src": "venue_clean",
+   "h0": -0.03500000000000003,
+   "h1": -0.185,
+   "h2": null,
+   "last_drift": -0.185,
+   "horizons_matured": 2,
+   "total_markout": -0.15499999999999997,
+   "capture": 0.030000000000000027,
+   "age_h": 41.30525281561746,
+   "done": 0
+  },
+  {
+   "ts": 1785768090.0349941,
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "side": "UP",
+   "fill_price": 0.5,
+   "size": 135.0,
+   "ref_mid": 0.525,
+   "src": "venue_clean",
+   "h0": 0.05999999999999994,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.05999999999999994,
+   "horizons_matured": 1,
+   "total_markout": 0.08499999999999996,
+   "capture": 0.025000000000000022,
+   "age_h": 41.26436823493905,
+   "done": 0
+  },
+  {
+   "ts": 1785768699.9175231,
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "side": "UP",
+   "fill_price": 0.58,
+   "size": 32.21000000000001,
+   "ref_mid": 0.605,
+   "src": "venue_clean",
+   "h0": 0.010000000000000009,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.010000000000000009,
+   "horizons_matured": 1,
+   "total_markout": 0.03500000000000003,
+   "capture": 0.025000000000000022,
+   "age_h": 41.094956421322294,
+   "done": 0
+  },
+  {
+   "ts": 1785769612.7978463,
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "side": "UP",
+   "fill_price": 0.69,
+   "size": 7.09,
+   "ref_mid": 0.73,
+   "src": "venue_clean",
+   "h0": 0.05500000000000005,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.05500000000000005,
+   "horizons_matured": 1,
+   "total_markout": 0.09500000000000008,
+   "capture": 0.040000000000000036,
+   "age_h": 40.841378553774625,
+   "done": 0
+  },
+  {
+   "ts": 1785769911.5351756,
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "side": "UP",
+   "fill_price": 0.75,
+   "size": 10.0,
+   "ref_mid": 0.785,
+   "src": "venue_clean",
+   "h0": 0.015000000000000013,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.015000000000000013,
+   "horizons_matured": 1,
+   "total_markout": 0.050000000000000044,
+   "capture": 0.03500000000000003,
+   "age_h": 40.758395962317785,
+   "done": 0
+  },
+  {
+   "ts": 1785770234.2650542,
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "side": "DOWN",
+   "fill_price": 0.2,
+   "size": 84.0,
+   "ref_mid": 0.2,
+   "src": "venue_clean",
+   "h0": -0.0050000000000000044,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.0050000000000000044,
+   "horizons_matured": 1,
+   "total_markout": -0.0050000000000000044,
+   "capture": 0.0,
+   "age_h": 40.668748773800004,
+   "done": 0
+  },
+  {
+   "ts": 1785771859.8243532,
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "side": "UP",
+   "fill_price": 0.58,
+   "size": 46.481378,
+   "ref_mid": 0.585,
+   "src": "venue_clean",
+   "h0": 0.015000000000000013,
+   "h1": -0.5529999999999999,
+   "h2": null,
+   "last_drift": -0.5529999999999999,
+   "horizons_matured": 2,
+   "total_markout": -0.5479999999999999,
+   "capture": 0.0050000000000000044,
+   "age_h": 40.21720452407996,
+   "done": 0
+  },
+  {
+   "ts": 1785771907.9232533,
+   "cid": "0x2498c20721a62f1ff81a432a2c85f98af1d598ba4a8ab1cc258b0405cf10c67f",
+   "slug": "cs2-mouzn-mis-2026-08-03",
+   "side": "UP",
+   "fill_price": 0.66,
+   "size": 104.75878500000002,
+   "ref_mid": 0.675,
+   "src": "venue_clean",
+   "h0": -0.29000000000000004,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.29000000000000004,
+   "horizons_matured": 1,
+   "total_markout": -0.275,
+   "capture": 0.015000000000000013,
+   "age_h": 40.203843718502256,
+   "done": 0
+  },
+  {
+   "ts": 1785772183.935759,
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "side": "UP",
+   "fill_price": 0.59,
+   "size": 7.464574999999996,
+   "ref_mid": 0.6,
+   "src": "venue_clean",
+   "h0": 0.025000000000000022,
+   "h1": -0.503,
+   "h2": null,
+   "last_drift": -0.503,
+   "horizons_matured": 2,
+   "total_markout": -0.493,
+   "capture": 0.010000000000000009,
+   "age_h": 40.12717357801066,
+   "done": 0
+  },
+  {
+   "ts": 1785773077.6152608,
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "side": "UP",
+   "fill_price": 0.63,
+   "size": 0.37761799999999823,
+   "ref_mid": 0.645,
+   "src": "venue_clean",
+   "h0": -0.010000000000000009,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.010000000000000009,
+   "horizons_matured": 1,
+   "total_markout": 0.0050000000000000044,
+   "capture": 0.015000000000000013,
+   "age_h": 39.87892927196291,
+   "done": 0
+  },
+  {
+   "ts": 1785774014.823596,
+   "cid": "0x2498c20721a62f1ff81a432a2c85f98af1d598ba4a8ab1cc258b0405cf10c67f",
+   "slug": "cs2-mouzn-mis-2026-08-03",
+   "side": "DOWN",
+   "fill_price": 0.59,
+   "size": 135.0,
+   "ref_mid": 0.675,
+   "src": "venue_clean",
+   "h0": -0.14500000000000002,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.14500000000000002,
+   "horizons_matured": 1,
+   "total_markout": -0.05999999999999994,
+   "capture": 0.08500000000000008,
+   "age_h": 39.618593623307014,
+   "done": 0
+  },
+  {
+   "ts": 1785774285.0907252,
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "side": "UP",
+   "fill_price": 0.17,
+   "size": 135.0,
+   "ref_mid": 0.19,
+   "src": "venue_clean",
+   "h0": 0.0050000000000000044,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.0050000000000000044,
+   "horizons_matured": 1,
+   "total_markout": 0.024999999999999994,
+   "capture": 0.01999999999999999,
+   "age_h": 39.54351942075623,
+   "done": 0
+  },
+  {
+   "ts": 1785775216.327536,
+   "cid": "0x2498c20721a62f1ff81a432a2c85f98af1d598ba4a8ab1cc258b0405cf10c67f",
+   "slug": "cs2-mouzn-mis-2026-08-03",
+   "side": "UP",
+   "fill_price": 0.59,
+   "size": 5.0,
+   "ref_mid": 0.715,
+   "src": "venue_clean",
+   "h0": null,
+   "h1": null,
+   "h2": null,
+   "last_drift": null,
+   "horizons_matured": 0,
+   "total_markout": null,
+   "capture": 0.125,
+   "age_h": 39.28484252883328,
+   "done": 0
+  },
+  {
+   "ts": 1785785230.2445548,
+   "cid": "0xda75a4a463bd90f0a3bea1b9a0cc29db8475cebce79954f6f827c362dd908542",
+   "slug": "will-bitcoin-dip-to-62k-on-august-3",
+   "side": "DOWN",
+   "fill_price": 0.96,
+   "size": 135.0,
+   "ref_mid": 0.9764999999999999,
+   "src": "venue_clean",
+   "h0": 0.0,
+   "h1": 0.007000000000000117,
+   "h2": 0.018500000000000072,
+   "last_drift": 0.018500000000000072,
+   "horizons_matured": 3,
+   "total_markout": 0.03500000000000003,
+   "capture": 0.01649999999999996,
+   "age_h": 36.50319891254107,
+   "done": 1
+  },
+  {
+   "ts": 1785786983.9038646,
+   "cid": "0x8992f7316a12ca75e5a25c92721f402bdd3b1ee92610d1a9d8f581af3e9143c2",
+   "slug": "wta-boisson-ruzic-2026-08-02",
+   "side": "DOWN",
+   "fill_price": 0.3,
+   "size": 6.0,
+   "ref_mid": 0.325,
+   "src": "venue_clean",
+   "h0": -0.04999999999999999,
+   "h1": 0.29,
+   "h2": null,
+   "last_drift": 0.29,
+   "horizons_matured": 2,
+   "total_markout": 0.315,
+   "capture": 0.025000000000000022,
+   "age_h": 36.016071326467724,
+   "done": 0
+  },
+  {
+   "ts": 1785788289.2644942,
+   "cid": "0xda75a4a463bd90f0a3bea1b9a0cc29db8475cebce79954f6f827c362dd908542",
+   "slug": "will-bitcoin-dip-to-62k-on-august-3",
+   "side": "UP",
+   "fill_price": 0.022,
+   "size": 20.44,
+   "ref_mid": 0.025500000000000002,
+   "src": "venue_clean",
+   "h0": -0.009000000000000001,
+   "h1": 0.0019999999999999983,
+   "h2": -0.021,
+   "last_drift": -0.021,
+   "horizons_matured": 3,
+   "total_markout": -0.017499999999999998,
+   "capture": 0.003500000000000003,
+   "age_h": 35.653471151590345,
+   "done": 1
+  },
+  {
+   "ts": 1785792057.2817535,
+   "cid": "0x88d2251f33c6e5745edc2424a79578fcbd289667790514b04da8a0392154e539",
+   "slug": "atp-zheng-kecmano-2026-08-02",
+   "side": "UP",
+   "fill_price": 0.56,
+   "size": 42.72,
+   "ref_mid": 0.575,
+   "src": "venue_clean",
+   "h0": 0.010000000000000009,
+   "h1": 0.010000000000000009,
+   "h2": null,
+   "last_drift": 0.010000000000000009,
+   "horizons_matured": 2,
+   "total_markout": 0.02499999999999991,
+   "capture": 0.014999999999999902,
+   "age_h": 34.60679969065719,
+   "done": 0
+  },
+  {
+   "ts": 1785821462.7109292,
+   "cid": "0x700dceb5257c664de091156f768a4024e2817ad1b41ca7302efdee9e6ebd6a69",
+   "slug": "elon-musk-of-tweets-july-28-august-4-240-259",
+   "side": "UP",
+   "fill_price": 0.12,
+   "size": 74.63999999999999,
+   "ref_mid": 0.165,
+   "src": "venue_clean",
+   "h0": -0.010000000000000009,
+   "h1": -0.1,
+   "h2": -0.1385,
+   "last_drift": -0.1385,
+   "horizons_matured": 3,
+   "total_markout": -0.0935,
+   "capture": 0.04500000000000001,
+   "age_h": 26.438624919652938,
+   "done": 1
+  },
+  {
+   "ts": 1785833962.2829776,
+   "cid": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "slug": "elon-musk-of-tweets-july-28-august-4-220-239",
+   "side": "UP",
+   "fill_price": 0.6,
+   "size": 135.0,
+   "ref_mid": 0.625,
+   "src": "venue_clean",
+   "h0": 0.010000000000000009,
+   "h1": 0.0,
+   "h2": 0.36650000000000005,
+   "last_drift": 0.36650000000000005,
+   "horizons_matured": 3,
+   "total_markout": 0.39150000000000007,
+   "capture": 0.025000000000000022,
+   "age_h": 22.96652157286803,
+   "done": 1
+  },
+  {
+   "ts": 1785834111.6431086,
+   "cid": "0xfd08056dee526375e4a4ec411cd1dc0026ca76413a7ee135a658b6a8e8f219b9",
+   "slug": "elon-musk-of-tweets-july-28-august-4-200-219",
+   "side": "UP",
+   "fill_price": 0.316,
+   "size": 4.4,
+   "ref_mid": 0.3405,
+   "src": "venue_clean",
+   "h0": -0.0045000000000000595,
+   "h1": -0.006500000000000006,
+   "h2": null,
+   "last_drift": -0.006500000000000006,
+   "horizons_matured": 2,
+   "total_markout": 0.018000000000000016,
+   "capture": 0.024500000000000022,
+   "age_h": 22.92503264758322,
+   "done": 0
+  },
+  {
+   "ts": 1785843190.9453006,
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "side": "DOWN",
+   "fill_price": 0.68,
+   "size": 41.25,
+   "ref_mid": 0.725,
+   "src": "venue_clean",
+   "h0": 0.0,
+   "h1": -0.08999999999999997,
+   "h2": null,
+   "last_drift": -0.08999999999999997,
+   "horizons_matured": 2,
+   "total_markout": -0.04500000000000004,
+   "capture": 0.04499999999999993,
+   "age_h": 20.403004260924128,
+   "done": 0
+  },
+  {
+   "ts": 1785843491.960494,
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "side": "DOWN",
+   "fill_price": 0.7,
+   "size": 7.04,
+   "ref_mid": 0.725,
+   "src": "venue_clean",
+   "h0": 0.0,
+   "h1": -0.24,
+   "h2": null,
+   "last_drift": -0.24,
+   "horizons_matured": 2,
+   "total_markout": -0.21499999999999997,
+   "capture": 0.025000000000000022,
+   "age_h": 20.319388929406802,
+   "done": 0
+  },
+  {
+   "ts": 1785844399.688547,
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "side": "UP",
+   "fill_price": 0.42,
+   "size": 75.0,
+   "ref_mid": 0.44,
+   "src": "venue_clean",
+   "h0": 0.0050000000000000044,
+   "h1": 0.0050000000000000044,
+   "h2": null,
+   "last_drift": 0.0050000000000000044,
+   "horizons_matured": 2,
+   "total_markout": 0.025000000000000022,
+   "capture": 0.020000000000000018,
+   "age_h": 20.06724224805832,
+   "done": 0
+  },
+  {
+   "ts": 1785844698.1771972,
+   "cid": "0xfd08056dee526375e4a4ec411cd1dc0026ca76413a7ee135a658b6a8e8f219b9",
+   "slug": "elon-musk-of-tweets-july-28-august-4-200-219",
+   "side": "UP",
+   "fill_price": 0.346,
+   "size": 5.0,
+   "ref_mid": 0.3665,
+   "src": "venue_clean",
+   "h0": 0.0,
+   "h1": -0.016000000000000014,
+   "h2": null,
+   "last_drift": -0.016000000000000014,
+   "horizons_matured": 2,
+   "total_markout": 0.004500000000000004,
+   "capture": 0.020500000000000018,
+   "age_h": 19.984328734079998,
+   "done": 0
+  },
+  {
+   "ts": 1785850707.350101,
+   "cid": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "slug": "elon-musk-of-tweets-july-28-august-4-220-239",
+   "side": "UP",
+   "fill_price": 0.78,
+   "size": 126.78,
+   "ref_mid": 0.8300000000000001,
+   "src": "venue_clean",
+   "h0": 0.04499999999999993,
+   "h1": 0.15749999999999997,
+   "h2": null,
+   "last_drift": 0.15749999999999997,
+   "horizons_matured": 2,
+   "total_markout": 0.20750000000000002,
+   "capture": 0.050000000000000044,
+   "age_h": 18.315114038586618,
+   "done": 0
+  },
+  {
+   "ts": 1785851007.1569571,
+   "cid": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "slug": "elon-musk-of-tweets-july-28-august-4-220-239",
+   "side": "DOWN",
+   "fill_price": 0.1,
+   "size": 135.0,
+   "ref_mid": 0.10500000000000001,
+   "src": "venue_clean",
+   "h0": 0.03,
+   "h1": -0.0975,
+   "h2": null,
+   "last_drift": -0.0975,
+   "horizons_matured": 2,
+   "total_markout": -0.0925,
+   "capture": 0.0050000000000000044,
+   "age_h": 18.23183435632123,
+   "done": 0
+  },
+  {
+   "ts": 1785855582.37101,
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "side": "UP",
+   "fill_price": 0.75,
+   "size": 135.0,
+   "ref_mid": 0.715,
+   "src": "venue_clean",
+   "h0": 0.06500000000000006,
+   "h1": 0.2835,
+   "h2": null,
+   "last_drift": 0.2835,
+   "horizons_matured": 2,
+   "total_markout": 0.24849999999999994,
+   "capture": -0.03500000000000003,
+   "age_h": 16.96094156384468,
+   "done": 0
+  },
+  {
+   "ts": 1785857986.8199131,
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "side": "DOWN",
+   "fill_price": 0.7,
+   "size": 16.7,
+   "ref_mid": 0.8,
+   "src": "venue_clean",
+   "h0": -0.615,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.615,
+   "horizons_matured": 1,
+   "total_markout": -0.5149999999999999,
+   "capture": 0.10000000000000009,
+   "age_h": 16.29303909076585,
+   "done": 0
+  },
+  {
+   "ts": 1785858595.1261902,
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "side": "DOWN",
+   "fill_price": 0.08,
+   "size": 58.375,
+   "ref_mid": 0.08499999999999999,
+   "src": "venue_clean",
+   "h0": -0.05499999999999999,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.05499999999999999,
+   "horizons_matured": 1,
+   "total_markout": -0.05,
+   "capture": 0.0049999999999999906,
+   "age_h": 16.12406512492233,
+   "done": 0
+  },
+  {
+   "ts": 1785859208.0128884,
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "side": "UP",
+   "fill_price": 0.96,
+   "size": 112.0,
+   "ref_mid": null,
+   "src": "venue_clean",
+   "h0": null,
+   "h1": null,
+   "h2": null,
+   "last_drift": null,
+   "horizons_matured": 0,
+   "total_markout": null,
+   "capture": null,
+   "age_h": 15.953818819853995,
+   "done": 0
+  },
+  {
+   "ts": 1785879722.1442711,
+   "cid": "0xdf4aaa4d15ba71baed89b18edc53f8b05d2611320f674ea0ed5a1e34753592b3",
+   "slug": "atp-shang-rublev-2026-08-04",
+   "side": "DOWN",
+   "fill_price": 0.14,
+   "size": 85.0,
+   "ref_mid": 0.155,
+   "src": "venue_clean",
+   "h0": -0.009999999999999981,
+   "h1": 0.589,
+   "h2": null,
+   "last_drift": 0.589,
+   "horizons_matured": 2,
+   "total_markout": 0.604,
+   "capture": 0.014999999999999986,
+   "age_h": 10.255448991325167,
+   "done": 0
+  },
+  {
+   "ts": 1785881105.8491974,
+   "cid": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "slug": "cs2-gls1-meiano-2026-08-04",
+   "side": "DOWN",
+   "fill_price": 0.34,
+   "size": 135.0,
+   "ref_mid": 0.35,
+   "src": "venue_clean",
+   "h0": 0.16000000000000003,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.16000000000000003,
+   "horizons_matured": 1,
+   "total_markout": 0.16999999999999998,
+   "capture": 0.009999999999999953,
+   "age_h": 9.87108651181062,
+   "done": 0
+  },
+  {
+   "ts": 1785881404.4810338,
+   "cid": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "slug": "cs2-gls1-meiano-2026-08-04",
+   "side": "UP",
+   "fill_price": 0.43,
+   "size": 135.0,
+   "ref_mid": 0.485,
+   "src": "venue_clean",
+   "h0": 0.10999999999999999,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.10999999999999999,
+   "horizons_matured": 1,
+   "total_markout": 0.16499999999999998,
+   "capture": 0.05499999999999999,
+   "age_h": 9.788133223917749,
+   "done": 0
+  },
+  {
+   "ts": 1785882005.9574301,
+   "cid": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "slug": "cs2-gls1-meiano-2026-08-04",
+   "side": "UP",
+   "fill_price": 0.68,
+   "size": 35.0,
+   "ref_mid": 0.7050000000000001,
+   "src": "venue_clean",
+   "h0": -0.0050000000000001155,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.0050000000000001155,
+   "horizons_matured": 1,
+   "total_markout": 0.019999999999999907,
+   "capture": 0.025000000000000022,
+   "age_h": 9.62105644716157,
+   "done": 0
+  },
+  {
+   "ts": 1785888339.7967372,
+   "cid": "0xe493e01d21535bfd02a4a8957015288abce314a9b489ee3ec7ae797e6df30b4e",
+   "slug": "lol-maz-mg1-2026-08-04",
+   "side": "UP",
+   "fill_price": 0.74,
+   "size": 98.397296,
+   "ref_mid": 0.755,
+   "src": "venue_clean",
+   "h0": -0.09999999999999998,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.09999999999999998,
+   "horizons_matured": 1,
+   "total_markout": -0.08499999999999996,
+   "capture": 0.015000000000000013,
+   "age_h": 7.861656639642185,
+   "done": 0
+  },
+  {
+   "ts": 1785888691.2085435,
+   "cid": "0x7b02186cfb0200f6db3c8cf645334a94e13e4efe0015f3616e632647f088b93c",
+   "slug": "wta-kalinsk-kessler-2026-08-04",
+   "side": "DOWN",
+   "fill_price": 0.54,
+   "size": 107.41,
+   "ref_mid": 0.495,
+   "src": "venue_clean",
+   "h0": -0.03999999999999998,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.03999999999999998,
+   "horizons_matured": 1,
+   "total_markout": -0.08500000000000002,
+   "capture": -0.04500000000000004,
+   "age_h": 7.7640422489908,
+   "done": 0
+  },
+  {
+   "ts": 1785888999.4759386,
+   "cid": "0x7b02186cfb0200f6db3c8cf645334a94e13e4efe0015f3616e632647f088b93c",
+   "slug": "wta-kalinsk-kessler-2026-08-04",
+   "side": "UP",
+   "fill_price": 0.48,
+   "size": 14.0,
+   "ref_mid": 0.545,
+   "src": "venue_clean",
+   "h0": 0.21499999999999997,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.21499999999999997,
+   "horizons_matured": 1,
+   "total_markout": 0.28,
+   "capture": 0.06500000000000006,
+   "age_h": 7.6784124170409305,
+   "done": 0
+  },
+  {
+   "ts": 1785890140.2014644,
+   "cid": "0xe493e01d21535bfd02a4a8957015288abce314a9b489ee3ec7ae797e6df30b4e",
+   "slug": "lol-maz-mg1-2026-08-04",
+   "side": "UP",
+   "fill_price": 0.87,
+   "size": 135.0,
+   "ref_mid": null,
+   "src": "venue_clean",
+   "h0": null,
+   "h1": null,
+   "h2": null,
+   "last_drift": null,
+   "horizons_matured": 0,
+   "total_markout": null,
+   "capture": null,
+   "age_h": 7.361544215414259,
+   "done": 0
+  },
+  {
+   "ts": 1785893893.8844526,
+   "cid": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "slug": "mlb-tb-col-2026-08-04",
+   "side": "UP",
+   "fill_price": 0.55,
+   "size": 135.0,
+   "ref_mid": 0.585,
+   "src": "venue_clean",
+   "h0": -0.04999999999999993,
+   "h1": -0.41999999999999993,
+   "h2": null,
+   "last_drift": -0.41999999999999993,
+   "horizons_matured": 2,
+   "total_markout": -0.385,
+   "capture": 0.03499999999999992,
+   "age_h": 6.318854496479035,
+   "done": 0
+  },
+  {
+   "ts": 1785895131.6722474,
+   "cid": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "slug": "mlb-tb-col-2026-08-04",
+   "side": "DOWN",
+   "fill_price": 0.68,
+   "size": 135.0,
+   "ref_mid": 0.715,
+   "src": "venue_clean",
+   "h0": -0.039999999999999925,
+   "h1": 0.18000000000000005,
+   "h2": null,
+   "last_drift": 0.18000000000000005,
+   "horizons_matured": 2,
+   "total_markout": 0.21499999999999997,
+   "capture": 0.03499999999999992,
+   "age_h": 5.975024553471141,
+   "done": 0
+  },
+  {
+   "ts": 1785895430.625686,
+   "cid": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "slug": "mlb-tb-col-2026-08-04",
+   "side": "UP",
+   "fill_price": 0.27,
+   "size": 70.0,
+   "ref_mid": 0.305,
+   "src": "venue_clean",
+   "h0": 0.04999999999999999,
+   "h1": -0.19,
+   "h2": null,
+   "last_drift": -0.19,
+   "horizons_matured": 2,
+   "total_markout": -0.15500000000000003,
+   "capture": 0.034999999999999976,
+   "age_h": 5.8919819316599105,
+   "done": 0
+  },
+  {
+   "ts": 1785910350.0393596,
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "side": "DOWN",
+   "fill_price": 0.46,
+   "size": 6.0,
+   "ref_mid": 0.46499999999999997,
+   "src": "venue_clean",
+   "h0": -0.034999999999999976,
+   "h1": -0.14999999999999997,
+   "h2": null,
+   "last_drift": -0.14999999999999997,
+   "horizons_matured": 2,
+   "total_markout": -0.14500000000000002,
+   "capture": 0.004999999999999949,
+   "age_h": 1.7477003556489945,
+   "done": 0
+  },
+  {
+   "ts": 1785911265.2943134,
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "side": "UP",
+   "fill_price": 0.42,
+   "size": 5.0,
+   "ref_mid": 0.45,
+   "src": "venue_clean",
+   "h0": -0.034999999999999976,
+   "h1": 0.44,
+   "h2": null,
+   "last_drift": 0.44,
+   "horizons_matured": 2,
+   "total_markout": 0.47000000000000003,
+   "capture": 0.030000000000000027,
+   "age_h": 1.4934628684653177,
+   "done": 0
+  },
+  {
+   "ts": 1785911362.279691,
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "side": "UP",
+   "fill_price": 0.35,
+   "size": 31.0,
+   "ref_mid": 0.385,
+   "src": "venue_clean",
+   "h0": 0.020000000000000018,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.020000000000000018,
+   "horizons_matured": 1,
+   "total_markout": 0.05500000000000005,
+   "capture": 0.03500000000000003,
+   "age_h": 1.466522485812505,
+   "done": 0
+  },
+  {
+   "ts": 1785911877.9487517,
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "side": "DOWN",
+   "fill_price": 0.53,
+   "size": 10.0,
+   "ref_mid": 0.53,
+   "src": "venue_clean",
+   "h0": -0.07000000000000006,
+   "h1": -0.506,
+   "h2": null,
+   "last_drift": -0.506,
+   "horizons_matured": 2,
+   "total_markout": -0.506,
+   "capture": 0.0,
+   "age_h": 1.323281080060535,
+   "done": 0
+  },
+  {
+   "ts": 1785912182.3271277,
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "side": "DOWN",
+   "fill_price": 0.46,
+   "size": 60.0,
+   "ref_mid": 0.45999999999999996,
+   "src": "venue_clean",
+   "h0": -0.024999999999999967,
+   "h1": -0.45299999999999996,
+   "h2": null,
+   "last_drift": -0.45299999999999996,
+   "horizons_matured": 2,
+   "total_markout": -0.453,
+   "capture": -5.551115123125783e-17,
+   "age_h": 1.2387315311696794,
+   "done": 0
+  },
+  {
+   "ts": 1785912250.9135988,
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "side": "DOWN",
+   "fill_price": 0.61,
+   "size": 69.93540700000005,
+   "ref_mid": 0.635,
+   "src": "venue_clean",
+   "h0": -0.05500000000000005,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.05500000000000005,
+   "horizons_matured": 1,
+   "total_markout": -0.030000000000000027,
+   "capture": 0.025000000000000022,
+   "age_h": 1.2196797336472405,
+   "done": 0
+  },
+  {
+   "ts": 1785912853.3745222,
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "side": "DOWN",
+   "fill_price": 0.59,
+   "size": 135.0,
+   "ref_mid": 0.665,
+   "src": "venue_clean",
+   "h0": 0.15500000000000003,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.15500000000000003,
+   "horizons_matured": 1,
+   "total_markout": 0.2300000000000001,
+   "capture": 0.07500000000000007,
+   "age_h": 1.0523294771379894,
+   "done": 0
+  },
+  {
+   "ts": 1785913178.9498494,
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "side": "UP",
+   "fill_price": 0.22,
+   "size": 130.0,
+   "ref_mid": 0.18,
+   "src": "venue_clean",
+   "h0": -0.10999999999999999,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.10999999999999999,
+   "horizons_matured": 1,
+   "total_markout": -0.15,
+   "capture": -0.04000000000000001,
+   "age_h": 0.9618918862607744,
+   "done": 0
+  },
+  {
+   "ts": 1785913380.404739,
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "side": "DOWN",
+   "fill_price": 0.4,
+   "size": 1.58,
+   "ref_mid": 0.435,
+   "src": "venue_clean",
+   "h0": -0.03999999999999998,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.03999999999999998,
+   "horizons_matured": 1,
+   "total_markout": -0.0050000000000000044,
+   "capture": 0.034999999999999976,
+   "age_h": 0.9059321947230233,
+   "done": 0
+  },
+  {
+   "ts": 1785913478.0134134,
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "side": "UP",
+   "fill_price": 0.1,
+   "size": 9.0,
+   "ref_mid": 0.08499999999999999,
+   "src": "venue_clean",
+   "h0": -0.024999999999999988,
+   "h1": null,
+   "h2": null,
+   "last_drift": -0.024999999999999988,
+   "horizons_matured": 1,
+   "total_markout": -0.04,
+   "capture": -0.015000000000000013,
+   "age_h": 0.878818674021297,
+   "done": 0
+  },
+  {
+   "ts": 1785913478.0134134,
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "side": "DOWN",
+   "fill_price": 0.83,
+   "size": 59.0,
+   "ref_mid": 0.915,
+   "src": "venue_clean",
+   "h0": 0.02499999999999991,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.02499999999999991,
+   "horizons_matured": 1,
+   "total_markout": 0.10999999999999999,
+   "capture": 0.08500000000000008,
+   "age_h": 0.878818674021297,
+   "done": 0
+  },
+  {
+   "ts": 1785914057.680736,
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "side": "UP",
+   "fill_price": 0.27,
+   "size": 135.0,
+   "ref_mid": 0.245,
+   "src": "venue_clean",
+   "h0": null,
+   "h1": null,
+   "h2": null,
+   "last_drift": null,
+   "horizons_matured": 0,
+   "total_markout": null,
+   "capture": -0.025000000000000022,
+   "age_h": 0.7177999732891719,
+   "done": 0
+  },
+  {
+   "ts": 1785914357.3240917,
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "side": "DOWN",
+   "fill_price": 0.9,
+   "size": 93.0,
+   "ref_mid": null,
+   "src": "venue_clean",
+   "h0": null,
+   "h1": null,
+   "h2": null,
+   "last_drift": null,
+   "horizons_matured": 0,
+   "total_markout": null,
+   "capture": null,
+   "age_h": 0.634565707842509,
+   "done": 0
+  },
+  {
+   "ts": 1785914886.8184147,
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "side": "UP",
+   "fill_price": 0.91,
+   "size": 7.41,
+   "ref_mid": 0.89,
+   "src": "venue_clean",
+   "h0": 0.07799999999999996,
+   "h1": null,
+   "h2": null,
+   "last_drift": 0.07799999999999996,
+   "horizons_matured": 1,
+   "total_markout": 0.05799999999999994,
+   "capture": -0.020000000000000018,
+   "age_h": 0.4874839514493942,
+   "done": 0
+  }
+ ],
+ "fills": [
+  {
+   "ts": 1785767635.6034207,
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "side": "DOWN",
+   "price": 0.52,
+   "size": 100.0,
+   "notional": 52.0,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 41.390599227547646,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785767683.963074,
+   "slug": "lol-rs-deer-2026-08-03",
+   "cid": "0xa3bd770f42c926f9b4b9435068cb2472a7a106b77da66bb4521bf483d1cb4d85",
+   "side": "UP",
+   "price": 0.85,
+   "size": 5.0,
+   "notional": 4.25,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 5.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 41.37716599053807,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785767943.1675055,
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "side": "DOWN",
+   "price": 0.58,
+   "size": 135.0,
+   "notional": 78.3,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 41.305164759556455,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785768090.349614,
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "side": "UP",
+   "price": 0.5,
+   "size": 135.0,
+   "notional": 67.5,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 180.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 41.26428084055583,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785768700.3007884,
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "side": "UP",
+   "price": 0.58,
+   "size": 32.21000000000001,
+   "notional": 18.681800000000003,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 100.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 41.094849958750935,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785769613.105427,
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "side": "UP",
+   "price": 0.69,
+   "size": 7.09,
+   "notional": 4.892099999999999,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 40.84129311468866,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785769911.8896205,
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "side": "UP",
+   "price": 0.75,
+   "size": 10.0,
+   "notional": 7.5,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 40.75829750537872,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785770234.620053,
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "side": "DOWN",
+   "price": 0.2,
+   "size": 84.0,
+   "notional": 16.8,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 22.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 40.66865016301473,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785771860.1623547,
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "side": "UP",
+   "price": 0.58,
+   "size": 46.481378,
+   "notional": 26.959199239999997,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 50.76,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 40.21711063477728,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785771908.1540046,
+   "slug": "cs2-mouzn-mis-2026-08-03",
+   "cid": "0x2498c20721a62f1ff81a432a2c85f98af1d598ba4a8ab1cc258b0405cf10c67f",
+   "side": "UP",
+   "price": 0.66,
+   "size": 104.75878500000002,
+   "notional": 69.14079810000001,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 50.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 40.20377962092559,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785772184.1539826,
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "side": "UP",
+   "price": 0.59,
+   "size": 7.464574999999996,
+   "notional": 4.404099249999998,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 12.520000000000003,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 40.12711296035184,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785773077.8337302,
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "side": "UP",
+   "price": 0.63,
+   "size": 0.37761799999999823,
+   "notional": 0.23789933999999888,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 15.21,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 39.87886858602365,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785774015.1064548,
+   "slug": "cs2-mouzn-mis-2026-08-03",
+   "cid": "0x2498c20721a62f1ff81a432a2c85f98af1d598ba4a8ab1cc258b0405cf10c67f",
+   "side": "DOWN",
+   "price": 0.59,
+   "size": 135.0,
+   "notional": 79.64999999999999,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 39.618515051404636,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785774285.3897436,
+   "slug": "cs2-arc4-btf-2026-08-03",
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "side": "UP",
+   "price": 0.17,
+   "size": 135.0,
+   "notional": 22.950000000000003,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 269.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 39.54343636009428,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785775216.6807983,
+   "slug": "cs2-mouzn-mis-2026-08-03",
+   "cid": "0x2498c20721a62f1ff81a432a2c85f98af1d598ba4a8ab1cc258b0405cf10c67f",
+   "side": "UP",
+   "price": 0.59,
+   "size": 5.0,
+   "notional": 2.9499999999999997,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 5.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 39.28474440044827,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785785230.6021068,
+   "slug": "will-bitcoin-dip-to-62k-on-august-3",
+   "cid": "0xda75a4a463bd90f0a3bea1b9a0cc29db8475cebce79954f6f827c362dd908542",
+   "side": "DOWN",
+   "price": 0.96,
+   "size": 135.0,
+   "notional": 129.6,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 36.50309959252675,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785786984.2029088,
+   "slug": "wta-boisson-ruzic-2026-08-02",
+   "cid": "0x8992f7316a12ca75e5a25c92721f402bdd3b1ee92610d1a9d8f581af3e9143c2",
+   "side": "DOWN",
+   "price": 0.3,
+   "size": 6.0,
+   "notional": 1.7999999999999998,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 36.015988258653216,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785788289.6010482,
+   "slug": "will-bitcoin-dip-to-62k-on-august-3",
+   "cid": "0xda75a4a463bd90f0a3bea1b9a0cc29db8475cebce79954f6f827c362dd908542",
+   "side": "UP",
+   "price": 0.022,
+   "size": 20.44,
+   "notional": 0.44968,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 35.65337766435411,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785792057.5805113,
+   "slug": "atp-zheng-kecmano-2026-08-02",
+   "cid": "0x88d2251f33c6e5745edc2424a79578fcbd289667790514b04da8a0392154e539",
+   "side": "UP",
+   "price": 0.56,
+   "size": 42.72,
+   "notional": 23.9232,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 34.60671670238177,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785821463.027336,
+   "slug": "elon-musk-of-tweets-july-28-august-4-240-259",
+   "cid": "0x700dceb5257c664de091156f768a4024e2817ad1b41ca7302efdee9e6ebd6a69",
+   "side": "UP",
+   "price": 0.12,
+   "size": 74.63999999999999,
+   "notional": 8.956799999999998,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 35.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 26.438537028895485,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785833962.6476805,
+   "slug": "elon-musk-of-tweets-july-28-august-4-220-239",
+   "cid": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "side": "UP",
+   "price": 0.6,
+   "size": 135.0,
+   "notional": 81.0,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 15.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 22.96642026649581,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785834112.0778708,
+   "slug": "elon-musk-of-tweets-july-28-august-4-200-219",
+   "cid": "0xfd08056dee526375e4a4ec411cd1dc0026ca76413a7ee135a658b6a8e8f219b9",
+   "side": "UP",
+   "price": 0.316,
+   "size": 4.4,
+   "notional": 1.3904,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 22.92491188029448,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785843191.4183044,
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "side": "DOWN",
+   "price": 0.68,
+   "size": 41.25,
+   "notional": 28.05,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 20.402872870961826,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785843492.3984702,
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "side": "DOWN",
+   "price": 0.7,
+   "size": 7.04,
+   "notional": 4.928,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 20.31926726937294,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785844400.0903885,
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "side": "UP",
+   "price": 0.42,
+   "size": 75.0,
+   "notional": 31.5,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 20.06713062538041,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785844698.6504054,
+   "slug": "elon-musk-of-tweets-july-28-august-4-200-219",
+   "cid": "0xfd08056dee526375e4a4ec411cd1dc0026ca76413a7ee135a658b6a8e8f219b9",
+   "side": "UP",
+   "price": 0.346,
+   "size": 5.0,
+   "notional": 1.73,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 19.98419728736083,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785850707.7548618,
+   "slug": "elon-musk-of-tweets-july-28-august-4-220-239",
+   "cid": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "side": "UP",
+   "price": 0.78,
+   "size": 126.78,
+   "notional": 98.8884,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 18.31500160502063,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785851007.5916908,
+   "slug": "elon-musk-of-tweets-july-28-august-4-220-239",
+   "cid": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "side": "DOWN",
+   "price": 0.1,
+   "size": 135.0,
+   "notional": 13.5,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 227.13,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 18.231713596979777,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785855582.7614396,
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "side": "UP",
+   "price": 0.75,
+   "size": 135.0,
+   "notional": 101.25,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 25.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 16.96083311120669,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785857987.235432,
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "side": "DOWN",
+   "price": 0.7,
+   "size": 16.7,
+   "notional": 11.69,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 5.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 16.29292366888788,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785858595.5916233,
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "side": "DOWN",
+   "price": 0.08,
+   "size": 58.375,
+   "notional": 4.67,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 16.123935837944348,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785859208.4351144,
+   "slug": "bitcoin-above-64k-on-august-4-2026",
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "side": "UP",
+   "price": 0.96,
+   "size": 112.0,
+   "notional": 107.52,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 15.953701534867287,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785879722.5727148,
+   "slug": "atp-shang-rublev-2026-08-04",
+   "cid": "0xdf4aaa4d15ba71baed89b18edc53f8b05d2611320f674ea0ed5a1e34753592b3",
+   "side": "DOWN",
+   "price": 0.14,
+   "size": 85.0,
+   "notional": 11.9,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 224.1999999999971,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 10.255329979194535,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785881106.2529602,
+   "slug": "cs2-gls1-meiano-2026-08-04",
+   "cid": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "side": "DOWN",
+   "price": 0.34,
+   "size": 135.0,
+   "notional": 45.900000000000006,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 9.870974355472459,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785881404.8837016,
+   "slug": "cs2-gls1-meiano-2026-08-04",
+   "cid": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "side": "UP",
+   "price": 0.43,
+   "size": 135.0,
+   "notional": 58.05,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 115.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 9.788021371761959,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785882006.2826836,
+   "slug": "cs2-gls1-meiano-2026-08-04",
+   "cid": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "side": "UP",
+   "price": 0.68,
+   "size": 35.0,
+   "notional": 23.8,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 16.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 9.620966098970838,
+   "still_open": false,
+   "naked_side_now": null,
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785888340.3986826,
+   "slug": "lol-maz-mg1-2026-08-04",
+   "cid": "0xe493e01d21535bfd02a4a8957015288abce314a9b489ee3ec7ae797e6df30b4e",
+   "side": "UP",
+   "price": 0.74,
+   "size": 98.397296,
+   "notional": 72.81399904,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 20.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 7.861489432586564,
+   "still_open": true,
+   "naked_side_now": "UP",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785888691.8942833,
+   "slug": "wta-kalinsk-kessler-2026-08-04",
+   "cid": "0x7b02186cfb0200f6db3c8cf645334a94e13e4efe0015f3616e632647f088b93c",
+   "side": "DOWN",
+   "price": 0.54,
+   "size": 107.41,
+   "notional": 58.001400000000004,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 35.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 7.763851765725348,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785888999.8105507,
+   "slug": "wta-kalinsk-kessler-2026-08-04",
+   "cid": "0x7b02186cfb0200f6db3c8cf645334a94e13e4efe0015f3616e632647f088b93c",
+   "side": "UP",
+   "price": 0.48,
+   "size": 14.0,
+   "notional": 6.72,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 26.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 7.678319469226731,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785890140.644173,
+   "slug": "lol-maz-mg1-2026-08-04",
+   "cid": "0xe493e01d21535bfd02a4a8957015288abce314a9b489ee3ec7ae797e6df30b4e",
+   "side": "UP",
+   "price": 0.87,
+   "size": 135.0,
+   "notional": 117.45,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 39.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 7.361421240833071,
+   "still_open": true,
+   "naked_side_now": "UP",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785893894.1981518,
+   "slug": "mlb-tb-col-2026-08-04",
+   "cid": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "side": "UP",
+   "price": 0.55,
+   "size": 135.0,
+   "notional": 74.25,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 225.5,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 6.318767357799742,
+   "still_open": true,
+   "naked_side_now": "UP",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785895132.0056183,
+   "slug": "mlb-tb-col-2026-08-04",
+   "cid": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "side": "DOWN",
+   "price": 0.68,
+   "size": 135.0,
+   "notional": 91.80000000000001,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 598.8,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 5.974931950436698,
+   "still_open": true,
+   "naked_side_now": "UP",
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785895430.9386935,
+   "slug": "mlb-tb-col-2026-08-04",
+   "cid": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "side": "UP",
+   "price": 0.27,
+   "size": 70.0,
+   "notional": 18.900000000000002,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 80.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 5.891894985106256,
+   "still_open": true,
+   "naked_side_now": "UP",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785910350.3826015,
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "side": "DOWN",
+   "price": 0.46,
+   "size": 6.0,
+   "notional": 2.7600000000000002,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 31.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 1.7476050106684367,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785911265.526239,
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "side": "UP",
+   "price": 0.42,
+   "size": 5.0,
+   "notional": 2.1,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 1.4933984447187847,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785911362.601954,
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "side": "UP",
+   "price": 0.35,
+   "size": 31.0,
+   "notional": 10.85,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 1.4664329683118396,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785911878.206274,
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "side": "DOWN",
+   "price": 0.53,
+   "size": 10.0,
+   "notional": 5.300000000000001,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 1.3232095460759268,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785912182.5662897,
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "side": "DOWN",
+   "price": 0.46,
+   "size": 60.0,
+   "notional": 27.6,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 1.2386650972896152,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785912251.2833524,
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "side": "DOWN",
+   "price": 0.61,
+   "size": 69.93540700000005,
+   "notional": 42.66059827000003,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 201.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 1.2195770243141386,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785912854.0736275,
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "side": "DOWN",
+   "price": 0.59,
+   "size": 135.0,
+   "notional": 79.64999999999999,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 1.0521352812316682,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785913179.2879698,
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "side": "UP",
+   "price": 0.22,
+   "size": 130.0,
+   "notional": 28.6,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 0.9617979639106327,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785913381.888975,
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "side": "DOWN",
+   "price": 0.4,
+   "size": 1.58,
+   "notional": 0.6320000000000001,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 0.9055199069446987,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785913478.2806711,
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "side": "UP",
+   "price": 0.1,
+   "size": 9.0,
+   "notional": 0.9,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 0.8787444357739554,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785913478.336937,
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "side": "DOWN",
+   "price": 0.83,
+   "size": 59.0,
+   "notional": 48.97,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 35.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 0.8787288063764572,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785914058.041109,
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "side": "UP",
+   "price": 0.27,
+   "size": 135.0,
+   "notional": 36.45,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 15.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 0.7176998696724574,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": false
+  },
+  {
+   "ts": 1785914357.6565068,
+   "slug": "lol-foxy-drxc-2026-08-05",
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "side": "DOWN",
+   "price": 0.9,
+   "size": 93.0,
+   "notional": 83.7,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 5.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 0.6344733703136444,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": true
+  },
+  {
+   "ts": 1785914887.1853242,
+   "slug": "lol-dkc-nsea-2026-08-05",
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "side": "UP",
+   "price": 0.91,
+   "size": 7.41,
+   "notional": 6.7431,
+   "seconds_to_fill": 0.0,
+   "queue_waited": 0.0,
+   "crossed": 0,
+   "reason": "tape",
+   "age_h": 0.4873820321427451,
+   "still_open": true,
+   "naked_side_now": "DOWN",
+   "on_naked_side": false
+  }
+ ],
+ "fill_by_queue": [
+  {
+   "label": "0-1",
+   "quotes": 3080,
+   "posted": 361348.0,
+   "filled": 1225.075,
+   "rate": 0.003390291353487497
+  },
+  {
+   "label": "1-50",
+   "quotes": 1075,
+   "posted": 132571.0,
+   "filled": 1010.9894889999999,
+   "rate": 0.007626022953737996
+  },
+  {
+   "label": "50-150",
+   "quotes": 1344,
+   "posted": 160023.0,
+   "filled": 292.691378,
+   "rate": 0.0018290581853858507
+  },
+  {
+   "label": "150-400",
+   "quotes": 1741,
+   "posted": 188838.0,
+   "filled": 889.935407,
+   "rate": 0.004712692397716561
+  },
+  {
+   "label": "400+",
+   "quotes": 3613,
+   "posted": 385269.0,
+   "filled": 490.76878500000004,
+   "rate": 0.0012738340873519542
+  }
+ ],
+ "share_hist": [
+  {
+   "hour": 1785765600,
+   "mean_share": 0.028759076364373172,
+   "n": 1257
+  },
+  {
+   "hour": 1785769200,
+   "mean_share": 0.0459564086202957,
+   "n": 2627
+  },
+  {
+   "hour": 1785772800,
+   "mean_share": 0.028298672423708628,
+   "n": 2407
+  },
+  {
+   "hour": 1785776400,
+   "mean_share": 0.013078723900302097,
+   "n": 2150
+  },
+  {
+   "hour": 1785780000,
+   "mean_share": 0.05634443982563192,
+   "n": 1784
+  },
+  {
+   "hour": 1785783600,
+   "mean_share": 0.04795205383821388,
+   "n": 1537
+  },
+  {
+   "hour": 1785787200,
+   "mean_share": 0.04777726422630804,
+   "n": 533
+  },
+  {
+   "hour": 1785790800,
+   "mean_share": 0.01421595366372458,
+   "n": 1533
+  },
+  {
+   "hour": 1785794400,
+   "mean_share": 0.016663279966380527,
+   "n": 1418
+  },
+  {
+   "hour": 1785798000,
+   "mean_share": 0.013195143322810491,
+   "n": 1416
+  },
+  {
+   "hour": 1785801600,
+   "mean_share": 0.015036740015919706,
+   "n": 1236
+  },
+  {
+   "hour": 1785805200,
+   "mean_share": 0.013461633044044713,
+   "n": 1029
+  },
+  {
+   "hour": 1785808800,
+   "mean_share": 0.013420397299559983,
+   "n": 969
+  },
+  {
+   "hour": 1785812400,
+   "mean_share": 0.006792476589753233,
+   "n": 970
+  },
+  {
+   "hour": 1785816000,
+   "mean_share": 0.007401799142960864,
+   "n": 850
+  },
+  {
+   "hour": 1785819600,
+   "mean_share": 0.009052271973383605,
+   "n": 815
+  },
+  {
+   "hour": 1785823200,
+   "mean_share": 0.01925504258676769,
+   "n": 698
+  },
+  {
+   "hour": 1785826800,
+   "mean_share": 0.03662251827479087,
+   "n": 613
+  },
+  {
+   "hour": 1785830400,
+   "mean_share": 0.038626611736078176,
+   "n": 775
+  },
+  {
+   "hour": 1785834000,
+   "mean_share": 0.03523653082413293,
+   "n": 566
+  },
+  {
+   "hour": 1785837600,
+   "mean_share": 0.027141299477182003,
+   "n": 739
+  },
+  {
+   "hour": 1785841200,
+   "mean_share": 0.039985347822546924,
+   "n": 778
+  },
+  {
+   "hour": 1785844800,
+   "mean_share": 0.014658355642845828,
+   "n": 770
+  },
+  {
+   "hour": 1785848400,
+   "mean_share": 0.013408460687524187,
+   "n": 767
+  },
+  {
+   "hour": 1785852000,
+   "mean_share": 0.002962217590695533,
+   "n": 785
+  },
+  {
+   "hour": 1785855600,
+   "mean_share": 0.007841476802245052,
+   "n": 761
+  },
+  {
+   "hour": 1785859200,
+   "mean_share": 0.0,
+   "n": 296
+  },
+  {
+   "hour": 1785862800,
+   "mean_share": 0.0,
+   "n": 332
+  },
+  {
+   "hour": 1785866400,
+   "mean_share": 0.0,
+   "n": 28
+  },
+  {
+   "hour": 1785870000,
+   "mean_share": 0.008967939932649332,
+   "n": 2558
+  },
+  {
+   "hour": 1785873600,
+   "mean_share": 0.00543599571239133,
+   "n": 2625
+  },
+  {
+   "hour": 1785877200,
+   "mean_share": 0.0028429056429531393,
+   "n": 2529
+  },
+  {
+   "hour": 1785880800,
+   "mean_share": 0.006040851389151191,
+   "n": 2677
+  },
+  {
+   "hour": 1785884400,
+   "mean_share": 0.003653128864969987,
+   "n": 2523
+  },
+  {
+   "hour": 1785888000,
+   "mean_share": 0.009751087470477461,
+   "n": 2371
+  },
+  {
+   "hour": 1785891600,
+   "mean_share": 0.0015086544201760917,
+   "n": 2596
+  },
+  {
+   "hour": 1785895200,
+   "mean_share": 0.002326490475198191,
+   "n": 2512
+  },
+  {
+   "hour": 1785898800,
+   "mean_share": 0.0012982168648730322,
+   "n": 2652
+  },
+  {
+   "hour": 1785902400,
+   "mean_share": 0.0017449052899467204,
+   "n": 2561
+  },
+  {
+   "hour": 1785906000,
+   "mean_share": 0.006015250686911908,
+   "n": 2536
+  },
+  {
+   "hour": 1785909600,
+   "mean_share": 0.02327006618059008,
+   "n": 2530
+  },
+  {
+   "hour": 1785913200,
+   "mean_share": 0.004068604957871662,
+   "n": 2197
+  }
+ ],
+ "horizons": [
+  300.0,
+  3600.0,
+  21600.0
+ ],
+ "closes": [
+  {
+   "id": 1,
+   "ts": 1785770234.6890495,
+   "condition_id": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "market_slug": "elon-musk-of-tweets-august-1-august-3-0-39",
+   "method": "merge",
+   "gas": 0.05,
+   "shares": 84.0,
+   "up_price": null,
+   "dn_price": null,
+   "cost_basis": 61.7278762886598,
+   "proceeds": 84.0,
+   "fee": null,
+   "realized_pnl": 22.2221237113402,
+   "forgone_vs_settlement": 0.0,
+   "up_cost_removed": 44.92787628865979,
+   "dn_cost_removed": 16.8
+  },
+  {
+   "id": 2,
+   "ts": 1785774285.4310713,
+   "condition_id": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "market_slug": "cs2-arc4-btf-2026-08-03",
+   "method": "merge",
+   "gas": 0.05,
+   "shares": 189.323571,
+   "up_price": null,
+   "dn_price": null,
+   "cost_basis": 159.52507570787233,
+   "proceeds": 189.323571,
+   "fee": null,
+   "realized_pnl": 29.748495292127654,
+   "forgone_vs_settlement": 0.0,
+   "up_cost_removed": 54.55119782999999,
+   "dn_cost_removed": 104.97387787787234
+  },
+  {
+   "id": 3,
+   "ts": 1785788289.7186573,
+   "condition_id": "0xda75a4a463bd90f0a3bea1b9a0cc29db8475cebce79954f6f827c362dd908542",
+   "market_slug": "will-bitcoin-dip-to-62k-on-august-3",
+   "method": "merge",
+   "gas": 0.05,
+   "shares": 20.44,
+   "up_price": null,
+   "dn_price": null,
+   "cost_basis": 20.07208,
+   "proceeds": 20.44,
+   "fee": null,
+   "realized_pnl": 0.3179200000000016,
+   "forgone_vs_settlement": 0.0,
+   "up_cost_removed": 0.44968,
+   "dn_cost_removed": 19.6224
+  },
+  {
+   "id": 4,
+   "ts": 1785851007.623626,
+   "condition_id": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "market_slug": "elon-musk-of-tweets-july-28-august-4-220-239",
+   "method": "merge",
+   "gas": 0.05,
+   "shares": 135.0,
+   "up_price": null,
+   "dn_price": null,
+   "cost_basis": 106.268484987394,
+   "proceeds": 135.0,
+   "fee": null,
+   "realized_pnl": 28.681515012605995,
+   "forgone_vs_settlement": 0.0,
+   "up_cost_removed": 92.768484987394,
+   "dn_cost_removed": 13.5
+  },
+  {
+   "id": 5,
+   "ts": 1785881404.9806788,
+   "condition_id": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "market_slug": "cs2-gls1-meiano-2026-08-04",
+   "method": "merge",
+   "gas": 0.05,
+   "shares": 135.0,
+   "up_price": null,
+   "dn_price": null,
+   "cost_basis": 103.95,
+   "proceeds": 135.0,
+   "fee": null,
+   "realized_pnl": 30.999999999999996,
+   "forgone_vs_settlement": 0.0,
+   "up_cost_removed": 58.05,
+   "dn_cost_removed": 45.900000000000006
+  },
+  {
+   "id": 6,
+   "ts": 1785911265.6277275,
+   "condition_id": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "market_slug": "lol-dkc-nsea-2026-08-05",
+   "method": "merge",
+   "gas": 0.05,
+   "shares": 5.0,
+   "up_price": null,
+   "dn_price": null,
+   "cost_basis": 4.4,
+   "proceeds": 5.0,
+   "fee": null,
+   "realized_pnl": 0.5499999999999996,
+   "forgone_vs_settlement": 0.0,
+   "up_cost_removed": 2.1,
+   "dn_cost_removed": 2.3000000000000003
+  },
+  {
+   "id": 7,
+   "ts": 1785912251.3515809,
+   "condition_id": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "market_slug": "lol-foxy-drxc-2026-08-05",
+   "method": "merge",
+   "gas": 0.05,
+   "shares": 31.0,
+   "up_price": null,
+   "dn_price": null,
+   "cost_basis": 29.759999999999998,
+   "proceeds": 31.0,
+   "fee": null,
+   "realized_pnl": 1.190000000000002,
+   "forgone_vs_settlement": 0.0,
+   "up_cost_removed": 10.85,
+   "dn_cost_removed": 18.91
+  },
+  {
+   "id": 8,
+   "ts": 1785913179.4385052,
+   "condition_id": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "market_slug": "lol-foxy-drxc-2026-08-05",
+   "method": "merge",
+   "gas": 0.05,
+   "shares": 130.0,
+   "up_price": null,
+   "dn_price": null,
+   "cost_basis": 105.88200949390367,
+   "proceeds": 130.0,
+   "fee": null,
+   "realized_pnl": 24.067990506096333,
+   "forgone_vs_settlement": 0.0,
+   "up_cost_removed": 28.6,
+   "dn_cost_removed": 77.28200949390366
+  },
+  {
+   "id": 9,
+   "ts": 1785913478.3820965,
+   "condition_id": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "market_slug": "lol-foxy-drxc-2026-08-05",
+   "method": "merge",
+   "gas": 0.05,
+   "shares": 9.0,
+   "up_price": null,
+   "dn_price": null,
+   "cost_basis": 7.465256005495435,
+   "proceeds": 9.0,
+   "fee": null,
+   "realized_pnl": 1.4847439945045646,
+   "forgone_vs_settlement": 0.0,
+   "up_cost_removed": 0.9,
+   "dn_cost_removed": 6.565256005495436
+  }
+ ],
+ "resolutions": [
+  {
+   "condition_id": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "winning_token": "35095125611492724239215090212235310059158603734378278466183791393566818505315",
+   "resolved_ts": 1785779306.323111
+  },
+  {
+   "condition_id": "0x2498c20721a62f1ff81a432a2c85f98af1d598ba4a8ab1cc258b0405cf10c67f",
+   "winning_token": "98075324187412790333857805223523324536732415910160162778589086503097320321082",
+   "resolved_ts": 1785783809.5982335
+  },
+  {
+   "condition_id": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "winning_token": "115370413159099501116270936927666001069345078961316763756842013810438674258921",
+   "resolved_ts": 1785784710.4406261
+  },
+  {
+   "condition_id": "0x8992f7316a12ca75e5a25c92721f402bdd3b1ee92610d1a9d8f581af3e9143c2",
+   "winning_token": "63060401824163743039756878067234456073425661138539410467767251006968519201447",
+   "resolved_ts": 1785795154.4371219
+  },
+  {
+   "condition_id": "0xa3bd770f42c926f9b4b9435068cb2472a7a106b77da66bb4521bf483d1cb4d85",
+   "winning_token": "20234544740391779414174876367257562259613731961600862948460631171921724286051",
+   "resolved_ts": 1785805060.8113072
+  },
+  {
+   "condition_id": "0x88d2251f33c6e5745edc2424a79578fcbd289667790514b04da8a0392154e539",
+   "winning_token": "56882011917273640084823249326001053189225136904142472220170731855262149705156",
+   "resolved_ts": 1785807762.38158
+  },
+  {
+   "condition_id": "0xda75a4a463bd90f0a3bea1b9a0cc29db8475cebce79954f6f827c362dd908542",
+   "winning_token": "83586901063500294103215813993663362429756144159825486877231475293836157187083",
+   "resolved_ts": 1785817669.4736586
+  },
+  {
+   "condition_id": "0xfd08056dee526375e4a4ec411cd1dc0026ca76413a7ee135a658b6a8e8f219b9",
+   "winning_token": "46103123679387343066192044130672094825423988033900052155195007554483625193594",
+   "resolved_ts": 1785860296.693344
+  },
+  {
+   "condition_id": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "winning_token": "29555762820866648320104527193097022031745059648291657199936106011886955678610",
+   "resolved_ts": 1785862827.865671
+  },
+  {
+   "condition_id": "0x700dceb5257c664de091156f768a4024e2817ad1b41ca7302efdee9e6ebd6a69",
+   "winning_token": "19908909250361340424221096035976676260080526436525215484039404212096093643930",
+   "resolved_ts": 1785867330.2953863
+  },
+  {
+   "condition_id": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "winning_token": "97922732210962035502861466696384187449046621425226697582890980078170406083800",
+   "resolved_ts": 1785867330.3797696
+  },
+  {
+   "condition_id": "0xdf4aaa4d15ba71baed89b18edc53f8b05d2611320f674ea0ed5a1e34753592b3",
+   "winning_token": "45527867941029412132729211576672829428007557196828392779057625459515182183142",
+   "resolved_ts": 1785887801.2078574
+  },
+  {
+   "condition_id": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "winning_token": "22042079104852490500906953474799902844749239619320760893573300276223447486334",
+   "resolved_ts": 1785891229.198553
+  },
+  {
+   "condition_id": "0x7b02186cfb0200f6db3c8cf645334a94e13e4efe0015f3616e632647f088b93c",
+   "winning_token": "4124391865558275046244108292271451609557599007421368175683970680417936769068",
+   "resolved_ts": 1785893031.8880408
+  },
+  {
+   "condition_id": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "winning_token": "29252763708008230752263285400265988210827995119337995605391137009572670750022",
+   "resolved_ts": 1785904742.9910698
+  },
+  {
+   "condition_id": "0xe493e01d21535bfd02a4a8957015288abce314a9b489ee3ec7ae797e6df30b4e",
+   "winning_token": "88062172786508788953938671070914445632798507290722113606417488369903344026157",
+   "resolved_ts": 1785905642.4361348
+  }
+ ],
+ "quote_sides": [
+  {
+   "cid": "0x12f41495368762c249e7ff069a1484f8954a34d178bafc6bfbfda0c473fd6dff",
+   "side": "UP",
+   "posted": 5641.0,
+   "filled": 0.0,
+   "n": 42
+  },
+  {
+   "cid": "0x12f41495368762c249e7ff069a1484f8954a34d178bafc6bfbfda0c473fd6dff",
+   "side": "DOWN",
+   "posted": 5212.0,
+   "filled": 0.0,
+   "n": 39
+  },
+  {
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "side": "UP",
+   "posted": 6450.0,
+   "filled": 184.3,
+   "n": 51
+  },
+  {
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "side": "DOWN",
+   "posted": 7920.0,
+   "filled": 84.0,
+   "n": 68
+  },
+  {
+   "cid": "0xa3bd770f42c926f9b4b9435068cb2472a7a106b77da66bb4521bf483d1cb4d85",
+   "side": "UP",
+   "posted": 17400.0,
+   "filled": 5.0,
+   "n": 129
+  },
+  {
+   "cid": "0xa3bd770f42c926f9b4b9435068cb2472a7a106b77da66bb4521bf483d1cb4d85",
+   "side": "DOWN",
+   "posted": 19325.0,
+   "filled": 0.0,
+   "n": 177
+  },
+  {
+   "cid": "0xda75a4a463bd90f0a3bea1b9a0cc29db8475cebce79954f6f827c362dd908542",
+   "side": "UP",
+   "posted": 14940.0,
+   "filled": 20.44,
+   "n": 188
+  },
+  {
+   "cid": "0xda75a4a463bd90f0a3bea1b9a0cc29db8475cebce79954f6f827c362dd908542",
+   "side": "DOWN",
+   "posted": 19062.0,
+   "filled": 135.0,
+   "n": 187
+  },
+  {
+   "cid": "0x2498c20721a62f1ff81a432a2c85f98af1d598ba4a8ab1cc258b0405cf10c67f",
+   "side": "UP",
+   "posted": 26715.0,
+   "filled": 109.75878500000002,
+   "n": 211
+  },
+  {
+   "cid": "0x2498c20721a62f1ff81a432a2c85f98af1d598ba4a8ab1cc258b0405cf10c67f",
+   "side": "DOWN",
+   "posted": 28834.0,
+   "filled": 135.0,
+   "n": 227
+  },
+  {
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "side": "UP",
+   "posted": 18210.0,
+   "filled": 189.323571,
+   "n": 135
+  },
+  {
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "side": "DOWN",
+   "posted": 18541.0,
+   "filled": 235.0,
+   "n": 138
+  },
+  {
+   "cid": "0xa66e70f9c298c744537dc3c66e625794922a980ba8d38ef3fe33ba2d178219b7",
+   "side": "UP",
+   "posted": 3269.0,
+   "filled": 0.0,
+   "n": 44
+  },
+  {
+   "cid": "0xa66e70f9c298c744537dc3c66e625794922a980ba8d38ef3fe33ba2d178219b7",
+   "side": "DOWN",
+   "posted": 2890.0,
+   "filled": 0.0,
+   "n": 45
+  },
+  {
+   "cid": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "side": "UP",
+   "posted": 26864.0,
+   "filled": 261.78,
+   "n": 226
+  },
+  {
+   "cid": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "side": "DOWN",
+   "posted": 23963.0,
+   "filled": 135.0,
+   "n": 209
+  },
+  {
+   "cid": "0x700dceb5257c664de091156f768a4024e2817ad1b41ca7302efdee9e6ebd6a69",
+   "side": "UP",
+   "posted": 16865.0,
+   "filled": 74.63999999999999,
+   "n": 154
+  },
+  {
+   "cid": "0x700dceb5257c664de091156f768a4024e2817ad1b41ca7302efdee9e6ebd6a69",
+   "side": "DOWN",
+   "posted": 18398.0,
+   "filled": 0.0,
+   "n": 169
+  },
+  {
+   "cid": "0xfa1e6a0af97304bf081e854b89d5b430b9cdb3837ed0e28c5f9edea0ad1211ca",
+   "side": "DOWN",
+   "posted": 5.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0x4d18e2c722144b600b2b796809f87ec5f265d3d65213f5097bc2ffc4a1626d8b",
+   "side": "UP",
+   "posted": 9580.0,
+   "filled": 0.0,
+   "n": 79
+  },
+  {
+   "cid": "0x4d18e2c722144b600b2b796809f87ec5f265d3d65213f5097bc2ffc4a1626d8b",
+   "side": "DOWN",
+   "posted": 12621.0,
+   "filled": 0.0,
+   "n": 104
+  },
+  {
+   "cid": "0x88d2251f33c6e5745edc2424a79578fcbd289667790514b04da8a0392154e539",
+   "side": "UP",
+   "posted": 14105.0,
+   "filled": 42.72,
+   "n": 116
+  },
+  {
+   "cid": "0x88d2251f33c6e5745edc2424a79578fcbd289667790514b04da8a0392154e539",
+   "side": "DOWN",
+   "posted": 37318.0,
+   "filled": 0.0,
+   "n": 406
+  },
+  {
+   "cid": "0x8992f7316a12ca75e5a25c92721f402bdd3b1ee92610d1a9d8f581af3e9143c2",
+   "side": "UP",
+   "posted": 2015.0,
+   "filled": 0.0,
+   "n": 18
+  },
+  {
+   "cid": "0x8992f7316a12ca75e5a25c92721f402bdd3b1ee92610d1a9d8f581af3e9143c2",
+   "side": "DOWN",
+   "posted": 2247.0,
+   "filled": 6.0,
+   "n": 20
+  },
+  {
+   "cid": "0xfd08056dee526375e4a4ec411cd1dc0026ca76413a7ee135a658b6a8e8f219b9",
+   "side": "UP",
+   "posted": 62803.0,
+   "filled": 9.4,
+   "n": 474
+  },
+  {
+   "cid": "0xfd08056dee526375e4a4ec411cd1dc0026ca76413a7ee135a658b6a8e8f219b9",
+   "side": "DOWN",
+   "posted": 65360.0,
+   "filled": 0.0,
+   "n": 492
+  },
+  {
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "side": "UP",
+   "posted": 46380.0,
+   "filled": 322.0,
+   "n": 348
+  },
+  {
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "side": "DOWN",
+   "posted": 60825.0,
+   "filled": 123.365,
+   "n": 455
+  },
+  {
+   "cid": "0x60ba01bd7b151e2f18e64c1ea90b83181daab19789142b50bcc031105347f0f6",
+   "side": "UP",
+   "posted": 255.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0x60ba01bd7b151e2f18e64c1ea90b83181daab19789142b50bcc031105347f0f6",
+   "side": "DOWN",
+   "posted": 224.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0xa1b536c510fe7ebcc53fe3262e1197c67bf02c4621b107619f43dc9d81d221af",
+   "side": "UP",
+   "posted": 57301.0,
+   "filled": 0.0,
+   "n": 460
+  },
+  {
+   "cid": "0xa1b536c510fe7ebcc53fe3262e1197c67bf02c4621b107619f43dc9d81d221af",
+   "side": "DOWN",
+   "posted": 62750.0,
+   "filled": 0.0,
+   "n": 512
+  },
+  {
+   "cid": "0xa3abb41b7c84b9a4d34afe02c850c844284bbd12947939367e6ad55f853e6509",
+   "side": "UP",
+   "posted": 12182.0,
+   "filled": 0.0,
+   "n": 128
+  },
+  {
+   "cid": "0xa3abb41b7c84b9a4d34afe02c850c844284bbd12947939367e6ad55f853e6509",
+   "side": "DOWN",
+   "posted": 48228.0,
+   "filled": 0.0,
+   "n": 417
+  },
+  {
+   "cid": "0x331e84f080cef0976b352852775f948219eb8243ee4f3b3e59af411cc40d7800",
+   "side": "UP",
+   "posted": 13205.0,
+   "filled": 0.0,
+   "n": 126
+  },
+  {
+   "cid": "0x331e84f080cef0976b352852775f948219eb8243ee4f3b3e59af411cc40d7800",
+   "side": "DOWN",
+   "posted": 28360.0,
+   "filled": 0.0,
+   "n": 266
+  },
+  {
+   "cid": "0x6c1f3473f35702f00796b4ade45689570c86e933497501b99f81762be94ccf4e",
+   "side": "UP",
+   "posted": 11758.0,
+   "filled": 0.0,
+   "n": 140
+  },
+  {
+   "cid": "0x6c1f3473f35702f00796b4ade45689570c86e933497501b99f81762be94ccf4e",
+   "side": "DOWN",
+   "posted": 29177.0,
+   "filled": 0.0,
+   "n": 289
+  },
+  {
+   "cid": "0x975e068bb98f4a0fccdecea1b1cc5feb1f3774cc23f2d683449eff3b63dd1fda",
+   "side": "UP",
+   "posted": 34612.0,
+   "filled": 0.0,
+   "n": 344
+  },
+  {
+   "cid": "0x975e068bb98f4a0fccdecea1b1cc5feb1f3774cc23f2d683449eff3b63dd1fda",
+   "side": "DOWN",
+   "posted": 18243.0,
+   "filled": 0.0,
+   "n": 355
+  },
+  {
+   "cid": "0x1aa7ade5533c0fdbee8621fa8cd7c4c7ab76c40f0d42b183cf6e5aa0c8ff0de7",
+   "side": "UP",
+   "posted": 15140.0,
+   "filled": 0.0,
+   "n": 129
+  },
+  {
+   "cid": "0x1aa7ade5533c0fdbee8621fa8cd7c4c7ab76c40f0d42b183cf6e5aa0c8ff0de7",
+   "side": "DOWN",
+   "posted": 14770.0,
+   "filled": 0.0,
+   "n": 127
+  },
+  {
+   "cid": "0xf0a702c98c247180bc034194b862c8df230ec252a4e8918742924f662568dbc3",
+   "side": "UP",
+   "posted": 120.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0xf0a702c98c247180bc034194b862c8df230ec252a4e8918742924f662568dbc3",
+   "side": "DOWN",
+   "posted": 120.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0x0f7a43969727904abdf9fe37fbe8e9b20e871ca8d41ee7c35d210761109ceea6",
+   "side": "UP",
+   "posted": 205.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0x0f7a43969727904abdf9fe37fbe8e9b20e871ca8d41ee7c35d210761109ceea6",
+   "side": "DOWN",
+   "posted": 198.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0xc750afc124803004d2944708e6af47cdc23465d837fcbdfa3d7cd91e80b857a6",
+   "side": "UP",
+   "posted": 5.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0xc750afc124803004d2944708e6af47cdc23465d837fcbdfa3d7cd91e80b857a6",
+   "side": "DOWN",
+   "posted": 140.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0x0c7b605341236536cde4d010cca9d3b1954b2ab6439cda899ac400bfe603274a",
+   "side": "UP",
+   "posted": 85.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0x0c7b605341236536cde4d010cca9d3b1954b2ab6439cda899ac400bfe603274a",
+   "side": "DOWN",
+   "posted": 85.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0x32d34e36428ec6da9e6cff5ef778ef8f7cbb7bce2900bff0589eaa3f5adb4be1",
+   "side": "UP",
+   "posted": 255.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0x32d34e36428ec6da9e6cff5ef778ef8f7cbb7bce2900bff0589eaa3f5adb4be1",
+   "side": "DOWN",
+   "posted": 255.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0xfd5d06a9a3782e73859ea1bbcfc729b88f92da9a117f0550ac450d11efd46b28",
+   "side": "UP",
+   "posted": 2733.0,
+   "filled": 0.0,
+   "n": 56
+  },
+  {
+   "cid": "0xfd5d06a9a3782e73859ea1bbcfc729b88f92da9a117f0550ac450d11efd46b28",
+   "side": "DOWN",
+   "posted": 1048.0,
+   "filled": 0.0,
+   "n": 16
+  },
+  {
+   "cid": "0xd7b43163df1dc66519a5a194436d13bd51d23854cd21b7daaaafb9f12329fe79",
+   "side": "UP",
+   "posted": 73.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0xa949b772fc184ba556271d1de621a5654382e2d310d549ae25bb50d5fc6c6de1",
+   "side": "UP",
+   "posted": 970.0,
+   "filled": 0.0,
+   "n": 17
+  },
+  {
+   "cid": "0xa949b772fc184ba556271d1de621a5654382e2d310d549ae25bb50d5fc6c6de1",
+   "side": "DOWN",
+   "posted": 16962.0,
+   "filled": 0.0,
+   "n": 148
+  },
+  {
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "side": "UP",
+   "posted": 24819.0,
+   "filled": 12.41,
+   "n": 220
+  },
+  {
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "side": "DOWN",
+   "posted": 25941.0,
+   "filled": 77.58,
+   "n": 217
+  },
+  {
+   "cid": "0xb2fb0a3ce19a3a25302fa8d9e351826d4f4909ec8af1d0620c706b5fb3671746",
+   "side": "UP",
+   "posted": 120.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0xb2fb0a3ce19a3a25302fa8d9e351826d4f4909ec8af1d0620c706b5fb3671746",
+   "side": "DOWN",
+   "posted": 51.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0x0531779ab466d6c13cabfea68448bcf92756c45310048a6bdc106740460a3e9d",
+   "side": "UP",
+   "posted": 1220.0,
+   "filled": 0.0,
+   "n": 10
+  },
+  {
+   "cid": "0x0531779ab466d6c13cabfea68448bcf92756c45310048a6bdc106740460a3e9d",
+   "side": "DOWN",
+   "posted": 1215.0,
+   "filled": 0.0,
+   "n": 9
+  },
+  {
+   "cid": "0xd04cfc3253ef13c1ebda1971b9476a29257d60ff5384617579770240b36875f7",
+   "side": "UP",
+   "posted": 26583.0,
+   "filled": 0.0,
+   "n": 210
+  },
+  {
+   "cid": "0xd04cfc3253ef13c1ebda1971b9476a29257d60ff5384617579770240b36875f7",
+   "side": "DOWN",
+   "posted": 27902.0,
+   "filled": 0.0,
+   "n": 236
+  },
+  {
+   "cid": "0xdf4aaa4d15ba71baed89b18edc53f8b05d2611320f674ea0ed5a1e34753592b3",
+   "side": "UP",
+   "posted": 8470.0,
+   "filled": 0.0,
+   "n": 83
+  },
+  {
+   "cid": "0xdf4aaa4d15ba71baed89b18edc53f8b05d2611320f674ea0ed5a1e34753592b3",
+   "side": "DOWN",
+   "posted": 6860.0,
+   "filled": 85.0,
+   "n": 68
+  },
+  {
+   "cid": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "side": "UP",
+   "posted": 8355.0,
+   "filled": 170.0,
+   "n": 62
+  },
+  {
+   "cid": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "side": "DOWN",
+   "posted": 7140.0,
+   "filled": 135.0,
+   "n": 53
+  },
+  {
+   "cid": "0xc5fac43fb2ceb6e88c4badb230421d6f5f3a3cdfe170d5b5469445d1747d960d",
+   "side": "UP",
+   "posted": 3793.0,
+   "filled": 0.0,
+   "n": 56
+  },
+  {
+   "cid": "0xc5fac43fb2ceb6e88c4badb230421d6f5f3a3cdfe170d5b5469445d1747d960d",
+   "side": "DOWN",
+   "posted": 3930.0,
+   "filled": 0.0,
+   "n": 62
+  },
+  {
+   "cid": "0xfcf38d4553b33355efe4e6353a310db53303ee18c9ad9e78213b1820d9556383",
+   "side": "UP",
+   "posted": 120.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0xfcf38d4553b33355efe4e6353a310db53303ee18c9ad9e78213b1820d9556383",
+   "side": "DOWN",
+   "posted": 39.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0x0c82093780da4342e47eb5fdae6280bf34a429e086f22c9957906695f6d972c1",
+   "side": "DOWN",
+   "posted": 4575.0,
+   "filled": 0.0,
+   "n": 36
+  },
+  {
+   "cid": "0x90dab0680f465b0e4f505295d1b138b2982a86a2eafa92b6530c5035efa7a716",
+   "side": "UP",
+   "posted": 240.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0x90dab0680f465b0e4f505295d1b138b2982a86a2eafa92b6530c5035efa7a716",
+   "side": "DOWN",
+   "posted": 240.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0xbaefb45dfb13dee04ab24e02b02a2d3ea3e8441582dc16c977e7e97377661010",
+   "side": "UP",
+   "posted": 232.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0xbaefb45dfb13dee04ab24e02b02a2d3ea3e8441582dc16c977e7e97377661010",
+   "side": "DOWN",
+   "posted": 159.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0x3250991062dee7e768335a2dca0b5282e8e3bf461120775a1f94de78cd7d55c6",
+   "side": "UP",
+   "posted": 230.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0x3250991062dee7e768335a2dca0b5282e8e3bf461120775a1f94de78cd7d55c6",
+   "side": "DOWN",
+   "posted": 135.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0x0c82093780da4342e47eb5fdae6280bf34a429e086f22c9957906695f6d972c1",
+   "side": "UP",
+   "posted": 4913.0,
+   "filled": 0.0,
+   "n": 37
+  },
+  {
+   "cid": "0x998c3ae4eb83983d477a8def12134f195b0627503c975eaa547a58167345e843",
+   "side": "UP",
+   "posted": 2740.0,
+   "filled": 0.0,
+   "n": 21
+  },
+  {
+   "cid": "0x998c3ae4eb83983d477a8def12134f195b0627503c975eaa547a58167345e843",
+   "side": "DOWN",
+   "posted": 3067.0,
+   "filled": 0.0,
+   "n": 24
+  },
+  {
+   "cid": "0xb7cbbb1ae06d551cc95a17840350dda741d6f88aa5005d1a5a4e49f5de800980",
+   "side": "UP",
+   "posted": 375.0,
+   "filled": 0.0,
+   "n": 3
+  },
+  {
+   "cid": "0xb7cbbb1ae06d551cc95a17840350dda741d6f88aa5005d1a5a4e49f5de800980",
+   "side": "DOWN",
+   "posted": 375.0,
+   "filled": 0.0,
+   "n": 3
+  },
+  {
+   "cid": "0x7b02186cfb0200f6db3c8cf645334a94e13e4efe0015f3616e632647f088b93c",
+   "side": "UP",
+   "posted": 9411.0,
+   "filled": 14.0,
+   "n": 70
+  },
+  {
+   "cid": "0x7b02186cfb0200f6db3c8cf645334a94e13e4efe0015f3616e632647f088b93c",
+   "side": "DOWN",
+   "posted": 6627.0,
+   "filled": 107.41,
+   "n": 50
+  },
+  {
+   "cid": "0xe493e01d21535bfd02a4a8957015288abce314a9b489ee3ec7ae797e6df30b4e",
+   "side": "UP",
+   "posted": 5790.0,
+   "filled": 233.39729599999998,
+   "n": 43
+  },
+  {
+   "cid": "0xe493e01d21535bfd02a4a8957015288abce314a9b489ee3ec7ae797e6df30b4e",
+   "side": "DOWN",
+   "posted": 6465.0,
+   "filled": 0.0,
+   "n": 48
+  },
+  {
+   "cid": "0x20f02425ebb3dff922542e3306b515d0059724beacd15bc7f048d7449c4e9417",
+   "side": "UP",
+   "posted": 1605.0,
+   "filled": 0.0,
+   "n": 12
+  },
+  {
+   "cid": "0x20f02425ebb3dff922542e3306b515d0059724beacd15bc7f048d7449c4e9417",
+   "side": "DOWN",
+   "posted": 1470.0,
+   "filled": 0.0,
+   "n": 11
+  },
+  {
+   "cid": "0x89ae4bd727cfb265d512f605df0827d6f1d9dc263e2ea669e93063365977ef67",
+   "side": "UP",
+   "posted": 135.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0x89ae4bd727cfb265d512f605df0827d6f1d9dc263e2ea669e93063365977ef67",
+   "side": "DOWN",
+   "posted": 135.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0x09396b2e3cec4ced5c176724d51bd577c15051a283db94cae83a747efd015f3f",
+   "side": "UP",
+   "posted": 120.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0x09396b2e3cec4ced5c176724d51bd577c15051a283db94cae83a747efd015f3f",
+   "side": "DOWN",
+   "posted": 120.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "side": "UP",
+   "posted": 6414.0,
+   "filled": 205.0,
+   "n": 78
+  },
+  {
+   "cid": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "side": "DOWN",
+   "posted": 4095.0,
+   "filled": 135.0,
+   "n": 43
+  },
+  {
+   "cid": "0x63d81a2ed40f3d1647b0b81146fd2dc76797ccf68958afcf4236dce4557a5470",
+   "side": "UP",
+   "posted": 1658.0,
+   "filled": 0.0,
+   "n": 18
+  },
+  {
+   "cid": "0x63d81a2ed40f3d1647b0b81146fd2dc76797ccf68958afcf4236dce4557a5470",
+   "side": "DOWN",
+   "posted": 14.0,
+   "filled": 0.0,
+   "n": 2
+  },
+  {
+   "cid": "0xa07afa604d35aa9defce63ed7ec32f8b0514aa423a12e87ff3f6771479d21672",
+   "side": "UP",
+   "posted": 418.0,
+   "filled": 0.0,
+   "n": 5
+  },
+  {
+   "cid": "0xa07afa604d35aa9defce63ed7ec32f8b0514aa423a12e87ff3f6771479d21672",
+   "side": "DOWN",
+   "posted": 5273.0,
+   "filled": 0.0,
+   "n": 47
+  },
+  {
+   "cid": "0xdf81e7d8988eb38bea52982e1ce34fc08ea197993c103b4e28535924f6ffd2db",
+   "side": "UP",
+   "posted": 796.0,
+   "filled": 0.0,
+   "n": 12
+  },
+  {
+   "cid": "0xdf81e7d8988eb38bea52982e1ce34fc08ea197993c103b4e28535924f6ffd2db",
+   "side": "DOWN",
+   "posted": 690.0,
+   "filled": 0.0,
+   "n": 11
+  },
+  {
+   "cid": "0xa16d0696a3cedc7d8faeb1e03eb036bddccc3cae473b0604c19548f7ca7d480a",
+   "side": "UP",
+   "posted": 780.0,
+   "filled": 0.0,
+   "n": 6
+  },
+  {
+   "cid": "0xa16d0696a3cedc7d8faeb1e03eb036bddccc3cae473b0604c19548f7ca7d480a",
+   "side": "DOWN",
+   "posted": 2656.0,
+   "filled": 0.0,
+   "n": 26
+  },
+  {
+   "cid": "0xb53f223be1db0deaca728f91eb479b522ddce74efa33fa8844d79b7fdcec2598",
+   "side": "UP",
+   "posted": 3177.0,
+   "filled": 0.0,
+   "n": 33
+  },
+  {
+   "cid": "0xb53f223be1db0deaca728f91eb479b522ddce74efa33fa8844d79b7fdcec2598",
+   "side": "DOWN",
+   "posted": 1236.0,
+   "filled": 0.0,
+   "n": 18
+  },
+  {
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "side": "UP",
+   "posted": 13076.0,
+   "filled": 305.0,
+   "n": 100
+  },
+  {
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "side": "DOWN",
+   "posted": 11095.0,
+   "filled": 356.93540700000005,
+   "n": 97
+  },
+  {
+   "cid": "0x1a1b583bc9c778eb169b2bc78a04630a50398be880548276804c5e2a05f4eaa9",
+   "side": "UP",
+   "posted": 8096.0,
+   "filled": 0.0,
+   "n": 68
+  },
+  {
+   "cid": "0x1a1b583bc9c778eb169b2bc78a04630a50398be880548276804c5e2a05f4eaa9",
+   "side": "DOWN",
+   "posted": 6033.0,
+   "filled": 0.0,
+   "n": 86
+  },
+  {
+   "cid": "0x65b7ed8d9cf83e14a02c99ef51a3f9bdaa79bdbccd299e072ea53d370d903c8d",
+   "side": "UP",
+   "posted": 1393.0,
+   "filled": 0.0,
+   "n": 12
+  },
+  {
+   "cid": "0x65b7ed8d9cf83e14a02c99ef51a3f9bdaa79bdbccd299e072ea53d370d903c8d",
+   "side": "DOWN",
+   "posted": 1266.0,
+   "filled": 0.0,
+   "n": 11
+  },
+  {
+   "cid": "0xa6d016ba329b99b89bc4170baa70fa24420a8e09860e39dacddc6471c0641884",
+   "side": "UP",
+   "posted": 29.0,
+   "filled": 0.0,
+   "n": 1
+  },
+  {
+   "cid": "0xf57902fb236a32a52a6230e8c7c46d0ecd13cd04b43fb48064007666b0ef1ce5",
+   "side": "UP",
+   "posted": 460.0,
+   "filled": 0.0,
+   "n": 7
+  },
+  {
+   "cid": "0xf57902fb236a32a52a6230e8c7c46d0ecd13cd04b43fb48064007666b0ef1ce5",
+   "side": "DOWN",
+   "posted": 460.0,
+   "filled": 0.0,
+   "n": 7
+  }
+ ],
+ "fill_sides": [
+  {
+   "cid": "0x149d28e7f5aaa243c78bd97f670706663b4b34b1aa6b5d466c7f684e91f50b7a",
+   "UP": 189.323571,
+   "DOWN": 235.0,
+   "slug": "cs2-arc4-btf-2026-08-03"
+  },
+  {
+   "cid": "0xa3bd770f42c926f9b4b9435068cb2472a7a106b77da66bb4521bf483d1cb4d85",
+   "UP": 5.0,
+   "DOWN": 0.0,
+   "slug": "lol-rs-deer-2026-08-03"
+  },
+  {
+   "cid": "0xcf68640be0770763444cdb7276913ed566ca24e91d684eca37b75ed8c3a48a16",
+   "UP": 184.3,
+   "DOWN": 84.0,
+   "slug": "elon-musk-of-tweets-august-1-august-3-0-39"
+  },
+  {
+   "cid": "0x2498c20721a62f1ff81a432a2c85f98af1d598ba4a8ab1cc258b0405cf10c67f",
+   "UP": 109.75878500000002,
+   "DOWN": 135.0,
+   "slug": "cs2-mouzn-mis-2026-08-03"
+  },
+  {
+   "cid": "0xda75a4a463bd90f0a3bea1b9a0cc29db8475cebce79954f6f827c362dd908542",
+   "UP": 20.44,
+   "DOWN": 135.0,
+   "slug": "will-bitcoin-dip-to-62k-on-august-3"
+  },
+  {
+   "cid": "0x8992f7316a12ca75e5a25c92721f402bdd3b1ee92610d1a9d8f581af3e9143c2",
+   "UP": 0.0,
+   "DOWN": 6.0,
+   "slug": "wta-boisson-ruzic-2026-08-02"
+  },
+  {
+   "cid": "0x88d2251f33c6e5745edc2424a79578fcbd289667790514b04da8a0392154e539",
+   "UP": 42.72,
+   "DOWN": 0.0,
+   "slug": "atp-zheng-kecmano-2026-08-02"
+  },
+  {
+   "cid": "0x700dceb5257c664de091156f768a4024e2817ad1b41ca7302efdee9e6ebd6a69",
+   "UP": 74.63999999999999,
+   "DOWN": 0.0,
+   "slug": "elon-musk-of-tweets-july-28-august-4-240-259"
+  },
+  {
+   "cid": "0xd807b4f7da58129a1f3b63c3bf17e6f789876a34c3bf1b00aafce5a9f4d89bdf",
+   "UP": 261.78,
+   "DOWN": 135.0,
+   "slug": "elon-musk-of-tweets-july-28-august-4-220-239"
+  },
+  {
+   "cid": "0xfd08056dee526375e4a4ec411cd1dc0026ca76413a7ee135a658b6a8e8f219b9",
+   "UP": 9.4,
+   "DOWN": 0.0,
+   "slug": "elon-musk-of-tweets-july-28-august-4-200-219"
+  },
+  {
+   "cid": "0x010522f1f7e0cb638c6e07559441188f1b5e714455643db498c92f5d3197f9ee",
+   "UP": 322.0,
+   "DOWN": 123.365,
+   "slug": "bitcoin-above-64k-on-august-4-2026"
+  },
+  {
+   "cid": "0xdf4aaa4d15ba71baed89b18edc53f8b05d2611320f674ea0ed5a1e34753592b3",
+   "UP": 0.0,
+   "DOWN": 85.0,
+   "slug": "atp-shang-rublev-2026-08-04"
+  },
+  {
+   "cid": "0xe6a4f98bbf2daafd6ffd2eae82384a307c6a1cb9b8f839216b26f4baf8fb978e",
+   "UP": 170.0,
+   "DOWN": 135.0,
+   "slug": "cs2-gls1-meiano-2026-08-04"
+  },
+  {
+   "cid": "0xe493e01d21535bfd02a4a8957015288abce314a9b489ee3ec7ae797e6df30b4e",
+   "UP": 233.39729599999998,
+   "DOWN": 0.0,
+   "slug": "lol-maz-mg1-2026-08-04"
+  },
+  {
+   "cid": "0x7b02186cfb0200f6db3c8cf645334a94e13e4efe0015f3616e632647f088b93c",
+   "UP": 14.0,
+   "DOWN": 107.41,
+   "slug": "wta-kalinsk-kessler-2026-08-04"
+  },
+  {
+   "cid": "0xb919777c92212f3a7ff07a6e77568162657229d9a9cff0595d0b3379671ecbc4",
+   "UP": 205.0,
+   "DOWN": 135.0,
+   "slug": "mlb-tb-col-2026-08-04"
+  },
+  {
+   "cid": "0x4623495dd415b3ba582419d13cd0a52cb1171638cbf1b5449290e07ebbff3ace",
+   "UP": 12.41,
+   "DOWN": 77.58,
+   "slug": "lol-dkc-nsea-2026-08-05"
+  },
+  {
+   "cid": "0x5a76ff827fee03a48315e6d450d811a9723d05834e4f2d45c7566dafe27d252a",
+   "UP": 305.0,
+   "DOWN": 356.93540700000005,
+   "slug": "lol-foxy-drxc-2026-08-05"
+  }
+ ]
+};
+</script>
+<script>
+/* ---------- helpers ---------------------------------------------------- */
+const T = DATA.totals, L = DATA.live, MK = DATA.markouts, FL = DATA.fills;
+const $ = s => document.querySelector(s);
+const usd = (v,d=2) => (v<0?'-':'')+'$'+Math.abs(v).toFixed(d);
+const c  = v => (v*100).toFixed(1)+'c';
+const cls= v => v>0?'good':(v<0?'bad':'dim');
+const esc= s => String(s).replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]));
+const COL={good:'#3fb950',bad:'#f85149',warn:'#d29922',info:'#58a6ff',acc:'#bc8cff',
+           dim:'#5c6880',line:'#232c3d',fg:'#e6edf7'};
+
+function svg(w,h){ return `<svg viewBox="0 0 ${w} ${h}" width="${w}" height="${h}">`; }
+function txt(x,y,s,o={}){
+  return `<text x="${x}" y="${y}" font-size="${o.fs||11}" fill="${o.fill||COL.dim}"
+    text-anchor="${o.a||'middle'}" ${o.w?`font-weight="${o.w}"`:''}>${esc(s)}</text>`;
+}
+function rect(x,y,w,h,f,o={}){
+  return `<rect x="${x}" y="${y}" width="${Math.max(0,w)}" height="${Math.max(0,h)}"
+    fill="${f}" ${o.rx?`rx="${o.rx}"`:''} ${o.op?`opacity="${o.op}"`:''}
+    ${o.stroke?`stroke="${o.stroke}" stroke-width="${o.sw||1}"`:''}/>`;
+}
+function line(x1,y1,x2,y2,s,o={}){
+  return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${s}"
+    stroke-width="${o.w||1}" ${o.dash?`stroke-dasharray="${o.dash}"`:''}/>`;
+}
+function sect(id,title,tag){
+  return `<h2 id="${id}">${title}${tag?`<span class="lbl">${tag}</span>`:''}</h2>`;
+}
+const out=[];
+const push = s => out.push(s);
+
+/* ---------- 0. headline ------------------------------------------------- */
+const dt = new Date(T.now*1000);
+$('#sub').innerHTML = `נוצר ${dt.toLocaleString('he-IL')} &nbsp;·&nbsp;
+  <span class="mono">${T.fills}</span> fills ·
+  <span class="mono">${T.quotes.toLocaleString()}</span> quotes ·
+  <span class="mono">${T.markets}</span> שווקים חיים ·
+  חלון של <span class="mono">${T.fills_span_h.toFixed(1)}</span> שעות מסחר`;
+
+push(`<div class="cards">
+ <div class="card"><div class="k">Realized P&L</div>
+   <div class="v good">${usd(T.realized)}</div><div class="n">${DATA.resolutions.length} הכרעות + ${T.closes} סגירות</div></div>
+ <div class="card"><div class="k">Paired Float</div>
+   <div class="v ${cls(T.paired_float)}">${usd(T.paired_float)}</div><div class="n">זוגות שנקנו מעל פארטי</div></div>
+ <div class="card"><div class="k">Unhedged Float</div>
+   <div class="v bad">${usd(T.unhedged_float)}</div><div class="n">מסומן ב-bid נוכחי</div></div>
+ <div class="card"><div class="k">Total Liquidation</div>
+   <div class="v bad">${usd(T.liquidation)}</div><div class="n">אילו היינו סוגרים עכשיו</div></div>
+ <div class="card"><div class="k">At Risk (Naked Cost)</div>
+   <div class="v warn">${usd(T.at_risk)}</div><div class="n">מול תקרה של $400</div></div>
+</div>`);
+
+push(`<div class="note bad"><b>המסקנה בשורה אחת.</b>
+כל ה-<span class="num">${usd(T.unhedged_float)}</span> מרוכזים ב-<b>3 שווקים</b> מתוך 23,
+וכולם חולקים את אותו סימן היכר יחיד: <b>הספר כבר הכריע</b> (<span class="num">up_bid=0.999</span>
+או ספר בלתי-קריא לחלוטין) והצד שאנחנו מחזיקים הוא הצד המפסיד.
+זו לא זליגה מפוזרת של Adverse Selection על פני התיק — זה סיכון הכרעה בינארי
+בשלושה שווקים שנתקענו בהם חד-צדדית ולא יצאנו.</div>`);
+
+/* ---------- 1. waterfall ------------------------------------------------ */
+push(sect('waterfall','1. מאזן כולל: מאיפה מגיע כל דולר','Waterfall'));
+push(`<p>הפירוק המדויק של <code>Total Liquidation P&L</code> לשלושת מרכיביו,
+בדיוק כפי שהדשבורד מגדיר אותם. גובה כל עמודה הוא הסכום; הקו האפור הוא אפס.</p>`);
+{
+  const steps=[
+    ['Realized', T.realized, COL.good],
+    ['Paired Float', T.paired_float, COL.warn],
+    ['Unhedged Float', T.unhedged_float, COL.bad],
+  ];
+  const W=980,H=250,PAD=40,BW=150;
+  let s=svg(W,H), run=0;
+  const all=[0]; steps.forEach(x=>{run+=x[1];all.push(run)});
+  const mn=Math.min(...all,0), mx=Math.max(...all,0), rng=(mx-mn)||1;
+  const Y=v=>H-PAD-((v-mn)/rng)*(H-2*PAD);
+  s+=line(PAD,Y(0),W-PAD,Y(0),COL.line,{w:1});
+  s+=txt(W-PAD+2,Y(0)+4,'0',{a:'start',fs:10});
+  run=0;
+  steps.forEach((st,i)=>{
+    const x=PAD+30+i*(BW+50), y0=Y(run), y1=Y(run+st[1]);
+    s+=rect(x,Math.min(y0,y1),BW,Math.abs(y1-y0),st[2],{rx:3,op:.85});
+    s+=txt(x+BW/2,Math.min(y0,y1)-8,(st[1]>0?'+':'')+usd(st[1]),{fill:st[2],fs:13,w:600});
+    s+=txt(x+BW/2,H-PAD+18,st[0],{fs:12});
+    if(i<steps.length-1) s+=line(x+BW,y1,x+BW+50,y1,COL.dim,{w:1,dash:'3 3'});
+    run+=st[1];
+  });
+  const x=PAD+30+3*(BW+50), y1=Y(run), y0=Y(0);
+  s+=rect(x,Math.min(y0,y1),BW,Math.abs(y1-y0),COL.acc,{rx:3,op:.5,stroke:COL.acc});
+  s+=txt(x+BW/2,Math.min(y0,y1)-8,usd(run),{fill:COL.acc,fs:14,w:700});
+  s+=txt(x+BW/2,H-PAD+18,'Total Liquidation',{fs:12,fill:COL.fg});
+  s+='</svg>';
+  push(`<div class="panel"><div class="chart">${s}</div></div>`);
+}
+push(`<div class="note"><b>מה רואים.</b> העמודה הירוקה
+(<span class="num">${usd(T.realized)}</span>) מוכיחה שמנוע הציטוט עצמו רווחי:
+זה כסף שכבר נכנס מהכרעות ומ-merges. העמודה האדומה מוחקת אותו פי
+<span class="num">${(Math.abs(T.unhedged_float)/T.realized).toFixed(1)}</span>.
+<br><b>מה להסיק.</b> אל תיגע במנוע התמחור. הבעיה כולה במלאי החד-צדדי שנשאר פתוח.
+העמודה הכתומה (<span class="num">${usd(T.paired_float)}</span>) קטנה יחסית — היא אומרת שקנינו
+זוגות בעלות ממוצעת מעט מעל $1.00, מטרד ולא איום.</div>`);
+
+/* ---------- 2. concentration ------------------------------------------- */
+push(sect('conc','2. ריכוזיות: 3 שווקים מייצרים 100% מההפסד','Market-Level Breakdown'));
+push(`<p>הגרף הראשון שביקשת: פיצול ה-P&amp;L הצף לפי שווקים בודדים.
+שאר השווקים אינם מוצגים כי הם שטוחים לחלוטין (אפס מלאי).</p>`);
+{
+  const rows=L.filter(r=>Math.abs(r.naked_float)>0.005||Math.abs(r.paired_float)>0.005)
+              .sort((a,b)=>a.naked_float-b.naked_float);
+  const W=980,H=60+rows.length*44,LW=250;
+  const mx=Math.max(...rows.map(r=>Math.abs(r.naked_float)),1);
+  const zero=LW+ (W-LW-60)*0.62;
+  const sc=v=>(v/mx)*(W-LW-80)*0.60;
+  let s=svg(W,H);
+  s+=line(zero,26,zero,H-14,COL.line,{w:1});
+  s+=txt(zero,18,'0',{fs:10});
+  rows.forEach((r,i)=>{
+    const y=34+i*44;
+    const w=sc(r.naked_float);
+    const col=r.naked_float<0?COL.bad:COL.good;
+    s+=rect(w<0?zero+w:zero, y, Math.abs(w), 22, col,{rx:3,op:.85});
+    s+=txt(LW-8,y+16,r.slug.slice(0,34),{a:'end',fs:12,fill:COL.fg});
+    s+=txt(w<0?zero+w-6:zero+w+6,y+16,usd(r.naked_float),
+           {a:w<0?'end':'start',fs:12,fill:col,w:600});
+    s+=txt(LW-8,y+32,`${r.naked_sh.toFixed(0)}sh ${r.naked_side} @ ${(r.naked_cost/(r.naked_sh||1)).toFixed(3)} · mark=${r.mark} · ${r.sides_readable}/2 צדדים קריאים`,
+           {a:'end',fs:10,fill:COL.dim});
+  });
+  s+='</svg>';
+  push(`<div class="panel"><div class="chart">${s}</div></div>`);
+}
+{
+  const neg=L.filter(r=>r.naked_float<0).sort((a,b)=>a.naked_float-b.naked_float);
+  const tot=neg.reduce((a,r)=>a+r.naked_float,0);
+  const top1=neg[0];
+  push(`<div class="note bad"><b>מה רואים.</b>
+  <span class="num">${top1.slug}</span> לבדו אחראי ל-<span class="num">${usd(top1.naked_float)}</span>,
+  שהם <b>${(100*top1.naked_float/tot).toFixed(0)}%</b> מכל ההפסד הצף.
+  שלושת השווקים האדומים יחד = <span class="num">${usd(tot)}</span>;
+  שני השווקים הירוקים מחזירים <span class="num">${usd(L.reduce((a,r)=>a+Math.max(0,r.naked_float),0))}</span>.
+  <br><b>מה להסיק.</b> התשובה לשאלת האבחון שלך היא חד-משמעית:
+  <b>ההפסד מרוכז, לא מפוזר.</b> אין צורך ברפורמה גורפת של הציטוט —
+  צריך כלל אחד שמונע את המצב הספציפי הזה. חשוב לא פחות:
+  שלושתם מסומנים <span class="num">mark=unreadable</span> או קרוב לאפס,
+  כלומר <b>אין להם בכלל bid לצאת אליו</b> — גם החלטה "לצאת עכשיו" לא הייתה ניתנת לביצוע.</div>`);
+}
+
+/* ---------- 3. mark convention ------------------------------------------ */
+push(sect('mark','3. אזהרה: המספר הזה הוא מוסכמה, לא שווי הוגן','Marking Convention'));
+push(`<p>לפני שמתקנים משהו — חובה להבין מה בדיוק אומר המספר.
+הדשבורד מסמן פוזיציה חד-צדדית לפי <b>ה-bid הנוכחי</b>, ואם הספר לא נקרא הוא רושם
+<span class="num">$0</span> (<code>fleet_dash.py:574</code>). אבל שוק בינארי משלם
+$1.00 או $0.00 בהכרעה. אלה שלושה מספרים שונים מאוד על אותה פוזיציה.</p>`);
+{
+  const sc=[['Liquidate-now (מוסכמת הדשבורד)',T.unhedged_float,COL.bad],
+            ['כל הפוזיציות החשופות מפסידות',T.naked_lose_case,COL.warn],
+            ['כל הפוזיציות החשופות זוכות',T.naked_win_case,COL.good]];
+  const W=980,H=210,LW=290;
+  const mx=Math.max(...sc.map(x=>Math.abs(x[1])));
+  const zero=LW+120, sf=(W-LW-200)/ (2*mx);
+  let s=svg(W,H);
+  s+=line(zero,20,zero,H-26,COL.line,{w:1});
+  sc.forEach((x,i)=>{
+    const y=32+i*52, w=x[1]*sf;
+    s+=rect(w<0?zero+w:zero,y,Math.abs(w),26,x[2],{rx:3,op:.85});
+    s+=txt(LW-10,y+18,x[0],{a:'end',fs:12.5,fill:COL.fg});
+    s+=txt(w<0?zero+w-6:zero+w+6,y+18,usd(x[1]),{a:w<0?'end':'start',fs:13,fill:x[2],w:600});
+  });
+  s+=txt(zero,H-10,'0',{fs:10});
+  s+='</svg>';
+  push(`<div class="panel"><div class="chart">${s}</div></div>`);
+}
+push(`<div class="note warn"><b>מה רואים.</b> אותה פוזיציה בדיוק שווה בין
+<span class="num">${usd(T.naked_lose_case)}</span> ל-<span class="num">${usd(T.naked_win_case)}</span>,
+טווח של <span class="num">${usd(T.naked_win_case-T.naked_lose_case)}</span>.
+<br><b>מה להסיק.</b> שני דברים. ראשית, <b>אל תבנו טריגר סיכון על
+<span class="num">unhedged_float</span></b> — הוא קופץ מ-$0 למלוא העלות ברגע שהספר
+מפסיק להיקרא, בלי ששום דבר כלכלי קרה. הטריגר חייב לשבת על
+<span class="num">naked_cost</span> (המספר היציב) ועל <b>גיל</b> הפוזיציה.
+שנית, המספר <span class="num">${usd(T.unhedged_float)}</span> שאתה רואה בדשבורד
+כבר קרוב מאוד לתרחיש ההפסד המלא, כי רוב הפוזיציות החשופות באמת נמצאות בצד המפסיד
+של שוק שכבר הוכרע. במקרה הזה המוסכמה הפסימית צדקה — אבל היא צדקה במקרה.</div>`);
+
+/* ---------- 4. drift by horizon ---------------------------------------- */
+push(sect('horizon','4. Drift לפי אופק זמן: ההפסד גדל עם ההחזקה','Fill-to-Exit Dynamics'));
+push(`<p>המשימה השנייה שביקשת. <b>Drift</b> הוא <code>mid_later − ref_mid</code>:
+כמה השוק זז נגדנו <i>אחרי</i> שמילא אותנו, בנטרול ה-offset שלנו מתחת ל-mid.
+זה המדד הנקי של Adverse Selection.</p>`);
+{
+  const H0=MK.filter(m=>m.h0!==null).map(m=>m.h0);
+  const H1=MK.filter(m=>m.h1!==null).map(m=>m.h1);
+  const H2=MK.filter(m=>m.h2!==null).map(m=>m.h2);
+  const mean=a=>a.reduce((x,y)=>x+y,0)/a.length;
+  const med=a=>{const s=[...a].sort((x,y)=>x-y);return s[Math.floor(s.length/2)]};
+  const pts=[['5 דק׳',H0],['1 שעה',H1],['6 שעות',H2]];
+  const W=980,H=290,PAD=54;
+  const mn=Math.min(...pts.map(p=>mean(p[1])),0)*1.15, mx=0.02;
+  const Y=v=>H-PAD-((v-mn)/(mx-mn))*(H-2*PAD);
+  const X=i=>PAD+90+i*((W-2*PAD-140)/2);
+  let s=svg(W,H);
+  s+=line(PAD,Y(0),W-PAD,Y(0),COL.line,{w:1});
+  s+=txt(PAD-6,Y(0)+4,'0',{a:'end',fs:10});
+  [-0.05,-0.10].forEach(v=>{ if(v>mn){ s+=line(PAD,Y(v),W-PAD,Y(v),COL.line,{w:1,dash:'2 5'});
+    s+=txt(PAD-6,Y(v)+4,(v*100).toFixed(0)+'c',{a:'end',fs:10}); }});
+  let path='',pathM='';
+  pts.forEach((p,i)=>{ path+=(i?'L':'M')+X(i)+','+Y(mean(p[1]));
+                       pathM+=(i?'L':'M')+X(i)+','+Y(med(p[1])); });
+  s+=`<path d="${pathM}" fill="none" stroke="${COL.info}" stroke-width="2" stroke-dasharray="5 4"/>`;
+  s+=`<path d="${path}" fill="none" stroke="${COL.bad}" stroke-width="3"/>`;
+  pts.forEach((p,i)=>{
+    s+=`<circle cx="${X(i)}" cy="${Y(mean(p[1]))}" r="6" fill="${COL.bad}"/>`;
+    s+=`<circle cx="${X(i)}" cy="${Y(med(p[1]))}" r="4.5" fill="${COL.info}"/>`;
+    s+=txt(X(i),Y(mean(p[1]))-14,c(mean(p[1])),{fill:COL.bad,fs:13,w:600});
+    s+=txt(X(i),Y(med(p[1]))+ (med(p[1])<mean(p[1])?18:-14),c(med(p[1])),{fill:COL.info,fs:11.5});
+    s+=txt(X(i),H-PAD+20,p[0],{fs:13,fill:COL.fg});
+    s+=txt(X(i),H-PAD+36,`n=${p[1].length}`,{fs:11});
+  });
+  s+='</svg>';
+  push(`<div class="panel"><div class="chart">${s}</div>
+    <div class="legend"><span><i style="background:${COL.bad}"></i>ממוצע</span>
+    <span><i style="background:${COL.info}"></i>חציון</span></div></div>`);
+  push(`<div class="note bad"><b>מה רואים.</b> ה-drift הממוצע נופל מונוטונית:
+  <span class="num">${c(mean(H0))}</span> ← <span class="num">${c(mean(H1))}</span> ←
+  <span class="num">${c(mean(H2))}</span>. כלומר: ככל שהפוזיציה נשארת פתוחה יותר,
+  היא מפסידה יותר — לא פחות. הפער העצום בין הממוצע לחציון
+  (<span class="num">${c(mean(H1))}</span> מול <span class="num">${c(med(H1))}</span> בשעה)
+  אומר שההתפלגות היא <b>זנב שמאלי שמן</b>: רוב ה-fills תקינים לגמרי, מיעוט קטן קטסטרופלי.
+  <br><b>מה להסיק.</b> יש בסיס נתונים לסף זמן — אבל <b>לא</b> כזה שמבוסס על drift ממוצע,
+  כי הממוצע נשלט על ידי חריגים. הכלל חייב לתפוס את החריגים עצמם.
+  <br><b>סייג חשוב:</b> אופק 6 השעות נשען על <span class="num">n=${H2.length}</span> בלבד.
+  אל תכיילו פרמטר עליו — הוא מצביע על כיוון, לא נותן מספר.</div>`);
+}
+
+/* ---------- 5. drift histogram ------------------------------------------ */
+push(sect('hist','5. התפלגות ה-Drift: הזנב הוא כל הסיפור','Distribution'));
+{
+  const d=MK.filter(m=>m.last_drift!==null);
+  const vals=d.map(m=>m.last_drift);
+  const W=980,H=300,PAD=48;
+  const lo=-0.90, hi=0.62, NB=26, bw=(hi-lo)/NB;
+  const bins=Array.from({length:NB},()=>({n:0,$:0}));
+  d.forEach(m=>{ let i=Math.floor((m.last_drift-lo)/bw); i=Math.max(0,Math.min(NB-1,i));
+                 bins[i].n++; bins[i].$ += m.last_drift*m.size; });
+  const mxn=Math.max(...bins.map(b=>b.n));
+  const X=v=>PAD+((v-lo)/(hi-lo))*(W-2*PAD);
+  const BW=(W-2*PAD)/NB;
+  let s=svg(W,H);
+  s+=rect(X(-0.90),PAD-14,X(-0.20)-X(-0.90),H-PAD-(PAD-14),'#f8514911',{});
+  s+=txt((X(-0.9)+X(-0.2))/2,PAD-2,'אזור החריגים: drift של עשרות סנטים',{fs:11,fill:'#f8514999'});
+  bins.forEach((b,i)=>{
+    if(!b.n) return;
+    const x=PAD+i*BW, h=(b.n/mxn)*(H-2*PAD-10);
+    const cx=lo+bw*(i+.5);
+    s+=rect(x+1,H-PAD-h,BW-2,h,cx<0?COL.bad:COL.good,{rx:2,op:cx<-0.2?.95:.55});
+    if(b.n>=3) s+=txt(x+BW/2,H-PAD-h-5,b.n,{fs:10});
+  });
+  s+=line(X(0),PAD-14,X(0),H-PAD,COL.fg,{w:1.5});
+  s+=line(PAD,H-PAD,W-PAD,H-PAD,COL.line,{w:1});
+  [-0.8,-0.6,-0.4,-0.2,0,0.2,0.4,0.6].forEach(v=>
+    { s+=txt(X(v),H-PAD+18,(v*100).toFixed(0)+'c',{fs:11}); });
+  s+=txt(W/2,H-8,'Drift לשארה, בסנטים (mid מאוחר פחות mid בזמן ה-fill)',{fs:11.5});
+  s+='</svg>';
+  const neg=vals.filter(v=>v<-0.2), sum$=d.reduce((a,m)=>a+m.last_drift*m.size,0);
+  const tail$=d.filter(m=>m.last_drift<-0.2).reduce((a,m)=>a+m.last_drift*m.size,0);
+  push(`<div class="panel"><div class="chart">${s}</div></div>`);
+  push(`<div class="note"><b>מה רואים.</b> הגוש המרכזי סביב אפס הוא בריא לחלוטין —
+  רוב ה-fills לא זזים כמעט. אבל <span class="num">${neg.length}</span> fills
+  (<span class="num">${(100*neg.length/vals.length).toFixed(0)}%</span> בלבד) נמצאים מתחת ל-‎-20c,
+  ותורמים <span class="num">${usd(tail$)}</span> — מול סך drift של
+  <span class="num">${usd(sum$)}</span> על כל ה-<span class="num">${vals.length}</span> fills.
+  <br><b>מה להסיק.</b> זה גרף "טוב שנראה רע". ההתפלגות המרכזית מאשרת שהאסטרטגיה בריאה;
+  היא לא צריכה כיול עדין. מה שצריך זה <b>מנתק חשמלי</b> לאירועי הזנב:
+  כל ניסיון לשפר את הממוצע דרך offset גדול יותר יעלה לנו fill-rate ולא יגע בזנב בכלל.</div>`);
+}
+
+/* ---------- 6. price band scatter --------------------------------------- */
+push(sect('band','6. הממצא החזק ביותר: רצועת ה-40–60 סנט היא רעילה','Price Band'));
+push(`<p>כל fill כנקודה: מחיר הכניסה מול ה-drift שאחריו. גודל הנקודה = הנוטיונל בדולרים.
+זה החתך שמסביר את הזנב מהגרף הקודם.</p>`);
+{
+  const d=MK.filter(m=>m.last_drift!==null);
+  const W=980,H=380,PAD=54;
+  const X=v=>PAD+ (v/1.0)*(W-2*PAD);
+  const lo=-0.90,hi=0.62;
+  const Y=v=>H-PAD-((v-lo)/(hi-lo))*(H-2*PAD);
+  let s=svg(W,H);
+  s+=rect(X(0.40),PAD-16,X(0.60)-X(0.40),H-PAD-PAD+16,'#f8514918',{});
+  s+=txt((X(0.4)+X(0.6))/2,PAD-4,'רצועת ההימור-מטבע 40–60c',{fs:11.5,fill:'#f85149cc'});
+  s+=line(PAD,Y(0),W-PAD,Y(0),COL.line,{w:1.5});
+  s+=line(PAD,PAD-16,PAD,H-PAD,COL.line,{w:1});
+  [0,0.2,0.4,0.6,0.8,1].forEach(v=>s+=txt(X(v),H-PAD+18,v.toFixed(1),{fs:11}));
+  [-0.8,-0.4,0,0.4].forEach(v=>s+=txt(PAD-8,Y(v)+4,(v*100).toFixed(0)+'c',{a:'end',fs:10}));
+  d.forEach(m=>{
+    const r=Math.max(3.5,Math.min(20,Math.sqrt(m.size*m.fill_price)*1.15));
+    const col=m.last_drift<0?COL.bad:COL.good;
+    s+=`<circle cx="${X(m.fill_price)}" cy="${Y(m.last_drift)}" r="${r}"
+      fill="${col}" opacity="${m.last_drift<-0.2?0.8:0.35}"
+      stroke="${col}" stroke-width="1"/>`;
+  });
+  s+=txt(W/2,H-8,'מחיר ה-fill',{fs:11.5});
+  s+='</svg>';
+  push(`<div class="panel"><div class="chart">${s}</div>
+   <div class="legend"><span><i style="background:${COL.bad}"></i>drift שלילי</span>
+   <span><i style="background:${COL.good}"></i>drift חיובי</span>
+   <span>קוטר = נוטיונל ($)</span></div></div>`);
+}
+{
+  const d=MK.filter(m=>m.last_drift!==null);
+  const B=[[0,.2],[.2,.4],[.4,.6],[.6,.8],[.8,1.01]];
+  const rows=B.map(([a,b])=>{
+    const g=d.filter(m=>m.fill_price>=a&&m.fill_price<b);
+    return {lbl:`${(a*100).toFixed(0)}–${(b*100).toFixed(0)}c`,n:g.length,
+      mean:g.length?g.reduce((x,m)=>x+m.last_drift,0)/g.length:0,
+      $:g.reduce((x,m)=>x+m.last_drift*m.size,0)};
+  });
+  const W=980,H=250,LW=120;
+  const mx=Math.max(...rows.map(r=>Math.abs(r.$)));
+  const zero=W*0.58;
+  let s=svg(W,H);
+  s+=line(zero,16,zero,H-30,COL.line,{w:1});
+  rows.forEach((r,i)=>{
+    const y=26+i*40, w=(r.$/mx)*(W*0.34);
+    const col=r.$<0?COL.bad:COL.good;
+    s+=rect(w<0?zero+w:zero,y,Math.abs(w),24,col,{rx:3,op:Math.abs(r.$)>100?.95:.6});
+    s+=txt(LW,y+17,r.lbl,{a:'end',fs:13,fill:COL.fg});
+    s+=txt(LW+12,y+17,`n=${r.n}  ממוצע ${c(r.mean)}`,{a:'start',fs:11.5});
+    s+=txt(w<0?zero+w-6:zero+w+6,y+17,usd(r.$),{a:w<0?'end':'start',fs:13,fill:col,w:600});
+  });
+  s+='</svg>';
+  push(`<div class="panel"><h3 style="margin-top:0">Drift בדולרים, לפי רצועת מחיר</h3>
+    <div class="chart">${s}</div></div>`);
+  const bad=rows[2];
+  push(`<div class="note bad"><b>מה רואים.</b> רצועת <span class="num">40–60c</span> לבדה:
+  <span class="num">n=${bad.n}</span> fills, drift ממוצע <span class="num">${c(bad.mean)}</span>,
+  ובדולרים <span class="num">${usd(bad.$)}</span>. כל שאר הרצועות יחד חיוביות.
+  ההסבר מכני: מחיר של 50 סנט בשוק בינארי פירושו "אף אחד לא יודע";
+  זה בדיוק המצב שבו הגעת מידע חדש (גול, מפה שנגמרה, נקודה מכרעת) מזיזה את המחיר
+  ב-40 סנט בבת אחת. במחיר 15c או 85c המידע כבר מתומחר והתנועה חסומה.
+  <br><b>מה להסיק.</b> זהו כלל סינון מוכן לשימוש, והוא <b>לא</b> דורש מודל חדש:
+  הגבל נוטיונל ברצועה <span class="num">0.40–0.60</span>, או דרוש בה offset רחב משמעותית.
+  שים לב שהנקודות הגדולות והאדומות ביותר יושבות כולן בתוך הפס האדום.</div>`);
+}
+
+/* ---------- 7. weighted vs unweighted ----------------------------------- */
+push(sect('gate','7. אנומליה בגייט: הוא מודד ממוצע לא-משוקלל','Gate Anomaly'));
+{
+  const d=MK.filter(m=>m.last_drift!==null);
+  const un=d.reduce((a,m)=>a+m.last_drift,0)/d.length;
+  const sz=d.reduce((a,m)=>a+m.last_drift*m.size,0)/d.reduce((a,m)=>a+m.size,0);
+  const widened=L.filter(r=>r.gate==='WIDENED').length;
+  const flat=L.filter(r=>r.gate==='WIDENED'&&r.naked_sh===0&&r.paired===0).length;
+  push(`<div class="two">
+   <div class="card"><div class="k">Drift ממוצע — לא משוקלל <span class="dim">(מה שהגייט קורא)</span></div>
+     <div class="v bad">${c(un)}</div><div class="n">strategy/markout.py: statistics.mean</div></div>
+   <div class="card"><div class="k">Drift ממוצע — משוקלל לפי גודל</div>
+     <div class="v ${cls(sz)}">${c(sz)}</div><div class="n">אותם ${d.length} fills, במשקל דולרי</div></div>
+  </div>`);
+  push(`<div class="note warn"><b>מה רואים.</b> אותה קבוצת נתונים בדיוק נותנת
+  <span class="num">${c(un)}</span> כשסופרים כל fill כשווה ערך, אבל
+  <span class="num">${c(sz)}</span> כשמשקללים לפי מספר המניות. הפער נובע מכך שה-fills
+  הקטנים ביותר (5–17 מניות) הם החריגים הגרועים ביותר, ולכן הם מושכים את הממוצע הפשוט מטה.
+  <br><b>מה להסיק.</b> הגייט הפועל היום מסמן
+  <b>${widened} מתוך ${L.length} השווקים כ-WIDENED</b>, מתוכם
+  <span class="num">${flat}</span> ללא כל מלאי — שווקים שלא הפסידו שקל.
+  זו לא זהירות, זו האטת זרם ההכנסות על כל התיק בגלל שלושה שווקים חולים.
+  התיקון הנכון הוא לשקלל לפי גודל, או לחתוך את הזנב לפני שהוא נכנס לממוצע.</div>`);
+}
+
+/* ---------- 8. pairing rate --------------------------------------------- */
+push(sect('pair','8. Pairing Rate: בשליש מהשווקים אף פעם לא נוצר זוג','Inventory Management'));
+push(`<p>שיעור הזיווג = אחוז המניות שמצאו להן צד נגדי. אפס פירושו שהבוט
+נכנס לצד אחד וזהו — אין שום גידור, מהרגע הראשון ועד עכשיו.</p>`);
+{
+  const by={};
+  FL.forEach(f=>{ const m=by[f.cid]||(by[f.cid]={slug:f.slug,UP:0,DOWN:0,n:0,cost:0});
+    m[f.side]+=f.size; m.n++; m.cost+=f.notional; });
+  const rows=Object.values(by).map(m=>{const t=m.UP+m.DOWN,nk=Math.abs(m.UP-m.DOWN);
+    return {...m,pair:t?(t-nk)/t:0,naked:nk};}).sort((a,b)=>a.pair-b.pair);
+  const W=980,H=42+rows.length*26,LW=250;
+  let s=svg(W,H);
+  rows.forEach((r,i)=>{
+    const y=14+i*26, bw=(W-LW-140)*r.pair;
+    s+=rect(LW,y,W-LW-140,18,'#1b2130',{rx:3});
+    s+=rect(LW,y,bw,18,r.pair<0.01?COL.bad:(r.pair<0.5?COL.warn:COL.good),{rx:3,op:.9});
+    s+=txt(LW-8,y+14,r.slug.slice(0,36),{a:'end',fs:11.5,fill:r.pair<0.01?COL.bad:COL.fg});
+    s+=txt(W-134,y+14,(100*r.pair).toFixed(0)+'%',{a:'start',fs:12,
+       fill:r.pair<0.01?COL.bad:COL.dim,w:600});
+    s+=txt(W-90,y+14,`${r.n} fills · ${r.naked.toFixed(0)}sh חשופות`,{a:'start',fs:10.5});
+  });
+  s+='</svg>';
+  const zero=rows.filter(r=>r.pair<0.01);
+  push(`<div class="panel"><div class="chart">${s}</div></div>`);
+  push(`<div class="note bad"><b>מה רואים.</b> <span class="num">${zero.length}</span>
+  מתוך <span class="num">${rows.length}</span> השווקים שקיבלו fill מעולם לא הגיעו לזיווג אחד.
+  בקצה השני יש שווקים עם 89–92% זיווג — כלומר המנגנון <i>כן</i> עובד כשהספר דו-צדדי.
+  <br><b>מה להסיק.</b> אין כאן כשל אחיד באלגוריתם הזיווג. יש <b>שתי אוכלוסיות שונות</b>
+  של שווקים, והבוט לא מבחין ביניהן: שווקים שבהם זיווג אפשרי (ומצליח מצוין),
+  ושווקים חד-צדדיים שבהם זיווג בלתי-אפשרי מלכתחילה. הכלל הנדרש הוא כלל
+  <b>כניסה</b>, לא כלל יציאה.</div>`);
+}
+
+/* ---------- 9. buildup timeline ----------------------------------------- */
+push(sect('build','9. איך נבנתה הפוזיציה הגרועה ביותר','Fill Sequence'));
+push(`<p>שחזור צעד-אחר-צעד של המלאי החשוף בשווקים המפסידים, מרגע ה-fill הראשון.</p>`);
+{
+  const want=L.filter(r=>r.naked_float<-1).map(r=>r.cid);
+  const W=980,H=300,PAD=50;
+  const series=want.map(cid=>{
+    const f=FL.filter(x=>x.cid===cid).sort((a,b)=>a.ts-b.ts);
+    let up=0,dn=0; const t0=f[0].ts;
+    return {slug:f[0].slug, pts:f.map(x=>{ if(x.side==='UP')up+=x.size; else dn+=x.size;
+      return {t:(x.ts-t0)/60, nk:Math.abs(up-dn)};})};
+  });
+  const mxT=Math.max(...series.flatMap(s=>s.pts.map(p=>p.t)),5);
+  const mxN=Math.max(...series.flatMap(s=>s.pts.map(p=>p.nk)),360);
+  const X=v=>PAD+(v/mxT)*(W-2*PAD-110), Y=v=>H-PAD-(v/mxN)*(H-2*PAD);
+  const cols=[COL.bad,COL.warn,COL.acc];
+  let s=svg(W,H);
+  s+=line(PAD,H-PAD,W-PAD,H-PAD,COL.line,{w:1});
+  s+=line(PAD,PAD-10,PAD,H-PAD,COL.line,{w:1});
+  s+=line(PAD,Y(360),W-PAD-105,Y(360),COL.bad,{w:1,dash:'4 4'});
+  s+=txt(W-PAD-100,Y(360)+4,'max_naked_shares = 360',{a:'start',fs:10,fill:COL.bad});
+  [0,100,200,300].forEach(v=>{ s+=txt(PAD-8,Y(v)+4,v,{a:'end',fs:10}); });
+  series.forEach((se,i)=>{
+    let d='', prev=0;
+    se.pts.forEach((p,j)=>{ if(!j) d+='M'+X(0)+','+Y(0);
+      d+='L'+X(p.t)+','+Y(prev)+'L'+X(p.t)+','+Y(p.nk); prev=p.nk; });
+    d+='L'+X(mxT)+','+Y(prev);
+    s+=`<path d="${d}" fill="none" stroke="${cols[i%3]}" stroke-width="2.5"/>`;
+    se.pts.forEach(p=>s+=`<circle cx="${X(p.t)}" cy="${Y(p.nk)}" r="3.5" fill="${cols[i%3]}"/>`);
+    s+=txt(W-PAD-100,Y(prev)+4,`${se.slug.slice(0,20)}`,{a:'start',fs:10.5,fill:cols[i%3]});
+  });
+  s+=txt(W/2,H-10,'דקות מה-fill הראשון בשוק',{fs:11.5});
+  s+='</svg>';
+  push(`<div class="panel"><div class="chart">${s}</div>
+    <div class="tt">ציר Y = מניות חשופות (|UP − DOWN|).</div></div>`);
+  push(`<div class="note bad"><b>מה רואים.</b> ב-<span class="num">lol-maz-mg1</span>
+  ה-fill הראשון פתח <span class="num">98</span> מניות UP חשופות, ו-30 דקות אחר כך
+  הבוט <b>הוסיף עוד 135 מניות באותו צד בדיוק</b> והגיע ל-<span class="num">233</span> —
+  בלי שנרכשה ולו מניית DOWN אחת. ב-<span class="num">wta-kalinsk</span>
+  ה-fill הראשון פתח מיד <span class="num">107</span> מניות חשופות.
+  קו התקרה <span class="num">max_naked_shares=360</span> מעולם לא נגענו בו.
+  <br><b>מה להסיק.</b> מנגנון ה-skew לא ריסן כלום, וקל להבין למה:
+  <code>skew_full_shares=240</code> ו-<code>max_skew=0.015</code> — ב-98 מניות חשופות
+  ה-skew היה <span class="num">0.6c</span>, פחות מגודל טיק אחד. התקרה נמצאת גבוה מדי
+  והמדרון רדוד מדי מכדי לעצור בדיוק את התרחיש שכן קרה:
+  <b>הוספה לצד שכבר חשוף.</b></div>`);
+}
+
+/* ---------- 10. book readability ---------------------------------------- */
+push(sect('book','10. פרופיל נזילות: קריאוּת הספר מול הפסד','Liquidity Profiling'));
+push(`<p>המשימה השלישית שביקשת. לכל שוק נבדק כמה צדדים של הספר ניתנים לקריאה
+כרגע (bid ו-ask משני הטוקנים). <code>0/2</code> פירושו שאין בכלל ספר דו-צדדי לצאת אליו.</p>`);
+{
+  const rows=L.filter(r=>r.naked_sh>0||r.paired>0);
+  push(`<div class="panel"><div class="scroll"><table>
+  <thead><tr><th>שוק</th><th>צדדים קריאים</th><th>up_bid</th><th>dn_bid</th>
+  <th>מניות חשופות</th><th>עלות</th><th>שווי יציאה</th><th>Float</th><th>ימים להכרעה</th>
+  <th>למה לא נסגר</th></tr></thead><tbody>`+
+  rows.sort((a,b)=>a.naked_float-b.naked_float).map(r=>
+   `<tr class="${r.naked_float<-1?'flag':(r.sides_readable<2?'flag2':'')}">
+    <td>${esc(r.slug)}</td>
+    <td class="n ${r.sides_readable<2?'bad':'good'}">${r.sides_readable}/2</td>
+    <td class="n">${r.up_bid==null?'—':r.up_bid.toFixed(3)}</td>
+    <td class="n">${r.dn_bid==null?'—':r.dn_bid.toFixed(3)}</td>
+    <td class="n">${r.naked_sh.toFixed(0)} ${r.naked_side}</td>
+    <td class="n">${usd(r.naked_cost)}</td>
+    <td class="n">${usd(r.naked_exit)}</td>
+    <td class="n ${cls(r.naked_float)}">${usd(r.naked_float)}</td>
+    <td class="n">${r.days_to_resolve==null?'—':r.days_to_resolve.toFixed(2)}</td>
+    <td class="dim" style="font-size:11.5px">${esc(r.close_why||'')}</td></tr>`).join('')+
+  `</tbody></table></div></div>`);
+}
+push(`<div class="note bad"><b>מה רואים.</b> שלושת השווקים המפסידים כולם מציגים
+<span class="num">up_bid=0.999</span> או שורת מקפים מלאה, ו-<span class="num">0/2</span>
+צדדים קריאים. <span class="num">up_bid=0.999</span> בשוק בינארי אינו "מחיר" —
+זו הודעה שהאירוע כבר הוכרע ואנחנו מחזיקים את הצד שהפסיד.
+העמודה האחרונה מראה שהמנגנון <i>ידע</i>: <span class="num">"no two-sided book"</span> —
+הוא פשוט לא יכול היה לעשות דבר בשלב הזה.
+<br><b>מה להסיק.</b> הכלל צריך לפעול <b>לפני</b> שהמצב הזה נוצר, לא אחריו.
+שני אותות זמינים בזמן אמת ומקדימים את הנזק:
+(1) <b>ספר חד-צדדי בזמן הציטוט</b> — אם רק צד אחד קריא, אל תצטט שם כלל;
+(2) <b>קרבה להכרעה</b> — <span class="num">days_to_resolve</span> של
+<span class="num">0.08</span> ו-<span class="num">0.16</span> בשווקי e-sports פירושו
+שהמשחק מסתיים בשעות הקרובות. שם הספר תמיד יתייבש, וכל מלאי חשוף יהפוך לבינארי.</div>`);
+
+/* ---------- 11. fill mechanics ------------------------------------------ */
+push(sect('mech','11. איכות ה-Fills: המנוע עצמו תקין','Execution Quality'));
+{
+  const tape=FL.filter(f=>f.reason==='tape').length;
+  const crossed=FL.filter(f=>f.crossed).length;
+  const cap=MK.filter(m=>m.capture!==null);
+  const capMean=cap.reduce((a,m)=>a+m.capture,0)/cap.length;
+  push(`<div class="cards">
+   <div class="card"><div class="k">Tape-verified fills</div><div class="v good">${tape}/${FL.length}</div>
+     <div class="n">אומתו מול נפח מסחר בפועל</div></div>
+   <div class="card"><div class="k">Crossed (taker)</div><div class="v good">${crossed}</div>
+     <div class="n">אפס עמלות taker</div></div>
+   <div class="card"><div class="k">Spread Capture</div><div class="v good">${c(capMean)}</div>
+     <div class="n">ממוצע מתחת ל-mid בכניסה</div></div>
+   <div class="card"><div class="k">Notional מצטבר</div><div class="v">${usd(T.cost,0)}</div>
+     <div class="n">${T.fills} fills ב-${T.fills_span_h.toFixed(0)} שעות</div></div>
+  </div>`);
+  push(`<div class="note good"><b>מה רואים.</b> <span class="num">100%</span> מה-fills
+  מסומנים <span class="num">reason='tape'</span> — כלומר אושרו מול נפח שנצפה בסרט המסחר,
+  ולא נזקפו מהיעלמות רמה בספר (<span class="num">'sweep'</span>), שהיא ראיה חלשה בהרבה.
+  <span class="num">0</span> fills חצו את הספר, ולכן שולם <span class="num">$0</span>
+  בעמלות taker. ה-spread capture הממוצע <span class="num">${c(capMean)}</span>
+  לשארה תואם את התכנון.
+  <br><b>מה להסיק.</b> זה גרף "טוב שהוא באמת טוב", והוא מצמצם דרמטית את שטח החיפוש:
+  אין באג בזיהוי fills, אין דליפת עמלות, ואין בעיית תמחור כניסה.
+  כל ההפסד נוצר <b>אחרי</b> ה-fill, בניהול המלאי. אין שום סיבה לגעת ב-<code>fills.py</code>
+  או ב-<code>quotes.py</code>.</div>`);
+}
+
+/* ---------- 12. per-market drift table ---------------------------------- */
+push(sect('tbl','12. טבלת אב: כל שוק, כל הפרמטרים','Full Data'));
+{
+  const by={};
+  MK.filter(m=>m.last_drift!==null).forEach(m=>{
+    const g=by[m.slug]||(by[m.slug]={slug:m.slug,n:0,sum:0,$:0,sz:0,worst:0,px:[]});
+    g.n++; g.sum+=m.last_drift; g.$+=m.last_drift*m.size; g.sz+=m.size;
+    g.worst=Math.min(g.worst,m.last_drift); g.px.push(m.fill_price);
+  });
+  const rows=Object.values(by).sort((a,b)=>a.$-b.$);
+  push(`<div class="panel"><div class="scroll"><table>
+  <thead><tr><th>שוק</th><th>fills</th><th>drift ממוצע</th><th>drift משוקלל</th>
+  <th>drift ב-$</th><th>ה-fill הגרוע</th><th>מחיר ממוצע</th></tr></thead><tbody>`+
+  rows.map(r=>{
+    const px=r.px.reduce((a,b)=>a+b,0)/r.px.length;
+    const toxic=px>=0.40&&px<=0.60;
+    return `<tr class="${r.$<-20?'flag':(toxic?'flag2':'')}">
+      <td>${esc(r.slug)}</td><td class="n">${r.n}</td>
+      <td class="n ${cls(r.sum)}">${c(r.sum/r.n)}</td>
+      <td class="n ${cls(r.$)}">${c(r.$/r.sz)}</td>
+      <td class="n ${cls(r.$)}">${usd(r.$)}</td>
+      <td class="n bad">${c(r.worst)}</td>
+      <td class="n ${toxic?'warn':''}">${px.toFixed(3)}</td></tr>`;
+  }).join('')+`</tbody></table></div>
+  <div class="tt">אדום = drift שלילי מעל $20. כתום = מחיר ממוצע ברצועת 40–60c.</div></div>`);
+}
+
+/* ---------- 13. conclusions --------------------------------------------- */
+push(sect('out','13. מה הנתונים מרשים — ומה הם אוסרים','Conclusions'));
+push(`<div class="panel">
+<h3 class="good">שלושה כללים שהנתונים תומכים בהם ישירות</h3>
+<ul>
+<li><b>סינון כניסה על ספר חד-צדדי.</b> שליש מהשווקים שקיבלו fill מעולם לא זיווגו,
+וכל שווקי ההפסד מציגים <span class="num">0/2</span> צדדים קריאים.
+האות זמין <i>בזמן הציטוט</i>, לא רק בדיעבד. זה הכלל בעל התמורה הגבוהה ביותר
+והסיכון הנמוך ביותר.</li>
+<li><b>מגבלת נוטיונל ברצועת 40–60 סנט.</b> הרצועה הזו לבדה מייצרת את כל ה-drift השלילי;
+כל שאר הרצועות יחד חיוביות. <span class="num">n=19</span> — לא ענק,
+אבל הכיוון עקבי והמנגנון מובן.</li>
+<li><b>איסור הוספה לצד שכבר חשוף.</b> ה-fill השני ב-<span class="num">lol-maz-mg1</span>
+הכפיל פוזיציה חשופה קיימת. זה כלל דטרמיניסטי שלא דורש שום הערכה סטטיסטית —
+הוא נגזר ממצב המלאי בלבד.</li>
+</ul>
+<h3 class="bad">שלושה דברים שהנתונים <u>אינם</u> מצדיקים כרגע</h3>
+<ul>
+<li><b>סף זמן החזקה (Time Cutoff).</b> אופק 6 השעות נשען על
+<span class="num">n=5</span> בלבד. הכיוון נכון, המספר לא כשיר לכיול פרמטר.
+צריך עוד נתונים לפני שקובעים "צא אחרי X דקות".</li>
+<li><b>הרחבת ה-offset הגורף.</b> ההתפלגות המרכזית של ה-drift בריאה; offset רחב יותר
+יעלה fill-rate ולא יגע בזנב, שהוא כל ההפסד.</li>
+<li><b>סגירה אגרסיבית ב-market.</b> בשלושת שווקי ההפסד לא היה
+<span class="num">bid</span> בכלל. פקודת יציאה שם לא הייתה מתמלאת בשום מחיר.</li>
+</ul>
+<h3 class="warn">באג לתיקון מיידי, בלתי תלוי בכל השאר</h3>
+<p>הגייט מחשב <span class="num">markout</span> כממוצע לא-משוקלל, ולכן הוא מסמן
+כמעט את כל השווקים כ-WIDENED — כולל שווקים ללא כל מלאי, שלא הפסידו שקל.
+זה מדכא את זרם ההכנסות על כל התיק בגלל שלושה שווקים חולים.</p>
+</div>`);
+
+$('#app').innerHTML = out.join('\n');
+</script>
+</body>
+</html>

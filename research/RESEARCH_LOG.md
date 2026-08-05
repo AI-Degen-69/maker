@@ -494,3 +494,87 @@ recoverable from the archive branch by checkout.
 **Result.** The dashboard UI now renders exact stock market metric definitions on hover, presents both instantaneous spot yield and solid 15h time-weighted hold rate, and explicitly breaks down total floating unrealized P&L into paired and unhedged components.
 
 **Verdict.** LIVE — dashboard readability and tooltips updated; paper strategy evidence remains OPEN.
+
+### Session 18 — 2026-08-05: Where the unhedged drag actually comes from
+
+**Question.** The fleet showed +$116.33 realized against -$223.32 unhedged
+float, so the quoting engine looked profitable and the position looked fatal.
+Is that drag diffuse adverse selection across the book, or is it concentrated?
+And if it is concentrated, what signal was available *before* the damage,
+rather than only in hindsight?
+
+**Method.** Read-only forensic pass over `run/fleet.db` (57 tape-confirmed
+fills, 57 markout rows, 10,853 quotes, 9 closes, 16 resolutions, spanning 40.9
+hours) joined against live positions in `run/fleet_state.json` (23 markets).
+P&L definitions were copied verbatim from `server/fleet_dash.py` so the
+analysis and the dashboard cannot disagree; drift used
+`strategy/markout.py:drift_per_share` (`mid_later - ref_mid`), which excludes
+our own sub-mid offset. Output is a standalone report,
+`research/unhedged_pnl_analysis.html` (9 charts, 13 sections), regenerable from
+the same two sources.
+
+**Result.** Eight findings, in descending order of consequence.
+
+1. **The drag is concentrated, not diffuse.** Three of 23 markets carry all of
+   it: `lol-maz-mg1` at -$190.26 (70% of the gross loss), `wta-kalinsk-kessler`
+   at -$50.44, `lol-dkc-nsea` at -$30.33. Two markets offset +$47.71. The
+   other 18 hold no inventory at all.
+
+2. **All three losers share one signature: the book had already decided.**
+   Each shows `up_bid = 0.999` (or an entirely unreadable book) with our
+   inventory sitting on the losing side. This is binary settlement risk on a
+   decided event, not gradual price erosion — a materially different failure
+   from the adverse-selection story the aggregate number suggested.
+
+3. **The -$223.32 headline is a marking convention, not a fair value.**
+   `fleet_dash.py:574` values a naked leg at the current bid and writes $0 when
+   the book cannot be read. The same position is worth -$345.33 if every naked
+   leg loses and +$168.59 if every one wins — a $513.91 spread. A risk trigger
+   built on `unhedged_float` fires when a book stops loading, with no
+   underlying economic event. The stable quantity is `naked_cost`.
+
+4. **The 40–60c price band is where the losses live.** Bucketing fills by entry
+   price: 0–20c +$23.37, 20–40c -$4.17, **40–60c -$122.00** (n=19, mean
+   -10.68c/share), 60–80c +$72.64, 80–100c +$0.22. Mechanically sound — a
+   coin-flip price is exactly where new information can move a binary market
+   40 cents at once, whereas at 15c or 85c the move is bounded.
+
+5. **Drift worsens monotonically with holding time**: -1.21c at 5 minutes
+   (n=52), -5.86c at 1 hour (n=27), -12.83c at 6 hours (n=5). Direction is
+   clear; the 6-hour figure is far too thin to calibrate a time cutoff on.
+
+6. **The drift distribution has a fat left tail, and the tail is the whole
+   loss.** Median last-horizon drift is -1.3c against a mean of -5.24c. Only
+   9 of 52 fills sit below -20c. The central mass is healthy, which means a
+   wider blanket offset would cost fill rate without touching the loss.
+
+7. **Instrumentation bug in the quality gate.** `markout.py:_stats_from_rows`
+   uses `statistics.mean`, an unweighted average over fills. The smallest fills
+   (5–17 shares) are the worst outliers, so the gate reads -5.24c where the
+   size-weighted figure is -0.87c. Consequence: all 23 markets are currently
+   marked `WIDENED`, including 18 that hold no inventory and have lost nothing.
+   The gate is suppressing fleet-wide income because of three sick markets.
+
+8. **Pairing is bimodal, and skew never engaged.** Eight of 18 markets that
+   received a fill never paired a single share; markets with a two-sided book
+   pair at 89–92%. In `lol-maz-mg1` the first fill opened 98 naked UP shares
+   and the bot **added 135 more to the same side** 30 minutes later, reaching
+   233 with zero DOWN ever bought. `max_naked_shares = 360` was never
+   approached, and at 98 shares `skew_full_shares = 240` with
+   `max_skew = 0.015` produces 0.6c of skew — less than one tick.
+
+Execution quality itself is clean and can be excluded from the search: 57/57
+fills are `reason='tape'` (venue-volume confirmed, not the weaker `sweep`
+branch), 0 crossed, $0 taker fees, +2.4c mean spread capture. Every dollar of
+loss is created after the fill, in inventory management.
+
+**Verdict.** OPEN, with scope now bounded. Three rules are directly supported
+by the data: (a) refuse to quote a market whose book is one-sided at quote
+time — the signal is live, not hindsight, and it covers every losing market
+here; (b) cap notional in the 0.40–0.60 band; (c) forbid adding to a side that
+is already naked, which is deterministic and needs no statistics. Three
+tempting responses are **not** supported: a holding-time cutoff (n=5 at the
+long horizon), a wider blanket offset (the central distribution is healthy),
+and aggressive market-order exits (all three losers had no bid to exit into).
+The unweighted-mean gate bug (finding 7) is independent of all of the above and
+should be fixed on its own.
