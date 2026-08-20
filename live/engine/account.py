@@ -259,3 +259,47 @@ def read_account(funder: str, collateral_usd: Optional[float],
         closed_positions=fetch_closed_positions(funder, timeout),
         user_pnl_usd=fetch_user_pnl(funder, timeout=timeout),
     )
+
+
+# --- live balance + float mark (moved from engine.live_exec) ----------
+# `fetch_live_balance` reads the CLOB client's collateral balance; the
+# poll loop and the fleet both need it, so it lives with the other
+# venue account reads instead of live_exec's CLI grab-bag.
+
+
+def fetch_live_balance(funder: str | None = None) -> float | None:
+    """Fetch live USDC collateral balance from venue. Returns None on network error / offline / no credentials."""
+    import os
+    if not (os.environ.get("POLY_PRIVATE_KEY") or os.environ.get("POLY_KEY")):
+        return None
+    try:
+        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+        from engine.venue import client
+        who = funder or os.environ.get("POLY_FUNDER")
+        sig_type = int(os.environ.get("POLY_SIG_TYPE", "3"))
+        r = client(who).get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL,
+                                   signature_type=sig_type))
+        return float(r.get("balance", 0) or 0) / 1e6
+    except Exception:
+        return None
+
+
+def log_float_mark_if_measured(registry, mark: dict) -> None:
+    """Record an open-exposure float mark when the venue gave real numbers.
+
+    Unrealised and committed come from the venue sweep; naked is registry-
+    derived because the venue has no notion of a one-sided live leg. A
+    partial sweep skips rather than writing 0.0 for a number the venue never
+    reported.
+    """
+    from engine.order_registry import registry_naked_usd
+    unrealized = mark.get("unrealized_usd")
+    committed = mark.get("committed_usd")
+    if unrealized is None or committed is None:
+        return
+    registry.log_float_mark(
+        unrealized_usd=float(unrealized),
+        committed_open_usd=float(committed),
+        naked_usd=registry_naked_usd(registry),
+    )

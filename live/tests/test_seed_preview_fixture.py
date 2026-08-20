@@ -96,12 +96,12 @@ def test_fixture_populates_the_account_card(temp_db):
 
 def test_fixture_order_book_is_hedged_and_fresh(temp_db):
     """Balanced pairs mean no naked-leg alarm; recent polls mean no stale banner."""
-    from dash.live_dash import query_db_state
+    from engine.registry_state import summarize_state
 
     reg = OrderRegistry(temp_db)
     seed(reg)
 
-    state = query_db_state(temp_db)
+    state = summarize_state(temp_db)
     assert state["stale"] is False
     assert all(p["hedge_state"] != "NAKED" for p in state["pairs"])
     assert any(p["hedge_state"] == "BALANCED" for p in state["pairs"])

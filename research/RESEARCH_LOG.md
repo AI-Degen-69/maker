@@ -4560,6 +4560,7 @@ Regression tests added: a later decide no longer captures an earlier submit's ou
 
 **Verdict.** **LIVE**. Instrumentation-only; measured behaviour is unchanged.
 
+<<<<<<< HEAD
 ## Session — 2026-08-21 (U35 in the live loop: auto naked-leg management)
 
 ### Question
@@ -4648,3 +4649,25 @@ The production autopsy fixed the two live-run failure signatures at the source (
 ### Follow-up (dashboard health: the watcher self-reports)
 
 The watcher now writes `run/guardrail_watch_heartbeat.json` (pid, started_at, ts, cycle) every check -- a one-element list matching the poll heartbeat convention -- so a dead watcher is visible instead of failing silently. The dashboard reads it via the new `/api/guardrail-health` endpoint and a chip in the bot control bar: a heartbeat older than the 30s stale threshold renders red "guardrail DOWN (last heartbeat Nm ago)"; a fresh one renders green with pid and the cumulative alert count from the ring (which survives watcher restarts). `started_at` doubles as the restart marker -- a new pid + started_at after the poll restarts the watcher reads as "restarted". `heartbeat_path=None` disables self-reporting (test default); the CLI main() passes the default path. 4 new tests (watcher heartbeat write; endpoint alive / stale / absent). Live suite 459 passed, 1 skip. Verdict **LIVE**.
+
+## Session — 2026-08-21 (live engine deepenings: four shallow grab-bags made deep)
+
+### Question
+
+The real-money tree's architecture had drifted into grab-bags. `live_exec` was 3,370 lines mixing CLI parsing with settlement ABI math and venue plumbing; the dashboard hand-wrote ~370 lines of raw SQL over the same tables `OrderRegistry` reads through typed records; `live_fleet.run()` took 21 parameters (16 ports + 5 loop knobs) and imported `live_exec` privates (`_client`, `_open_notional`, `_registry_naked_usd`, ...); and the "quote one market" sequence (fetch market → fetch both books → read inventory → `decide_quotes`) existed in two copies — `live_exec.decide` and `live_fleet._visit_one` — that could drift apart. Does deepening these modules — making the interface smaller than the implementation — pay off in testability and single-copy logic without changing behaviour?
+
+### Method
+
+Pure relocation for locality, no strategy parameters or decision logic changed:
+- Settlement ABI/alt-bn128/EIP-712 math → `engine/settlement.py` (six pure functions + constants; the RPC/relayer submit path stays with the CLI verbs). `eth-account`/`eth-utils` declared in `requirements.txt` (were transitively installed only).
+- Dashboard state read + hedge classification (`RESTING`/`BALANCED`/`NAKED`/`SETTLED`/`REFUSED`) → `engine/registry_state.py` (`summarize_state(db_path, now=None)`), keeping the strict `mode=ro` connection; `live_dash.get_state` is a thin consumer.
+- `live_fleet.run()` → `run(seam, *, interval, once, live, markets, sleep_fn)` over a `VenueSeam` dataclass of 16 ports; the fleet's private `live_exec` imports got public homes (`engine/venue.py` client/notional/order-id/caps, `account.fetch_live_balance`/`log_float_mark_if_measured`, `order_registry.registry_naked_usd`/`registry_committed_usd`).
+- `decide` and `_visit_one` unified on `engine/quotes.evaluate_market_quote(cid, cfg, clob_host, *, fetch_market, fetch_books, inventory_for, decide)` → `MarketEval`, with typed errors (`MarketUnavailable`/`MarketQuoteError`); each caller formats its own presentation.
+
+The move surfaced three latent defects, fixed in the same change: `poll`/`probe`/`exit_pair` each did `client = client()` where the local assignment shadowed the builder (would have failed at runtime); a regex ate an underscore in `registry.attach_venue_order_id`; and the fleet's `_fetch_live_balance` patch surface moved with the functions.
+
+### Result
+
+`live_exec` 3,370 → ~2,800 lines; six new engine/test modules; the quote-one-market sequence exists exactly once. Root suite 703 passed; live suite 423 passed, 1 skipped (pre-existing POSIX signal skip). Tests for the extracted modules cross the new modules directly (46 encoding/signing assertions in `test_settlement.py`, 14 state assertions in `test_registry_state.py`, 5 step assertions in `test_market_quote.py`); the old copies were deleted, not layered.
+
+**Verdict.** **LIVE**. Behaviour-preserving relocation for locality; measured by both suites staying green.

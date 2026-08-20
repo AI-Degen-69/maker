@@ -66,7 +66,7 @@ def test_venue_sync_dedupes_by_condition_asset(tmp_path, monkeypatch):
     monkeypatch.setattr("engine.account.read_account", mock_read_account)
     monkeypatch.setattr("engine.account.fetch_closed_positions", mock_fetch_closed_positions)
     monkeypatch.setattr("engine.account.fetch_open_positions", mock_fetch_open_positions)
-    monkeypatch.setattr(exec_mod, "_fetch_live_balance", lambda *a, **kw: 100.0)
+    monkeypatch.setattr(exec_mod, "fetch_live_balance", lambda *a, **kw: 100.0)
 
     db_path = str(tmp_path / "test.db")
 
@@ -142,7 +142,7 @@ def test_venue_sync_writes_float_mark(tmp_path, monkeypatch):
     monkeypatch.setattr("engine.account.read_account", mock_read_account)
     monkeypatch.setattr("engine.account.fetch_closed_positions", mock_fetch_closed_positions)
     monkeypatch.setattr("engine.account.fetch_open_positions", mock_fetch_open_positions)
-    monkeypatch.setattr(exec_mod, "_fetch_live_balance", lambda *a, **kw: 100.0)
+    monkeypatch.setattr(exec_mod, "fetch_live_balance", lambda *a, **kw: 100.0)
 
     db_path = str(tmp_path / "test.db")
 
@@ -245,7 +245,7 @@ def test_venue_sync_preserves_existing_closes_adds_new(tmp_path, monkeypatch):
     monkeypatch.setattr("engine.account.read_account", mock_read_account)
     monkeypatch.setattr("engine.account.fetch_closed_positions", mock_fetch_closed_positions)
     monkeypatch.setattr("engine.account.fetch_open_positions", mock_fetch_open_positions)
-    monkeypatch.setattr(exec_mod, "_fetch_live_balance", lambda *a, **kw: 100.0)
+    monkeypatch.setattr(exec_mod, "fetch_live_balance", lambda *a, **kw: 100.0)
 
     summary = exec_mod.venue_sync(funder="0xfunder", db_path=db_path, quiet=True)
     assert summary["closes_written"] == 1

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from engine.live_fleet import LiveFleetResult, plan_orders, run
+from engine.live_fleet import LiveFleetResult, VenueSeam, plan_orders, run
 from engine.quotes import QuoteIntent
 
 
@@ -113,9 +113,7 @@ class TestRunLoop:
         def fake_sweep():
             calls["swept"] += 1
 
-        results = run(
-            interval=0.0, once=once, live=live,
-            markets=[FakeMarket("0xabc")],
+        seam = VenueSeam(
             client=object(),
             fetch_market=fake_fetch_market,
             fetch_books=fake_books,
@@ -124,6 +122,10 @@ class TestRunLoop:
             cancel_fn=fake_cancel,
             reconcile_fn=fake_reconcile,
             sweep_fn=fake_sweep,
+        )
+        results = run(
+            seam, interval=0.0, once=once, live=live,
+            markets=[FakeMarket("0xabc")],
             sleep_fn=lambda s: None,
         )
         return results, calls
@@ -181,12 +183,14 @@ class TestRunLoop:
         def reconcile_fn(client, registry, maker):
             calls["reconciled"] += 1
 
-        results = run(
-            interval=0.0, once=True, live=True,
-            markets=[FakeMarket("0xa"), FakeMarket("0xb")],
+        seam = VenueSeam(
             client=object(), fetch_market=fetch_market, fetch_books=fetch_books,
             decide=decide, submit_fn=submit_fn, cancel_fn=cancel_fn,
             reconcile_fn=reconcile_fn, sweep_fn=lambda: None,
+        )
+        results = run(
+            seam, interval=0.0, once=True, live=True,
+            markets=[FakeMarket("0xa"), FakeMarket("0xb")],
             sleep_fn=lambda s: None,
         )
         assert [r.status for r in results] == ["ERROR", "ERROR"]
@@ -207,12 +211,15 @@ class TestRunLoop:
                     "bids": {0.59: 100}, "asks": {0.61: 100}}
 
         run(
+            VenueSeam(
+                client=object(),
+                fetch_market=fetch_market, fetch_books=fetch_books, decide=decide,
+                submit_fn=lambda *a, **k: 0, cancel_fn=lambda *a, **k: 0,
+                reconcile_fn=lambda *a, **k: None, sweep_fn=lambda: None,
+                fleet_state_fn=lambda r: {"fleet_naked_usd": 12.5},
+            ),
             interval=0.0, once=True, live=False,
-            markets=[FakeMarket("0xabc")], client=object(),
-            fetch_market=fetch_market, fetch_books=fetch_books, decide=decide,
-            submit_fn=lambda *a, **k: 0, cancel_fn=lambda *a, **k: 0,
-            reconcile_fn=lambda *a, **k: None, sweep_fn=lambda: None,
+            markets=[FakeMarket("0xabc")],
             sleep_fn=lambda s: None,
-            fleet_state_fn=lambda r: {"fleet_naked_usd": 12.5},
         )
         assert seen["fleet_naked_usd"] == 12.5

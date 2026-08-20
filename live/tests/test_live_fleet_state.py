@@ -14,7 +14,7 @@ from __future__ import annotations
 import pytest
 
 from engine.config import load
-from engine.live_exec import _registry_committed_usd
+from engine.order_registry import registry_committed_usd
 from engine.live_fleet import _fleet_state
 from engine.markout import fleet_stats
 from engine.order_registry import (
@@ -65,7 +65,7 @@ class TestRegistryCommittedUsd:
         _fill(reg, "t2", "o2", 4, 0.40)
 
         # Inventory cost 3.00 + 1.60; resting 5*0.60 + 6*0.40 = 3.00 + 2.40.
-        assert _registry_committed_usd(reg) == pytest.approx(10.0)
+        assert registry_committed_usd(reg) == pytest.approx(10.0)
 
     def test_closed_condition_is_skipped_whole(self, reg):
         _order(reg, "o1", "c1", "tok-up", 0.60, 10)
@@ -75,7 +75,7 @@ class TestRegistryCommittedUsd:
         _fill(reg, "t2", "o2", 10, 0.50)         # 5.00 inventory, no resting
         reg.log_close(CloseRecord(ts=1.0, condition_id="c2"))
 
-        assert _registry_committed_usd(reg) == pytest.approx(6.0)
+        assert registry_committed_usd(reg) == pytest.approx(6.0)
 
     def test_filled_sell_reduces_cost_basis(self, reg):
         _order(reg, "o1", "c1", "tok-up", 0.60, 10)
@@ -84,7 +84,7 @@ class TestRegistryCommittedUsd:
         _fill(reg, "t2", "o2", 2, 0.60)          # -1.20
 
         # Inventory 1.80 + resting 5*0.60 = 3.00.
-        assert _registry_committed_usd(reg) == pytest.approx(4.80)
+        assert registry_committed_usd(reg) == pytest.approx(4.80)
 
 
 class TestFleetStats:
