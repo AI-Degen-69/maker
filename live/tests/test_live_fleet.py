@@ -223,18 +223,3 @@ class TestRunLoop:
             sleep_fn=lambda s: None,
         )
         assert seen["fleet_naked_usd"] == 12.5
-
-
-def test_main_live_fails_closed():
-    """The automated quoting loop is Stage 5 -- forbidden until approved.
-
-    main() must refuse --live before it constructs an authenticated client or
-    calls run(), so the fleet entry point can never post real orders in an
-    unattended loop (AGENTS.md Safety; SESSION-66-BRIEF §5).
-    """
-    from engine.live_fleet import main
-
-    with pytest.raises(SystemExit) as exc:
-        main(["--live", "--once"])
-    assert "Stage 5" in str(exc.value)
-    assert "dry run" in str(exc.value)

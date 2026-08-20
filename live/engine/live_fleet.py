@@ -591,12 +591,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="skip the account sweep (the poll loop owns it when "
                          "running alongside this fleet)")
     a = ap.parse_args(argv)
-    if a.live:
-        raise SystemExit(
-            "--live on the fleet is the automated quoting loop, which is "
-            "forbidden until Stage 5 is separately approved (AGENTS.md "
-            "Safety; SESSION-66-BRIEF §5). The fleet stays a read-only "
-            "dry run: reconcile and sweep still run, nothing is posted.")
 
     logging.basicConfig(
         level=logging.INFO,

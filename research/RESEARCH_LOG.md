@@ -4688,3 +4688,19 @@ CodeRabbit's review of the live-engine deepenings (PR 63) flagged two real issue
 Both suites still pass. Two other review items skipped with reasons: the research entry date is correct (2026-08-21 local calendar date — every prior entry uses local dates; CodeRabbit judged by UTC), and single-instance locking is a pre-existing operational gap tracked as a follow-up issue rather than bolted onto a refactor PR.
 
 **Verdict.** **LIVE**. Fail-closed safety hardening aligned with the repo's own stage invariant; no behaviour change on approved paths.
+
+## Session — 2026-08-21 (PR 63 correction: --live guard reverted per Owner)
+
+### Question
+
+The previous entry recorded a fail-closed `--live` guard on `live_fleet.main()` that cited AGENTS.md Safety and SESSION-66-BRIEF §5 ("automated quoting loop forbidden until Stage 5"). The Owner (PR #63 discussion) clarified that those guidelines are from the simulation phase (Hunter) and **do not apply to the live tree**: `live/` is the real-money path — a bot running on a real account placing orders under $100 starting capital, supervised, minimal risk per trade. Was the guard correct?
+
+### Method
+
+Reverted the guard and its regression test (`test_main_live_fails_closed`). `live_fleet.main()` again wires `--live` through the authenticated client to `run(live=True)`, restoring the real-order path. The constants dedup from the same CodeRabbit review stands (it is unrelated to paper/live). AGENTS.md Safety and SESSION-66-BRIEF §5 still carry the simulation-phase wording and need updating to reflect the live phase — flagged for the Owner.
+
+### Result
+
+Live suite green; the fleet's `--live` path is intact and verified to reach client construction. The lesson: guidelines written for the simulation phase must not be applied to the live tree without checking the phase.
+
+**Verdict.** **LIVE** (as corrected). The fail-closed guard was reverted at the Owner's direction; the live order path stands.
