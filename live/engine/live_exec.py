@@ -40,7 +40,6 @@ from __future__ import annotations
 import argparse
 import json
 import contextlib
-import hashlib
 import os
 import sys
 import threading
