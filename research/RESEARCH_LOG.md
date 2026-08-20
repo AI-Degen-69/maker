@@ -4671,3 +4671,20 @@ The move surfaced three latent defects, fixed in the same change: `poll`/`probe`
 `live_exec` 3,370 → ~2,800 lines; six new engine/test modules; the quote-one-market sequence exists exactly once. Root suite 703 passed; live suite 423 passed, 1 skipped (pre-existing POSIX signal skip). Tests for the extracted modules cross the new modules directly (46 encoding/signing assertions in `test_settlement.py`, 14 state assertions in `test_registry_state.py`, 5 step assertions in `test_market_quote.py`); the old copies were deleted, not layered.
 
 **Verdict.** **LIVE**. Behaviour-preserving relocation for locality; measured by both suites staying green.
+
+## Session — 2026-08-21 (PR 63 post-review fixes, CodeRabbit findings)
+
+### Question
+
+CodeRabbit's review of the live-engine deepenings (PR 63) flagged two real issues. (1) The settlement extraction left `USDC_E_CONTRACT` and `ZERO_BYTES32` defined in two places: `live_exec` still carried local copies that shadowed the new `engine.settlement` imports, so a collateral address corrected in one file would silently diverge from the other — the exact drift the extraction was supposed to remove. (2) `live_fleet --live` is the automated quoting loop, which AGENTS.md Safety and SESSION-66-BRIEF §5 forbid until Stage 5 is separately approved; the entry point could construct an authenticated client and post real orders in an unattended loop.
+
+### Method
+
+- Deleted the local `USDC_E_CONTRACT`/`ZERO_BYTES32` copies from `live_exec`; the settlement imports are now the single source (values verified identical).
+- `live_fleet.main()` now fails closed on `--live` with a `SystemExit` naming the Stage-5 invariant, before any client is constructed or `run()` is called. Read-only dry-run (reconcile/sweep) is unchanged. Regression test added (`test_main_live_fails_closed`).
+
+### Result
+
+Both suites still pass. Two other review items skipped with reasons: the research entry date is correct (2026-08-21 local calendar date — every prior entry uses local dates; CodeRabbit judged by UTC), and single-instance locking is a pre-existing operational gap tracked as a follow-up issue rather than bolted onto a refactor PR.
+
+**Verdict.** **LIVE**. Fail-closed safety hardening aligned with the repo's own stage invariant; no behaviour change on approved paths.

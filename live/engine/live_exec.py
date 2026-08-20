@@ -613,8 +613,6 @@ def quote(condition_id: str, price: float, size: float, live: bool,
     print(f"  complete: python -m engine.live_exec complete {pair_id}")
 
 
-USDC_E_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000"
 # Provenance: matches the 598s delta measured on transaction 0x66bc709b1a1d515d813e9d191a84b8863d8f2a251e1698a85d452152c7602135, block 92098496.
 REDEEM_DEADLINE_SECONDS = 600
 # Polymarket DepositWalletFactory address used by @polymarket/builder-relayer-client (config.DepositWalletFactory),
