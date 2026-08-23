@@ -960,6 +960,7 @@ def _guardrail_health() -> dict[str, Any]:
     ring_alerts.sort(key=lambda a: str(a.get("ts") or ""), reverse=True)
     newest = ring_alerts[0] if ring_alerts else {}
 
+    STALE_THRESHOLD_SEC = 30.0
     return {
         "pid": hb.get("pid"),
         "started_at": hb.get("started_at"),

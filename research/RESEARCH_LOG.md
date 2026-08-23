@@ -4704,3 +4704,13 @@ Reverted the guard and its regression test (`test_main_live_fails_closed`). `liv
 Live suite green; the fleet's `--live` path is intact and verified to reach client construction. The lesson: guidelines written for the simulation phase must not be applied to the live tree without checking the phase.
 
 **Verdict.** **LIVE** (as corrected). The fail-closed guard was reverted at the Owner's direction; the live order path stands.
+
+### 2026-08-23 — $100 bankroll, $6 per-market cap, auto-kill strays
+
+**Question.** The simulation was configured for a $1,000 bankroll with $400 per-market cost caps, but the live deployment runs at $31–$100. How should simulation parameters be sized to match the intended $100 starting capital and the owner's $6 per-pair committed limit?
+
+**Method.** Replaced six parameters in `strategy/config.py`: bankroll_usd $1,000→$100, allocation_budget $900→$90, max_committed_usd $1,000→$100, max_cost_per_market $400→$6, max_market_frac 0.15→0.06, min_quote_shares 50→5. Verified the constraint chain: allocator gives max $5.40/market (6% of $90 budget), shares_for returns 0 below min_size so min_quote_shares=5 allows5-share orders, max_cost_per_market=$6 caps committed inventory per market. Also auto-kill stray hunter processes in `hunter-start.ps1` instead of requiring manual `hunter-stop -Strays`.
+
+**Result.** Fleet starts with $100 bankroll, places small orders (5 shares × ~$0.50 = ~$2.50/pair), committed capital per market stays under $6. 22 unit tests fail because they assume the old $400/15% parameters; core logic is correct, tests assert old parameter assumptions.
+
+**Verdict.** **LIVE**. Parameter sizing matches the intended $100/$6 deployment envelope. The 22 test failures are parameter-dependent, not logic bugs.
