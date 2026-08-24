@@ -10,6 +10,7 @@ exercise: the mid-life settle (`_settle_resolved`), the bare cancel
 """
 import sys
 import time
+from dataclasses import replace as _dcreplace
 from pathlib import Path
 
 import pytest
@@ -270,6 +271,7 @@ def test_sweep_quoting_outcome_rests_both_sides(monkeypatch, tmp_path):
     from strategy import sweep
 
     st = _mk_sweep_state(monkeypatch, tmp_path)
+    st.cfg = _dcreplace(st.cfg, max_rest_queue_ahead=0)  # orthog to queue gate
     monkeypatch.setattr("strategy.sweep.recent_trades", lambda *a, **k: {})
     monkeypatch.setattr("strategy.sweep.full_book",
                         lambda host, token: _deep_book(token))
@@ -300,6 +302,7 @@ def test_trial_depth_bar_reaches_the_live_book_gate(monkeypatch, tmp_path):
     spec = _spec(cid="cond-trial")
     spec["trial_depth_usd"] = 500.0
     st = fleet.MarketState(spec, base_cfg)
+    st.cfg = _dcreplace(st.cfg, max_rest_queue_ahead=0)  # orthog to queue gate
     assert st.cfg.select_min_top3_depth_usd == 500.0
 
     monkeypatch.setenv("HUNTER_DB", str(tmp_path / "sweep.db"))
@@ -332,6 +335,7 @@ def test_price_band_widened_to_the_spread_universe(monkeypatch, tmp_path):
     spec["volume_24h"] = 500_000.0
     monkeypatch.setenv("HUNTER_DB", str(tmp_path / "sweep.db"))
     st = fleet.MarketState(spec, base_cfg)
+    st.cfg = _dcreplace(st.cfg, max_rest_queue_ahead=0)  # orthog to queue gate
     st.market = _Market()
     monkeypatch.setattr("strategy.sweep.recent_trades", lambda *a, **k: {})
 
@@ -540,3 +544,213 @@ def test_hedge_census_recorded_every_sweep(monkeypatch, tmp_path):
     # pair_cost_at_touch = ask + ask - reward_offset (0.02).
     assert pair_cost == pytest.approx(0.94)
     assert fillable == 1, "0.94 < max_pair_cost 0.995"
+
+
+def test_close_window_balance_hedge_crosses_the_light_side(monkeypatch, tmp_path):
+    """Plan 02 (harden-to-reality). When a market is within `balance_hedge_sec`
+    of resolution and the book is lopsided, the sweep must CROSS the light side
+    to flatten -- a true taker cross logged as `CROSS_HEDGE`, not a passive bid
+    at the ask. `_Market` has no `t_remaining`, so we inject one returning a
+    value under the 20s window; a seeded UP-only fill makes the book heavy UP.
+    """
+    from strategy import store, sweep
+
+    st = _pairs_state(monkeypatch, tmp_path,
+                      books=(_UP_BOOK, _DN_BOOK_CHEAP),
+                      fills=[("UP", 0.44, 100.0)])
+    # Light side is DOWN (we hold 100 UP, 0 DOWN). Near close -> cross DOWN.
+    st.market.t_remaining = lambda now=None: 10.0  # < balance_hedge_sec 20.0
+    # Make the DOWN ask depth shallow so the cross fills partially, exercising
+    # the residual-cancel path.
+    shallow_dn = _mk_book({0.44: 5000.0, 0.43: 4000.0, 0.42: 3000.0},
+                          {0.46: 30.0}, "tok-dn")
+    monkeypatch.setattr(
+        "strategy.sweep.full_book",
+        lambda host, token: _UP_BOOK if token == "tok-up" else shallow_dn)
+
+    out = sweep.sweep(st, _ctx(now=time.time()))
+
+    # CROSS_HEDGE must be recorded.
+    with store.db() as c:
+        row = c.execute("SELECT COUNT(*) FROM decisions "
+                        "WHERE action='CROSS_HEDGE'").fetchone()
+    assert row[0] == 1, "close-window hedge must log exactly one CROSS_HEDGE"
+    # The cross is a taker fill: a crossed DOWN fill must exist.
+    with store.db() as c:
+        n = c.execute("SELECT COUNT(*) FROM fills WHERE side='DOWN' "
+                      "AND crossed=1").fetchone()[0]
+    assert n >= 1, "the close-window hedge must cross the light (DOWN) side"
+    # Inventory moved toward balance: the hedge added DOWN shares.
+    assert st.inv.down_shares > 0.0
+
+
+def test_close_window_hedge_is_inert_when_far_from_close(monkeypatch, tmp_path):
+    """Plan 02. Long-dated markets report t_remaining in the billions, so the
+    close-window hedge must NOT fire and must not log CROSS_HEDGE.
+    """
+    from strategy import store, sweep
+
+    st = _pairs_state(monkeypatch, tmp_path,
+                      books=(_UP_BOOK, _DN_BOOK_CHEAP),
+                      fills=[("UP", 0.44, 100.0)])
+    st.market.t_remaining = lambda now=None: 1e9  # far from close
+
+    sweep.sweep(st, _ctx(now=time.time()))
+
+    with store.db() as c:
+        row = c.execute("SELECT COUNT(*) FROM decisions "
+                        "WHERE action='CROSS_HEDGE'").fetchone()
+    assert row[0] == 0, "far-from-close markets must not trigger the hedge"
+
+
+def test_skip_rest_is_logged_when_no_quote(monkeypatch, tmp_path):
+    """Plan 04 (harden-to-reality). A market the decision layer sits out of
+    must record WHY via a SKIP_REST decision, not just return a string the
+    dashboard never sees. A one-tick spread under the spread objective rests
+    nothing and names the thin-spread reason.
+    """
+    from strategy import store, sweep
+
+    st = _pairs_state(monkeypatch, tmp_path,
+                      books=(_UP_BOOK, _DN_BOOK_CHEAP))
+    # Force the spread objective so the thin-spread guard fires.
+    st.cfg = _spec_cfg_spread(st.cfg)
+    # 0.481/0.482 -> spread 0.001 < 0.01 min: rests nothing.
+    thin_up = _mk_book({0.481: 5000.0}, {0.482: 8000.0}, "tok-up")
+    thin_dn = _mk_book({0.481: 5000.0}, {0.482: 8000.0}, "tok-dn")
+    monkeypatch.setattr(
+        "strategy.sweep.full_book",
+        lambda host, token: thin_up if token == "tok-up" else thin_dn)
+
+    sweep.sweep(st, _ctx(now=time.time()))
+
+    with store.db() as c:
+        row = c.execute("SELECT COUNT(*) FROM decisions "
+                        "WHERE action='SKIP_REST'").fetchone()
+    assert row[0] >= 1, "a dark market must log SKIP_REST with its reason"
+
+
+def _spec_cfg_spread(cfg):
+    """Patch a config to the spread objective with a wide min-spread bar."""
+    import dataclasses
+    return dataclasses.replace(
+        cfg, objective="spread",
+        spread_capture_default_spread=0.01, tick_size=0.001,
+        min_quote_shares=5)
+
+
+# --- queue-depth gate (harden-to-reality, followup #1) --------------------
+# A resting quote only fills near the front of the book; behind thousands of
+# shares it never fills at the front and when it does it is adverse-selected.
+# The gate refuses to post when queue_ahead at our price exceeds
+# max_rest_queue_ahead. These pin that behaviour.
+
+def test_queue_depth_gate_blocks_deep_book(monkeypatch, tmp_path):
+    """A book with thousands of shares ahead at our rest price must NOT be
+    quoted -- the gate sits us out and records the queue reason."""
+    from strategy import store, sweep
+
+    # UP book: deep queue at EVERY bid level -> whichever price the quoter
+    # picks, queue_ahead > 50, so the gate must block and record it.
+    deep_up = _mk_book({0.48: 5000.0, 0.47: 5000.0, 0.46: 5000.0},
+                      {0.50: 8000.0}, "tok-up")
+    deep_dn = _mk_book({0.44: 5000.0, 0.43: 5000.0, 0.42: 5000.0},
+                      {0.46: 8000.0}, "tok-dn")
+    st = _pairs_state(monkeypatch, tmp_path, books=(deep_up, deep_dn))
+    st.cfg = _dcreplace(st.cfg, max_rest_queue_ahead=50.0)
+
+    monkeypatch.setattr(
+        "strategy.sweep.full_book",
+        lambda host, token: deep_up if token == "tok-up" else deep_dn)
+
+    sweep.sweep(st, _ctx(now=time.time()))
+
+    # The gate invariant: no resting order may sit behind a queue deeper than
+    # the cap. (The quoter may pick a shallow price and rest there legally.)
+    open_orders = st.engine.open_orders()
+    for o in open_orders:
+        assert o.queue_ahead <= 50.0, (
+            f"{o.side} rested at {o.price} behind {o.queue_ahead}sh "
+            f"> max_rest_queue_ahead 50")
+    # And at least one quote was blocked (the deep 0.48 bid) -> a BLOCKED event.
+    with store.db() as c:
+        n = c.execute("SELECT COUNT(*) FROM market_events "
+                      "WHERE kind='BLOCKED' AND reason LIKE '%queue%'").fetchone()[0]
+    assert n >= 1, "the queue-depth block must be recorded as a BLOCKED event"
+
+
+def test_queue_depth_gate_allows_shallow_book(monkeypatch, tmp_path):
+    """A book with no shares ahead at our rest price (front of book) DOES get
+    quoted -- the gate only refuses the deep case."""
+    from strategy import store, sweep
+
+    # UP book: empty bids at 0.48 (our rest price) -> queue_ahead = 0.
+    shallow_up = _mk_book({0.48: 0.0, 0.47: 4000.0}, {0.50: 8000.0}, "tok-up")
+    shallow_dn = _mk_book({0.44: 0.0, 0.43: 4000.0}, {0.46: 8000.0}, "tok-dn")
+    st = _pairs_state(monkeypatch, tmp_path, books=(shallow_up, shallow_dn))
+    st.cfg = _dcreplace(st.cfg, max_rest_queue_ahead=50.0)
+
+    monkeypatch.setattr(
+        "strategy.sweep.full_book",
+        lambda host, token: shallow_up if token == "tok-up" else shallow_dn)
+
+    sweep.sweep(st, _ctx(now=time.time()))
+
+    assert st.engine.open_orders(), "shallow-queue quote must rest"
+
+
+def test_queue_depth_gate_disabled_when_zero(monkeypatch, tmp_path):
+    """max_rest_queue_ahead=0 disables the gate: even a deep book is quoted."""
+    from strategy import store, sweep
+
+    deep_up = _mk_book({0.48: 5000.0, 0.47: 4000.0}, {0.50: 8000.0}, "tok-up")
+    deep_dn = _mk_book({0.44: 5000.0, 0.43: 4000.0}, {0.46: 8000.0}, "tok-dn")
+    st = _pairs_state(monkeypatch, tmp_path, books=(deep_up, deep_dn))
+    st.cfg = _dcreplace(st.cfg, max_rest_queue_ahead=0.0)
+
+    monkeypatch.setattr(
+        "strategy.sweep.full_book",
+        lambda host, token: deep_up if token == "tok-up" else deep_dn)
+
+    sweep.sweep(st, _ctx(now=time.time()))
+
+    assert st.engine.open_orders(), "gate=0 must allow even deep-queue quotes"
+
+
+# --- wallet cap clamp (harden-to-reality, Action 3) ------------------------
+# The venue holds collateral against every open bid; on live Polymarket you
+# cannot have open quotes whose notional exceeds the wallet. fleet_committed_cost
+# already sums the fleet, but the defensive clamp `min(available, max_committed_usd)`
+# guarantees no single sweep pushes exposure past the wallet even if the sampled
+# committed state under-counts. This pins that the wallet is never exceeded.
+
+def test_wallet_cap_clamp_never_exceeds_max_committed(monkeypatch, tmp_path):
+    """A market offered a huge book must still leave the wallet at or below
+    max_committed_usd after a sweep -- open notional + inventory <= wallet."""
+    import dataclasses
+    from strategy import sweep
+    from strategy.config import load as load_cfg
+    from strategy import fleet, store
+
+    st = _mk_sweep_state(monkeypatch, tmp_path)
+    # Wallet of $100, but a book deep enough to tempt a much larger allocation.
+    st.cfg = dataclasses.replace(
+        st.cfg, max_committed_usd=100.0, allocation_budget=10_000.0,
+        max_cost_per_market=10_000.0, min_quote_shares=5)
+    # Deep two-sided book -> the quoter wants to commit far more than $100.
+    deep_up = _mk_book({0.52: 50_000.0, 0.51: 40_000.0, 0.50: 30_000.0},
+                       {0.52: 50_000.0, 0.51: 40_000.0, 0.50: 30_000.0},
+                       "tok-up")
+    deep_dn = _mk_book({0.48: 50_000.0, 0.47: 40_000.0, 0.46: 30_000.0},
+                       {0.48: 50_000.0, 0.47: 40_000.0, 0.46: 30_000.0},
+                       "tok-dn")
+    monkeypatch.setattr(
+        "strategy.sweep.full_book",
+        lambda host, token: deep_up if token == "tok-up" else deep_dn)
+
+    sweep.sweep(st, _ctx(now=time.time()))
+
+    committed = sweep.fleet_committed_cost([st])
+    assert committed <= st.cfg.max_committed_usd + 1e-6, (
+        f"wallet cap breached: committed ${committed:.2f} > "
+        f"max_committed_usd ${st.cfg.max_committed_usd:.2f}")

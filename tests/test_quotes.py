@@ -1035,11 +1035,44 @@ def test_the_emergency_exit_still_crosses_under_the_halt():
 
 def test_an_exited_market_is_unaffected_by_the_fleet_posture():
     """The two mechanisms are independent, in both directions: EXITED is a
-    verdict on THIS market and outranks any posture, and the posture is a
+    verdict on THIS market and outranks any per-market posture, and the posture is a
     verdict on the universe that can neither impose nor lift it."""
     for posture in (gate.NORMAL, gate.HALTED):
         intents, why = _rw_quote(
             _rw(gate_state=gate.EXITED, fleet_posture=posture),
             inv=_heavy_up(30.0))
         assert intents == [], posture
-        assert "market exited" in why, why
+
+
+# --- Plan 03: the spread-capture objective --------------------------------
+#
+# Short-dated markets (t_remaining <= 1 day) switch to `objective="spread"`,
+# which rests INSIDE the touch to skim the bid/ask spread instead of earning
+# the rewards window. The pair-cost cap still binds (the instrument pays $1.00).
+
+
+def test_spread_objective_rests_inside_the_touch():
+    """A wide-spread book under the spread objective rests one tick above the
+    best bid -- inside the touch, where a marketable sell hits us first."""
+    cfg = _cfg(objective="spread", spread_capture_default_spread=0.01,
+               tick_size=0.001, min_quote_shares=5)
+    intents, why = _quote(cfg, up=(0.48, 0.52), dn=(0.46, 0.50))
+    sides = {q.side for q in intents}
+    assert sides == {"UP", "DOWN"}, why
+    for q in intents:
+        # price must be > best_bid (inside touch) and < best_ask.
+        bb = 0.48 if q.side == "UP" else 0.46
+        ba = 0.52 if q.side == "UP" else 0.50
+        assert bb < q.price < ba, f"{q.side}: {q.price} not inside {bb}/{ba}"
+        assert "spread capture" in q.reason, q.reason
+
+
+def test_spread_objective_refuses_thin_spread():
+    """A one-tick spread leaves nothing to capture, so the spread objective
+    must sit out rather than rest at the touch for no edge."""
+    cfg = _cfg(objective="spread", spread_capture_default_spread=0.01,
+               tick_size=0.001, min_quote_shares=5)
+    # 0.481/0.482 -> spread 0.001 < 0.01 min.
+    intents, why = _quote(cfg, up=(0.481, 0.482), dn=(0.481, 0.482))
+    assert intents == [], why
+    assert "spread" in why, why

@@ -20,7 +20,7 @@ class MakerConfig:
     # --- virtual account --------------------------------------------------
     # Fresh paper run wallet. This is the total simulated capital available,
     # not a promise that the allocator may commit every dollar at once.
-    bankroll_usd: float = 1000.0
+    bankroll_usd: float = 100.0
 
     # --- objective --------------------------------------------------------
     # "pair"    : the original bet -- rest under the ask, try to buy a hedged
@@ -214,6 +214,9 @@ class MakerConfig:
     # Marginal $/day per $ committed, below which capital is better left idle.
     marginal_return_floor: float = 0.02
     # Leave wallet headroom for inventory and order-lifecycle timing.
+    # Reference scale: 90% of the $1,000 simulation bankroll. The live run
+    # overrides this via SPREAD_HUNTER_BANKROLL (load() sets allocation_budget
+    # = bankroll * 0.9), so a $100 bankroll yields a $90 budget automatically.
     allocation_budget: float = 900.0
     # Ceiling on any ONE market's share of that budget.
     #
@@ -462,6 +465,9 @@ class MakerConfig:
     # Counts inventory cost PLUS resting offer notional, because both are
     # dollars that are spoken for. $2,000 leaves room above the observed
     # working set without permitting another $9.5k drift.
+    # Default reference scale is $1,000 (the simulation's historical wallet);
+    # the live $100 run overrides this to $100 via SPREAD_HUNTER_BANKROLL
+    # (load() sets max_committed_usd = bankroll).
     max_committed_usd: float = 1000.0
     # Injected each cycle by the fleet runner, same pattern as fleet_naked_usd.
     # Zero for a single-market bot, which has no fleet to total up.
@@ -512,6 +518,14 @@ class MakerConfig:
     # Quotes outside these earn no rebate, so they must not be posted casually.
     min_quote_shares: int = 50
     max_spread_from_mid: float = 0.045
+    # QUEUE-DEPTH GATE (harden-to-reality). On live Polymarket a resting quote
+    # only fills when it is at or near the FRONT of the book; a quote posted
+    # behind thousands of shares almost never fills, and when it does it is
+    # because a sweep blew through the entire queue -- i.e. informed flow hit
+    # it, which is adverse selection. Measured 2026-08-23: quotes at
+    # queue_ahead=0 filled 6-12%, at 50+ shares <3%. Default 50 shares: refuse
+    # to rest when the book is deeper than that at our price. Set 0 to disable.
+    max_rest_queue_ahead: float = 50.0
 
     # His fill sizes: median 120sh, p10 20, p90 160. 61% were >=50sh.
     quote_shares: int = 120
@@ -612,6 +626,8 @@ class MakerConfig:
     target_balance: float = 0.92
     # Stop quoting a side once the pair would cost more than this. The pair
     # pays exactly $1.00, so anything at/above 1.00 is a guaranteed loss.
+    # Default 0.995: a common healthy pair (0.51 + 0.48) costs 0.99, which
+    # leaves 1c profit and must never be refused (test_healthy_two_sided_flow).
     max_pair_cost: float = 0.995
 
     # --- pacing -----------------------------------------------------------

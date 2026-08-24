@@ -1046,7 +1046,33 @@ def _requote(st: "MarketState", m, up, dn, cfg, ctx: SweepContext,
     """
     # Requote. Long-dated markets never expire mid-session, so t_remaining is
     # effectively infinite and every 5-min timing rule is inert by construction.
+    # Short-dated markets (within 1 day of resolution) switch to the spread
+    # objective: they pay no rewards worth capturing and the book is about to
+    # converge, so resting inside the touch to skim the spread is the only
+    # edge left. Driven by the live market clock, not a static ranker tag.
+    try:
+        _t_rem = m.t_remaining(ctx.now)
+    except Exception:
+        _t_rem = 1e9
+    if 0.0 < _t_rem <= 86400.0 and cfg.objective != "spread":
+        cfg = replace(cfg, objective="spread")
     intents, why = decide_quotes(cfg, up, dn, st.inv, 1e9, None)
+
+    # QUOTE UPTIME INSTRUMENTATION (Plan 04, harden-to-reality). When the
+    # decision layer rests NOTHING and names a reason, record it so the
+    # dashboard can show WHY a market is dark -- not just that it is. The
+    # pair-cost guard and emergency hedge already log their own decisions;
+    # this catches the remaining resting-quote skips (band, cost cap, timing,
+    # fresh-market, hedged-out) that previously vanished into a returned
+    # string. log_decision collapses consecutive identical skips per market.
+    if not intents and why:
+        store.log_decision(
+            market_slug=m.market_slug, condition_id=m.condition_id,
+            action="SKIP_REST", side="", price=None, mid=None,
+            edge_vs_mid=None, t_remaining=None,
+            balance=st.inv.balance, pair_cost=st.inv.pair_cost(),
+            reason=why, reason_code="NO_QUOTE",
+        )
 
     # An emergency-hedge intent is a TAKER order and must not be posted as a
     # resting bid. Under the queue fill model a lone bid at the ask has nothing
@@ -1137,6 +1163,69 @@ def _requote(st: "MarketState", m, up, dn, cfg, ctx: SweepContext,
         log.info("EMERGENCY_HEDGE %-28s %-4s %.0f/%.0fsh bal=%.2f",
                  st.title[:28], qi.side, got, qi.size, st.inv.balance)
 
+    # CLOSE-WINDOW BALANCE HEDGE. When a market is within `balance_hedge_sec`
+    # of resolution, resting orders will not have time to fill and flatten a
+    # lopsided position, so a naked leg would resolve at a guaranteed $1.00
+    # loss on the unhedged side. Cross the LIGHT side to bring the book back
+    # toward balance -- a true taker cross via engine.cross() (not a passive
+    # bid at the ask, which the queue model never fills), matching the
+    # emergency-hedge primitive. Long-dated markets report t_remaining in the
+    # billions, so this path is inert there and only fires as close approaches.
+    try:
+        t_rem = m.t_remaining(ctx.now)
+    except Exception:
+        t_rem = 1e9
+    if 0.0 < t_rem <= cfg.balance_hedge_sec and st.inv.balance < cfg.target_balance:
+        light = "UP" if st.inv.up_shares < st.inv.down_shares else "DOWN"
+        heavy = "DOWN" if light == "UP" else "UP"
+        gap = abs(st.inv.up_shares - st.inv.down_shares)
+        book = up if light == "UP" else dn
+        asks = book.get("asks") or {}
+        available = max(cfg.max_committed_usd
+                       - fleet_committed_cost(committed_states), 0.0)
+        cross_size = _affordable_cross_size(asks, gap, available)
+        if cross_size > 1e-9:
+            qid = store.log_quote(
+                market_slug=m.market_slug, condition_id=m.condition_id,
+                token_id=book.get("token_id"), side=light, price=book.get("best_ask"),
+                size=cross_size, queue_ahead=0.0, mid=book.get("best_ask"),
+                edge_vs_mid=None, t_remaining=t_rem,
+            )
+            got = 0.0
+            for f in st.engine.cross(book.get("token_id"), light, cross_size,
+                                     asks, ctx.now):
+                if f.side == "UP":
+                    st.inv.up_shares += f.size
+                    st.inv.up_cost += f.size * f.price
+                else:
+                    st.inv.down_shares += f.size
+                    st.inv.down_cost += f.size * f.price
+                st.inv.fills += 1
+                got += f.size
+                store.log_fill(
+                    quote_id=qid, market_slug=m.market_slug,
+                    condition_id=m.condition_id, token_id=f.token_id,
+                    side=f.side, price=f.price, size=f.size, mid_at_post=book.get("best_ask"),
+                    edge_vs_mid=None, queue_waited=0.0, seconds_to_fill=0.0,
+                    crossed=True, reason="close-window balance hedge",
+                )
+            if got + 1e-9 < cross_size:
+                store.mark_cancelled([qid])
+            hedge_reason = (f"close-window hedge {light} {got:.0f}/{cross_size:.0f}sh "
+                            f"(t_rem {t_rem:.0f}s <= {cfg.balance_hedge_sec:.0f}s, "
+                            f"bal {st.inv.balance:.2f})")
+            store.log_decision(
+                market_slug=m.market_slug, condition_id=m.condition_id,
+                action="CROSS_HEDGE", side=light, price=book.get("best_ask"),
+                mid=book.get("best_ask"), edge_vs_mid=None, t_remaining=t_rem,
+                balance=st.inv.balance, pair_cost=st.inv.pair_cost(),
+                reason=hedge_reason, reason_code="HEDGE",
+            )
+            _record_event(st, ctx.now, "HEDGED", hedge_reason, side=light,
+                          size=got, reason_code="HEDGE", force=True)
+            log.info("CROSS_HEDGE %-28s %-4s %.0f/%.0fsh t_rem=%.0f",
+                     st.title[:28], light, got, cross_size, t_rem)
+
     # Cancel stale or resized orders before reserving the next batch. Keeping
     # an old-size order when the allocator just reduced `quote_shares` makes
     # the allocation advisory rather than a capital limit.
@@ -1160,6 +1249,13 @@ def _requote(st: "MarketState", m, up, dn, cfg, ctx: SweepContext,
     # venue's minimum is left idle rather than creating a quote that scores 0.
     available = max(cfg.max_committed_usd
                        - fleet_committed_cost(committed_states), 0.0)
+    # DEFENSIVE WALLET CLAMP (harden-to-reality). The venue holds collateral
+    # against every open bid; on live Polymarket you cannot have open quotes
+    # whose notional exceeds the wallet. fleet_committed_cost already sums the
+    # fleet, but if that sampling ever under-counts (stale state, missed
+    # market), this floor guarantees no single sweep can push exposure past
+    # the wallet -- matching live margin enforcement at the source.
+    available = min(available, cfg.max_committed_usd)
     budget_blocked: list[str] = []
     for qi in intents:
         if qi.side in keep:
@@ -1190,6 +1286,17 @@ def _requote(st: "MarketState", m, up, dn, cfg, ctx: SweepContext,
                                  f"{size:.0f}sh < {cfg.min_quote_shares} minimum")
             continue
         book = up if qi.side == "UP" else dn
+        # QUEUE-DEPTH GATE (harden-to-reality). Resting behind a deep queue
+        # almost never fills at the front, and when it does it is a sweep
+        # through informed flow = adverse selection. Refuse to post when the
+        # book is deeper than max_rest_queue_ahead at our price. 0 disables.
+        if cfg.max_rest_queue_ahead > 0:
+            q_ahead = float(book["bids"].get(round(qi.price, 4), 0.0) or 0.0)
+            if q_ahead > cfg.max_rest_queue_ahead:
+                budget_blocked.append(
+                    f"{qi.side}: queue {q_ahead:.0f}sh > "
+                    f"{cfg.max_rest_queue_ahead:.0f}sh max at {qi.price:.3f}")
+                continue
         o = st.engine.post(qi.token_id, qi.side, qi.price, size, book["bids"], ctx.now)
         available -= o.price * o.size
         o.quote_id = store.log_quote(
@@ -1389,6 +1496,11 @@ def sweep(state: "MarketState", ctx: SweepContext) -> SweepOutcome:
     cfg, prev_gate = _advance_gate(state, m, up, dn, cfg, ctx)
     mg, pt = _manage_exits(state, m, up, dn, cfg, ctx)
     why = _requote(state, m, up, dn, cfg, ctx, committed_states)
+    # Persist any buffered decision rows (log_decision collapses consecutive
+    # identical actions into one in-memory run) before the dashboard reads
+    # them back -- a CROSS_HEDGE or EMERGENCY_HEDGE logged in _requote must
+    # reach the decisions table this sweep, not wait for a later key change.
+    store.flush_decision(force=True)
     _score_and_publish(state, m, up, dn, cfg, ctx, mg, pt, why, pair)
 
     open_orders = state.engine.open_orders()

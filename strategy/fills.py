@@ -184,6 +184,12 @@ class QueueFillEngine:
     cancel_venue_ack_ms: float = 150.0
     post_venue_accept_ms: float = 81.0
     cancel_net_oneway_ms: Optional[float] = None
+    # Venue minimum fill size (Polymarket min_size = 5 shares). A fill below
+    # this cannot exist on the live venue -- it would be rounded or rejected.
+    # Paper can credit fractional shares, so we drop sub-min fills here to keep
+    # the simulation honest against live (this chiefly removes "race" dust,
+    # which is a *fraction* of a cancel-window overlap and is sub-5 shares).
+    min_fill_shares: float = 5.0
 
     def __post_init__(self):
         if self.cancel_net_oneway_ms is not None:
@@ -432,6 +438,11 @@ class QueueFillEngine:
               reason: str = "queue") -> Optional[Fill]:
         qty = min(qty, o.remaining)
         if qty <= 1e-9:
+            return None
+        # Venue minimum fill size: Polymarket rejects sub-5-share fills. Paper
+        # can credit fractional shares (e.g. race dust), so drop anything the
+        # live venue could not actually execute. Keeps sim/live honest.
+        if qty < self.min_fill_shares:
             return None
         o.filled += qty
         # A tape-backed fill happened in both universes, so it advances the

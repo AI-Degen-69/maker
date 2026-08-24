@@ -773,3 +773,41 @@ def test_small_dt_zero_and_negative_interval_guard():
     assert o.filled == 0.0
 
 
+# --- venue minimum fill size (harden-to-reality, Action 2) -----------------
+# Polymarket rejects sub-5-share fills. Paper can credit fractional shares
+# (e.g. race dust = p_race * exposed, a fraction of the cancel window), so
+# QueueFillEngine drops any fill below `min_fill_shares`. These pin that.
+
+def test_race_fill_below_venue_minimum_is_dropped():
+    """A cancel-race fill that resolves to < 5 shares is dust the live venue
+    would reject -- it must NOT be credited (matches live)."""
+    # tau = 0.25s. Order of 4.0 shares, full race credit (p_race=1.0).
+    eng = QueueFillEngine(cancel_net_oneway_ms=100.0, cancel_venue_ack_ms=150.0)
+    o = eng.post("T", "UP", 0.50, 4.0, {0.50: 0.0}, 0.0)
+    eng.on_book("T", {0.50: 0.0}, 1.0, traded={})       # establishes prev
+    eng.cancel("T", ts=1.0, reason="requote")
+    # Snapshot at t=1.2, dt_poll=0.2 <= tau -> p_race=1.0 -> qty_race=4.0 (< 5)
+    fills = eng.on_book("T", {0.50: 0.0}, 1.2, traded={0.50: 40.0})
+    assert fills == [], "sub-5-share race fill must be dropped"
+    assert o.filled == 0.0
+    assert eng.filled_shares() == 0.0
+
+
+def test_race_fill_at_venue_minimum_is_kept():
+    """The boundary: exactly 5 shares (the venue minimum) is a real fill."""
+    eng = QueueFillEngine(cancel_net_oneway_ms=100.0, cancel_venue_ack_ms=150.0)
+    o = eng.post("T", "UP", 0.50, 5.0, {0.50: 0.0}, 0.0)
+    eng.on_book("T", {0.50: 0.0}, 1.0, traded={})       # establishes prev
+    eng.cancel("T", ts=1.0, reason="requote")
+    fills = eng.on_book("T", {0.50: 0.0}, 1.2, traded={0.50: 50.0})
+    assert len(fills) == 1
+    assert fills[0].reason == "race"
+    assert fills[0].size == pytest.approx(5.0)
+    assert o.filled == pytest.approx(5.0)
+
+
+def test_min_fill_size_default_is_venue_minimum():
+    """The engine ships with the Polymarket minimum (5 shares) as the floor."""
+    assert QueueFillEngine().min_fill_shares == 5.0
+
+

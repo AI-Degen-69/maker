@@ -514,6 +514,83 @@ def _decide_quotes_rewards(
     return out, ""
 
 
+def _decide_quotes_spread(
+    cfg: MakerConfig,
+    up_book: dict,
+    down_book: dict,
+    inv: Inventory,
+    t_remaining: float,
+) -> tuple[list[QuoteIntent], str]:
+    """Spread-capture quoting for SHORT-DATED markets (Plan 03, harden-to-reality).
+
+    A market paying no rewards but trading real volume earns its income as
+    bid/ask spread, not emissions. We rest just INSIDE the touch -- one tick
+    above the best bid -- so a resting bid captures the spread on the next
+    marketable sell. This is the inverse of the rewards path, which rests
+    mid-minus-offset to earn the rebate window: here the edge is the spread
+    itself, so we sit at the top of the book.
+
+    Refuses a side when:
+      * the spread is too thin (< `spread_capture_default_spread`) -- no edge;
+      * the pair would cost >= `max_pair_cost` (still a $1.00 instrument);
+      * the size ladder yields nothing (same dollar caps as the rewards path).
+    """
+    out: list[QuoteIntent] = []
+    blocked: list[str] = []
+
+    # A spread-capture book needs real width to be worth resting inside.
+    min_spread = cfg.spread_capture_default_spread
+    for side, book in (("UP", up_book), ("DOWN", down_book)):
+        bb, ba = book.get("best_bid"), book.get("best_ask")
+        if bb is None or ba is None:
+            blocked.append(f"{side}: no book")
+            continue
+        spread = ba - bb
+        if spread < min_spread:
+            blocked.append(f"{side}: spread {spread:.3f} < {min_spread:.3f} min")
+            continue
+        # Rest one tick inside the touch: a maker bid at best_bid + tick.
+        price = round(bb + cfg.tick_size, 4)
+        if price >= ba:
+            # Touch collapsed to one tick; nothing to capture.
+            blocked.append(f"{side}: touch too thin to rest inside")
+            continue
+        mid = (bb + ba) / 2.0
+
+        # Pair-cost cap still binds: the instrument pays exactly $1.00.
+        other = "DOWN" if side == "UP" else "UP"
+        other_book = down_book if side == "UP" else up_book
+        other_avg = inv.avg(other)
+        other_bb = (other_book.get("best_bid") or 0.0)
+        # A held hedge averages into the pair; an open side uses the touch.
+        hedge_cost = other_avg if other_avg > 0 else other_bb
+        if hedge_cost > 0 and (price + hedge_cost) >= cfg.max_pair_cost:
+            blocked.append(
+                f"{side}: spread quote {price:.3f} + {other} {hedge_cost:.3f} "
+                f"= {price + hedge_cost:.3f} >= ${cfg.max_pair_cost:.3f} cap")
+            continue
+
+        ladder = risk.size_for(cfg, inv, side, price)
+        if ladder <= 0:
+            blocked.append(f"{side}: size ladder returned 0")
+            continue
+        size = int(ladder)
+        if size < cfg.min_quote_shares:
+            blocked.append(f"{side}: size {size} < min {cfg.min_quote_shares}")
+            continue
+
+        out.append(QuoteIntent(
+            side=side, token_id=book.get("token_id"), price=price, size=size,
+            mid=mid, edge_vs_mid=mid - price,
+            reason=(f"spread capture {side} inside touch {price:.3f} "
+                    f"(spread {spread:.3f})"),
+        ))
+
+    if not out:
+        return [], "; ".join(blocked) or "no side quotable"
+    return out, ""
+
+
 def decide_quotes(
     cfg: MakerConfig,
     up_book: dict,
@@ -531,6 +608,8 @@ def decide_quotes(
     """
     if cfg.objective == "rewards":
         return _decide_quotes_rewards(cfg, up_book, down_book, inv, t_remaining)
+    if cfg.objective == "spread":
+        return _decide_quotes_spread(cfg, up_book, down_book, inv, t_remaining)
 
     if t_remaining < cfg.min_t_remaining_sec:
         return [], f"t_remaining {t_remaining:.0f}s < {cfg.min_t_remaining_sec:.0f}s"
@@ -631,6 +710,15 @@ def decide_quotes(
         other = "DOWN" if side == "UP" else "UP"
         other_avg = inv.avg(other)
         if other_avg > 0 and (price + other_avg) >= cfg.max_pair_cost:
+            store.log_decision(
+                market_slug=m.market_slug, condition_id=m.condition_id,
+                action="SKIP_PAIR_COST", side=side, price=price, mid=mid,
+                edge_vs_mid=mid - price, t_remaining=None,
+                balance=inv.balance, pair_cost=inv.pair_cost(),
+                reason=(f"{side} quote {price:.3f} + {other} avg "
+                        f"{other_avg:.3f} = {price+other_avg:.3f} >= "
+                        f"${cfg.max_pair_cost:.3f} cap -- sits out"),
+                reason_code="PAIR_COST")
             continue
 
         # Inventory control: if we're already heavy on this side, only quote

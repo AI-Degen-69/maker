@@ -64,6 +64,9 @@ $env:SPREAD_HUNTER_DB = "run/fleet.db"
 $env:HUNTER_DEPTH_TRIAL_USD = "500"
 $env:HUNTER_VOLUME_TRIAL_USD = "125000"
 $env:HUNTER_MARGINAL_FLOOR = "0.0001"
+# STARTING CAPITAL: fresh paper run wallet = $100 (overrides bankroll_usd,
+# allocation_budget = bankroll*0.9 = $90, max_committed_usd = $100 via load()).
+$env:SPREAD_HUNTER_BANKROLL = "100"
 
 # 5. Start supervisor in hidden background process
 $sup = Start-Process -FilePath "python" `
