@@ -875,15 +875,21 @@ def _write_pipeline_snapshot(cands, spread_cands, out, eligible, picked,
 
     raw_rewards = []
     for rate, m in cands[:24]:
+        _slug = (m.get("slug") or m.get("market_slug") or "")[:120]
         raw_rewards.append({
             "title": (m.get("question") or "")[:80],
+            "slug": _slug,
+            "url": f"https://polymarket.com/market/{_slug}" if _slug else "",
             "rate": round(rate, 2),
             "days": _days(m),
         })
     raw_spread = []
     for m in spread_cands[:24]:
+        _slug = (m.get("slug") or m.get("market_slug") or "")[:120]
         raw_spread.append({
             "title": (m.get("question") or "")[:80],
+            "slug": _slug,
+            "url": f"https://polymarket.com/market/{_slug}" if _slug else "",
             "volume": round(float(m.get("_volume_24h") or 0.0), 0),
             "spread": m.get("_spread"),
             "days": _days(m),
@@ -903,8 +909,12 @@ def _write_pipeline_snapshot(cands, spread_cands, out, eligible, picked,
         examples = []
         for r in bucket_rows[:4]:
             v = verdicts.get(id(r))
+            _slug = r.get("slug") or ""
             examples.append({
                 "title": r["title"],
+                "slug": _slug,
+                "cid": r.get("cid") or "",
+                "url": f"https://polymarket.com/market/{_slug}" if _slug else "",
                 "reason": r["reject_reason"],
                 "volume": r.get("volume_24h"),
                 "days": r.get("days_to_resolve"),
@@ -926,8 +936,12 @@ def _write_pipeline_snapshot(cands, spread_cands, out, eligible, picked,
                            "examples": examples})
 
     def _row(r: dict) -> dict:
+        _slug = r.get("slug") or ""
         return {
-            "title": r["title"], "source": r["source"],
+            "title": r["title"], "slug": _slug,
+            "cid": r.get("cid") or "",
+            "url": f"https://polymarket.com/market/{_slug}" if _slug else "",
+            "source": r["source"],
             "income": r.get("est_income"), "capital": r.get("est_capital"),
             "ret_day_pct": r.get("return_pct_day"),
             "volume": r.get("volume_24h"), "days": r.get("days_to_resolve"),
