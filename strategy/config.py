@@ -214,10 +214,10 @@ class MakerConfig:
     # Marginal $/day per $ committed, below which capital is better left idle.
     marginal_return_floor: float = 0.02
     # Leave wallet headroom for inventory and order-lifecycle timing.
-    # Reference scale: 90% of the $1,000 simulation bankroll. The live run
+    # Reference scale: 90% of the $100.0 default bankroll. The live run
     # overrides this via SPREAD_HUNTER_BANKROLL (load() sets allocation_budget
     # = bankroll * 0.9), so a $100 bankroll yields a $90 budget automatically.
-    allocation_budget: float = 900.0
+    allocation_budget: float = 90.0
     # Ceiling on any ONE market's share of that budget.
     #
     # The water-fill was written as a diversifier and is not one. `marginal`
@@ -465,10 +465,10 @@ class MakerConfig:
     # Counts inventory cost PLUS resting offer notional, because both are
     # dollars that are spoken for. $2,000 leaves room above the observed
     # working set without permitting another $9.5k drift.
-    # Default reference scale is $1,000 (the simulation's historical wallet);
-    # the live $100 run overrides this to $100 via SPREAD_HUNTER_BANKROLL
+    # Default reference scale is $100.0 (aligned with default bankroll_usd);
+    # the live run overrides this via SPREAD_HUNTER_BANKROLL
     # (load() sets max_committed_usd = bankroll).
-    max_committed_usd: float = 1000.0
+    max_committed_usd: float = 100.0
     # Injected each cycle by the fleet runner, same pattern as fleet_naked_usd.
     # Zero for a single-market bot, which has no fleet to total up.
     committed_usd: float = 0.0

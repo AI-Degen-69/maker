@@ -1226,6 +1226,16 @@ def _requote(st: "MarketState", m, up, dn, cfg, ctx: SweepContext,
             log.info("CROSS_HEDGE %-28s %-4s %.0f/%.0fsh t_rem=%.0f",
                      st.title[:28], light, got, cross_size, t_rem)
 
+            # Cancel all resting orders after close-window hedge executes.
+            # Subsequent requote logic must not retain or submit new orders.
+            cancelled_hedge = []
+            for o in st.engine.open_orders():
+                o.cancel(ts=ctx.now, reason="close-window hedge executed")
+                cancelled_hedge.append(o.quote_id)
+            store.mark_cancelled([qid for qid in cancelled_hedge if qid is not None])
+            # Clear intents so the later requote logic cannot submit new orders
+            intents = []
+
     # Cancel stale or resized orders before reserving the next batch. Keeping
     # an old-size order when the allocator just reduced `quote_shares` makes
     # the allocation advisory rather than a capital limit.

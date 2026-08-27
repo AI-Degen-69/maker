@@ -40,14 +40,38 @@ def load_live_snaps():
     f = RUN / "oscillation_snapshots.jsonl"
     if not f.exists():
         return {}
-    # last snap per series
+    # last snap per series - read only bounded tail to avoid loading full file
     last={}
-    for line in f.read_text(encoding="utf-8").splitlines()[-2000:]:
-        if not line.strip(): continue
-        try:
-            r=json.loads(line)
-            last[r["series"]] = r
-        except: continue
+    try:
+        # Read only last 2000 lines efficiently without loading entire file
+        with open(f, 'r', encoding='utf-8') as file:
+            # Seek to end and read backwards to find last 2000 lines
+            file.seek(0, 2)  # Go to end
+            file_size = file.tell()
+
+            # If file is small, just read it all
+            if file_size < 500000:  # ~500KB threshold
+                file.seek(0)
+                lines = file.readlines()[-2000:]
+            else:
+                # Read last chunk and extract lines
+                chunk_size = min(file_size, 200000)  # Read last ~200KB
+                file.seek(max(0, file_size - chunk_size))
+                # Skip partial first line
+                file.readline()
+                lines = file.readlines()[-2000:]
+
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    last[r["series"]] = r
+                except:
+                    continue
+    except Exception:
+        pass
     return last
 
 @app.get("/api/oscillation")
@@ -125,7 +149,7 @@ a{color:var(--proj);text-decoration:none} a:hover{text-decoration:underline}
 </div>
 <script>
 const $=s=>document.getElementById(s);
-const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 const pct=(a,b)=> b?Math.round(a/b*100):0;
 const hms=s=>{s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;return h?`${h}h ${String(m).padStart(2,'0')}m`:`${m}m ${String(x).padStart(2,'0')}s`;};
 function pill(cls,txt){return `<span class="pill ${cls}">${txt}</span>`;}
@@ -144,7 +168,9 @@ async function tick(){
     const tp=s.touch_pair==null?'-':s.touch_pair.toFixed(3);
     const rem=s.t_rem==null?'-':hms(s.t_rem);
     const q=s.queue_up==null?'-':Math.round(s.queue_up);
-    liveHtml+=`<div class="liveBox"><div style="font:700 10px var(--disp);color:var(--faint)">${k}</div><div class="mono" style="font-size:12px">mid ${mid} · touch ${tp}</div><div class="mono" style="font-size:10px;color:var(--dim)">queue @rest ${q} · נותר ${rem}</div><div style="font-size:10px"><a href="https://polymarket.com/market/${s.slug}" target="_blank" rel="noopener">${esc(s.slug.slice(0,28))} ↗</a></div></div>`;
+    const marketUrl = `https://polymarket.com/market/${encodeURIComponent(s.slug)}`;
+    const displaySlug = esc(s.slug.slice(0,28));
+    liveHtml+=`<div class="liveBox"><div style="font:700 10px var(--disp);color:var(--faint)">${k}</div><div class="mono" style="font-size:12px">mid ${mid} · touch ${tp}</div><div class="mono" style="font-size:10px;color:var(--dim)">queue @rest ${q} · נותר ${rem}</div><div style="font-size:10px"><a href="${esc(marketUrl)}" target="_blank" rel="noopener" title="${esc(s.slug)}">${displaySlug} ↗</a></div></div>`;
   }
   liveHtml+='</div>';
   $('liveBar').innerHTML=liveHtml;

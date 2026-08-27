@@ -135,9 +135,14 @@ def classify_window(mids: list[float]):
     down2 = max_down >= 0.02
     if up2 and down2:
         return "oscillating"
-    if up2 or down2:
-        # check if it went one way then never came back >1c opposite
+    # monotonic requires one direction >= 2c AND the opposite < 1c (0.01)
+    if up2 and max_down < 0.01:
         return "monotonic"
+    if down2 and max_up < 0.01:
+        return "monotonic"
+    # if one direction >= 2c but the opposite >= 1c, it's reversing not monotonic
+    if up2 or down2:
+        return "oscillating"
     return "flat"
 
 def update_summary():
@@ -179,54 +184,81 @@ def update_summary():
     return summary
 
 def poll_once():
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     now = time.time()
-    for series_slug, duration, label in SERIES:
-        info, err = fetch_live_for_series(series_slug)
-        if not info:
-            continue
-        cid = info["conditionId"]
-        # init window collector if new
-        if cid not in windows:
-            windows[cid] = {"series": series_slug, "slug": info["slug"], "start_ts": info["start_ts"], "end_ts": info["end_ts"], "mids": [], "touch_pairs": [], "snap_count": 0, "label": label, "duration": duration}
-        # fetch books
-        ub = fetch_book(info["up_token"])
-        db = fetch_book(info["down_token"])
-        # compute mid_up from UP book
-        mid = None
-        if ub["best_bid"] is not None and ub["best_ask"] is not None:
-            mid = (ub["best_bid"] + ub["best_ask"])/2.0
-        elif ub["best_bid"] is not None:
-            mid = ub["best_bid"] + 0.005
-        elif ub["best_ask"] is not None:
-            mid = ub["best_ask"] - 0.005
-        # touch pair = up_ask + down_ask (cost to cross both)
-        touch_pair = None
-        if ub["best_ask"] is not None and db["best_ask"] is not None:
-            touch_pair = ub["best_ask"] + db["best_ask"]
-        # resting pair at SPREAD 2
-        resting_pair = 1.0 - 2*SPREAD_OFFSET  # 0.96
-        # queue ahead at resting price (approx: sum sizes at price >= resting_price for asks? but we rest at bid, so queue at bid level)
-        # For UP side, resting bid = mid - 0.02. Queue = sum of bid sizes at price >= resting_bid (ahead of us if we are at back)
-        queue_up = None
-        if mid is not None:
-            rest = round(mid - SPREAD_OFFSET,3)
-            # count bids at >= rest
-            queue_up = sum(s for p,s in ub["bids"].items() if p >= rest) if ub["bids"] else 0
-            windows[cid]["mids"].append(mid)
-            if touch_pair is not None:
-                windows[cid]["touch_pairs"].append(touch_pair)
-        snap = {
-            "ts": now, "series": series_slug, "cid": cid, "slug": info["slug"],
-            "mid": mid, "touch_pair": touch_pair, "resting_pair": resting_pair,
-            "queue_up": queue_up,
-            "up_bid": ub["best_bid"], "up_ask": ub["best_ask"],
-            "down_bid": db["best_bid"], "down_ask": db["best_ask"],
-            "t_rem": info["end_ts"] - now,
-        }
-        # append snapshot line
-        with open(SNAP_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(snap)+"\n")
-        windows[cid]["snap_count"] += 1
+
+    # Fetch all series info concurrently
+    fetch_tasks = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        for series_slug, duration, label in SERIES:
+            fetch_tasks.append((series_slug, duration, label, executor.submit(fetch_live_for_series, series_slug)))
+
+        # Process results as they complete
+        series_data = []
+        for series_slug, duration, label, future in fetch_tasks:
+            try:
+                info, err = future.result()
+                if info:
+                    series_data.append((series_slug, duration, label, info))
+            except Exception:
+                continue
+
+        # Fetch books concurrently for all live markets
+        book_tasks = []
+        for series_slug, duration, label, info in series_data:
+            cid = info["conditionId"]
+            # init window collector if new
+            if cid not in windows:
+                windows[cid] = {"series": series_slug, "slug": info["slug"], "start_ts": info["start_ts"], "end_ts": info["end_ts"], "mids": [], "touch_pairs": [], "snap_count": 0, "label": label, "duration": duration}
+
+            up_future = executor.submit(fetch_book, info["up_token"])
+            down_future = executor.submit(fetch_book, info["down_token"])
+            book_tasks.append((series_slug, duration, label, info, cid, up_future, down_future))
+
+        # Process book results and write telemetry
+        for series_slug, duration, label, info, cid, up_future, down_future in book_tasks:
+            try:
+                ub = up_future.result()
+                db = down_future.result()
+            except Exception:
+                continue
+
+            # compute mid_up from UP book
+            mid = None
+            if ub["best_bid"] is not None and ub["best_ask"] is not None:
+                mid = (ub["best_bid"] + ub["best_ask"])/2.0
+            elif ub["best_bid"] is not None:
+                mid = ub["best_bid"] + 0.005
+            elif ub["best_ask"] is not None:
+                mid = ub["best_ask"] - 0.005
+            # touch pair = up_ask + down_ask (cost to cross both)
+            touch_pair = None
+            if ub["best_ask"] is not None and db["best_ask"] is not None:
+                touch_pair = ub["best_ask"] + db["best_ask"]
+            # resting pair at SPREAD 2
+            resting_pair = 1.0 - 2*SPREAD_OFFSET  # 0.96
+            # queue ahead at resting price (approx: sum sizes at price >= resting_price for asks? but we rest at bid, so queue at bid level)
+            # For UP side, resting bid = mid - 0.02. Queue = sum of bid sizes at price >= resting_bid (ahead of us if we are at back)
+            queue_up = None
+            if mid is not None:
+                rest = round(mid - SPREAD_OFFSET,3)
+                # count bids at >= rest
+                queue_up = sum(s for p,s in ub["bids"].items() if p >= rest) if ub["bids"] else 0
+                windows[cid]["mids"].append(mid)
+                if touch_pair is not None:
+                    windows[cid]["touch_pairs"].append(touch_pair)
+            snap = {
+                "ts": now, "series": series_slug, "cid": cid, "slug": info["slug"],
+                "mid": mid, "touch_pair": touch_pair, "resting_pair": resting_pair,
+                "queue_up": queue_up,
+                "up_bid": ub["best_bid"], "up_ask": ub["best_ask"],
+                "down_bid": db["best_bid"], "down_ask": db["best_ask"],
+                "t_rem": info["end_ts"] - now,
+            }
+            # append snapshot line
+            with open(SNAP_FILE, "a", encoding="utf-8") as f:
+                f.write(json.dumps(snap)+"\n")
+            windows[cid]["snap_count"] += 1
     # check for closed windows
     now = time.time()
     closed = []

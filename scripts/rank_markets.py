@@ -875,20 +875,22 @@ def _write_pipeline_snapshot(cands, spread_cands, out, eligible, picked,
 
     raw_rewards = []
     for rate, m in cands[:24]:
-        _slug = (m.get("slug") or m.get("market_slug") or "")[:120]
+        _slug = m.get("slug") or m.get("market_slug") or ""
         raw_rewards.append({
             "title": (m.get("question") or "")[:80],
             "slug": _slug,
+            "cid": m.get("condition_id") or "",
             "url": f"https://polymarket.com/market/{_slug}" if _slug else "",
             "rate": round(rate, 2),
             "days": _days(m),
         })
     raw_spread = []
     for m in spread_cands[:24]:
-        _slug = (m.get("slug") or m.get("market_slug") or "")[:120]
+        _slug = m.get("slug") or m.get("market_slug") or ""
         raw_spread.append({
             "title": (m.get("question") or "")[:80],
             "slug": _slug,
+            "cid": m.get("condition_id") or "",
             "url": f"https://polymarket.com/market/{_slug}" if _slug else "",
             "volume": round(float(m.get("_volume_24h") or 0.0), 0),
             "spread": m.get("_spread"),

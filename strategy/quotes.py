@@ -550,7 +550,7 @@ def _decide_quotes_spread(
             blocked.append(f"{side}: spread {spread:.3f} < {min_spread:.3f} min")
             continue
         # Rest one tick inside the touch: a maker bid at best_bid + tick.
-        price = round(bb + cfg.tick_size, 4)
+        price = round(bb + cfg.price_tick, 4)
         if price >= ba:
             # Touch collapsed to one tick; nothing to capture.
             blocked.append(f"{side}: touch too thin to rest inside")
@@ -710,15 +710,7 @@ def decide_quotes(
         other = "DOWN" if side == "UP" else "UP"
         other_avg = inv.avg(other)
         if other_avg > 0 and (price + other_avg) >= cfg.max_pair_cost:
-            store.log_decision(
-                market_slug=m.market_slug, condition_id=m.condition_id,
-                action="SKIP_PAIR_COST", side=side, price=price, mid=mid,
-                edge_vs_mid=mid - price, t_remaining=None,
-                balance=inv.balance, pair_cost=inv.pair_cost(),
-                reason=(f"{side} quote {price:.3f} + {other} avg "
-                        f"{other_avg:.3f} = {price+other_avg:.3f} >= "
-                        f"${cfg.max_pair_cost:.3f} cap -- sits out"),
-                reason_code="PAIR_COST")
+            # Skip this side due to pair cost; _requote will log the refusal
             continue
 
         # Inventory control: if we're already heavy on this side, only quote

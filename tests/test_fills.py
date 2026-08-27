@@ -778,9 +778,9 @@ def test_small_dt_zero_and_negative_interval_guard():
 # (e.g. race dust = p_race * exposed, a fraction of the cancel window), so
 # QueueFillEngine drops any fill below `min_fill_shares`. These pin that.
 
-def test_race_fill_below_venue_minimum_is_dropped():
-    """A cancel-race fill that resolves to < 5 shares is dust the live venue
-    would reject -- it must NOT be credited (matches live)."""
+def test_race_fill_below_venue_minimum_is_recorded():
+    """A tape-confirmed partial fill below 5 shares is valid and recorded.
+    The venue minimum is enforced at order submission, not fill recording."""
     # tau = 0.25s. Order of 4.0 shares, full race credit (p_race=1.0).
     eng = QueueFillEngine(cancel_net_oneway_ms=100.0, cancel_venue_ack_ms=150.0)
     o = eng.post("T", "UP", 0.50, 4.0, {0.50: 0.0}, 0.0)
@@ -788,9 +788,11 @@ def test_race_fill_below_venue_minimum_is_dropped():
     eng.cancel("T", ts=1.0, reason="requote")
     # Snapshot at t=1.2, dt_poll=0.2 <= tau -> p_race=1.0 -> qty_race=4.0 (< 5)
     fills = eng.on_book("T", {0.50: 0.0}, 1.2, traded={0.50: 40.0})
-    assert fills == [], "sub-5-share race fill must be dropped"
-    assert o.filled == 0.0
-    assert eng.filled_shares() == 0.0
+    assert len(fills) == 1, "sub-5-share tape-confirmed fill must be recorded"
+    assert fills[0].reason == "race"
+    assert fills[0].size == pytest.approx(4.0)
+    assert o.filled == pytest.approx(4.0)
+    assert eng.filled_shares() == pytest.approx(4.0)
 
 
 def test_race_fill_at_venue_minimum_is_kept():

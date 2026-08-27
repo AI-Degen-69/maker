@@ -439,11 +439,9 @@ class QueueFillEngine:
         qty = min(qty, o.remaining)
         if qty <= 1e-9:
             return None
-        # Venue minimum fill size: Polymarket rejects sub-5-share fills. Paper
-        # can credit fractional shares (e.g. race dust), so drop anything the
-        # live venue could not actually execute. Keeps sim/live honest.
-        if qty < self.min_fill_shares:
-            return None
+        # Tape-confirmed partial fills below the venue minimum are recorded.
+        # The market-specific minimum is enforced at order submission, not fill
+        # recording -- the tape says it happened, so we credit it.
         o.filled += qty
         # A tape-backed fill happened in both universes, so it advances the
         # shadow too. Otherwise a verified fill would leave shadow_remaining
