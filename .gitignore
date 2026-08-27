@@ -27,6 +27,8 @@ run/volume_near_misses.jsonl
 run/pipeline.json
 run/trial_depth_report.json
 run/live_poll_heartbeat.json
+run/oscillation_*.jsonl
+run/oscillation_*.json
 # recorded market data + backfilled tape (scripts/record_books.py,
 # scripts/fetch_trades.py). Regenerable, and large after a long run.
 books.db

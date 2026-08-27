@@ -960,137 +960,214 @@ PAGE = r"""<!doctype html>
 <link rel="icon" href="data:,">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<!-- Font CSS is not render-critical: display=swap already swaps the glyphs
-     in, so fetching it in the background (preload -> stylesheet onload)
-     keeps the first paint off the Google round trip. -->
 <link rel="preload" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" as="style" onload="this.onload=null;this.rel='stylesheet'">
 <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap"></noscript>
 <style>
- :root{
-   --bg:#0a0d12; --panel:#12161d; --panel-2:#171c24; --line:#232a35; --line-soft:#1a2029;
-   --tx:#e7ebf3; --tx-dim:#8792a6; --tx-faint:#535e70;
-   --up:#33c9b5; --up-soft:#12302c;
-   --down:#f0684d; --down-soft:#3a201a;
-   --gold:#e8b84b; --gold-soft:#3a2f18;
-   --proj:#7b9bf7; --proj-soft:#1c2540;
-   --alert:#ff5c5c;
-   --r-md:8px; --r-sm:5px;
-   --disp:'Space Grotesk',system-ui,sans-serif;
-   --mono:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace;
-   --body:'IBM Plex Sans',system-ui,-apple-system,"Segoe UI",sans-serif;
- }
- *{box-sizing:border-box}
- body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 var(--body);
-      -webkit-font-smoothing:antialiased}
- a{color:inherit}
- a:focus-visible,button:focus-visible{outline:2px solid var(--proj);outline-offset:2px}
- .up{color:var(--up)}.down{color:var(--down)}
- .proj{color:var(--proj)}.alert-tx{color:var(--alert)}.dim{color:var(--tx-dim)}
- .bold{font-weight:600}.mono{font-family:var(--mono)}
-
-
-
- /* ---------- masthead ---------- */
- .mast{display:flex;align-items:center;gap:14px;padding:14px 24px;
-       background:var(--panel);border-bottom:1px solid var(--line)}
- .mast-id{font-family:var(--disp);font-weight:700;font-size:16px;letter-spacing:.01em}
- .mast-id b{color:var(--gold)}
- .tag{border:1px solid var(--down);color:var(--down);border-radius:99px;
-      padding:3px 10px;font-size:11px;font-weight:600;letter-spacing:.06em}
- .legend{display:flex;gap:14px;font-size:11px;color:var(--tx-dim);letter-spacing:.02em}
- .legend span{display:inline-flex;align-items:center;gap:5px}
- .legend i{width:7px;height:7px;border-radius:50%;display:inline-block}
- .live{font-size:12px;font-weight:600}
-
-
-
- /* ---------- market-pipeline (selection funnel) ---------- */
- .pipe-view{padding:20px 24px}
- .pipe-strip{display:flex;flex-direction:column;gap:6px;padding:12px 14px;background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);margin-bottom:14px}
- .pipe-census{font-family:var(--mono);font-size:11px;color:var(--tx-dim);margin-top:2px}
- .pipe-census summary{cursor:pointer;color:var(--tx-faint);font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;user-select:none}
- .pipe-census[open] summary{margin-bottom:5px}
- .pipe-chain{font-family:var(--mono);font-size:12px;color:var(--tx)}
- .pipe-chain span{margin:0 2px}
- .pipe-gates{font-size:11px;color:var(--tx-faint);margin-top:5px;border-top:1px dashed var(--line);padding-top:4px}
- .pipe-board{display:grid;grid-template-columns:minmax(250px,1fr) 26px minmax(280px,1.35fr) 26px minmax(250px,1fr) 26px minmax(280px,1.2fr);gap:8px;align-items:stretch}
- .pipe-arrow{align-self:center;text-align:center;font-size:20px;color:var(--tx-faint);user-select:none}
- .pipe-lane{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);display:flex;flex-direction:column;min-height:340px;max-height:680px}
- .pipe-lane-raw{border-color:var(--line)}
- .pipe-lane-filter{border-color:rgba(240,104,77,.45)}
- .pipe-lane-final{border-color:rgba(123,155,247,.45)}
- .pipe-lane-grad{border-color:rgba(51,201,181,.45)}
- .pipe-lane-hdr{padding:10px 12px;border-bottom:1px solid var(--line);display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
- .pipe-lane-hdr h3{margin:0;font:700 12px/1.25 var(--disp);letter-spacing:.08em;text-transform:uppercase}
- .pipe-count{font:700 13px/1 var(--mono);border-radius:99px;padding:4px 8px;background:var(--panel-2);border:1px solid var(--line);white-space:nowrap}
- .pipe-lane-body{padding:8px;overflow:auto;display:flex;flex-direction:column;gap:8px;flex:1}
- .pipe-lane-body::-webkit-scrollbar{width:6px}
- .pipe-lane-body::-webkit-scrollbar-thumb{background:var(--line);border-radius:3px}
- .pipe-group{border:1px solid var(--line-soft);border-radius:var(--r-sm);padding:6px}
- .pipe-group-hdr{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--tx-faint);font-weight:600;margin-bottom:6px}
- .pipe-empty{padding:6px;font-size:11px;color:var(--tx-dim)}
- .chip{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-sm);padding:5px 7px;font-size:11px;line-height:1.3}
- .chip-t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:230px}
- .chip-s{font-family:var(--mono);font-size:10px;color:var(--tx-dim);margin-top:2px}
- .gate-card{background:var(--down-soft);border:1px solid rgba(240,104,77,.35);border-radius:var(--r-sm);padding:7px 9px}
- .gate-hdr{display:flex;align-items:center;justify-content:space-between;gap:8px}
- .gate-name{font-weight:600;font-size:12px;text-transform:capitalize}
- .gate-n{font:700 13px/1 var(--mono);color:var(--down);background:rgba(240,104,77,.15);border-radius:99px;padding:3px 8px}
- .gate-exs{margin-top:6px;display:flex;flex-direction:column;gap:3px}
- .gate-ex{font-size:10.5px;color:var(--tx-dim)}
- .gate-ex-t{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:250px}
- .gate-ex .r{color:var(--tx-faint)}
- .gate-marg{margin-top:2px;font:10px/1.3 var(--mono)}
- .gate-marg.trap{color:var(--gold)}
- .gate-near{margin-top:5px;font:10px/1.2 var(--mono)}
- .gate-near.trap{color:var(--gold)}
- .pipe-near{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:9px 11px;margin-top:8px}
- .pipe-near-hdr{display:flex;align-items:center;justify-content:space-between;gap:8px}
- .pipe-near-t{font-size:11px;font-weight:600;letter-spacing:.06em;color:var(--tx-dim)}
- .pipe-near-body{display:flex;flex-wrap:wrap;gap:7px 16px;margin-top:7px}
- .pn-tile{display:flex;flex-direction:column;gap:2px}
- .pn-tl{font-size:9px;text-transform:uppercase;letter-spacing:.05em;color:var(--tx-faint)}
- .pn-tv{font:600 12px/1 var(--mono)}
- .pipe-near-sub{margin-top:7px;font-size:10px}
- .pipe-near-note{margin-top:7px;font-size:10.5px;border-top:1px dashed var(--line);padding-top:5px}
- .mkt-card{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-sm);padding:7px 9px;transition:border-color .15s}
- .mkt-card:hover{border-color:var(--proj)}
- .mkt-top{display:flex;align-items:center;justify-content:space-between;gap:6px}
- .mkt-t{font-size:11.5px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px}
- .mkt-mid{display:flex;gap:10px;margin-top:5px;font-size:11px;flex-wrap:wrap}
- .mkt-sub{margin-top:3px;font-size:10px}
- .alloc-line{margin-top:5px;padding-top:4px;border-top:1px dashed var(--line);font-size:10px}
- .alloc-line .alloc-nums{margin-top:2px}
- .pill{font-size:9px;letter-spacing:.07em;font-weight:700;border-radius:99px;padding:2px 6px;white-space:nowrap}
- .pill-rew{color:var(--gold);background:var(--gold-soft)}
- .pill-spr{color:var(--proj);background:var(--proj-soft)}
- .pill-live{color:var(--up);background:var(--up-soft)}
- .pill-wait{color:var(--tx-dim);background:var(--panel-2);border:1px solid var(--line)}
- /* ---------- operator guide + trial callout ---------- */
- .pipe-guide{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-md);padding:11px 14px;margin-bottom:10px;font-size:11.5px;color:var(--tx-dim);line-height:1.55}
- .pipe-guide summary{cursor:pointer;font:700 11px/1.4 var(--disp);letter-spacing:.08em;text-transform:uppercase;color:var(--tx);user-select:none}
- .pipe-guide[open] summary{margin-bottom:9px}
- .pipe-guide ol{margin:6px 0 0;padding-left:17px}
- .pipe-guide li{margin:4px 0}
- .pipe-guide b{color:var(--tx)}
- .pipe-guide code{font-family:var(--mono);font-size:10.5px;color:var(--gold)}
- .trial-callout{display:none;background:linear-gradient(180deg,rgba(240,104,77,.09),rgba(240,104,77,.03));border:1px solid rgba(240,104,77,.5);border-radius:var(--r-md);padding:12px 14px;margin-bottom:10px}
- .trial-hdr{font:700 12px/1.3 var(--disp);letter-spacing:.08em;text-transform:uppercase;color:var(--gold)}
- .trial-txt{margin-top:6px;font-size:11.5px;color:var(--tx-dim);line-height:1.55}
- .trial-txt b{color:var(--tx)}
- .trial-row{margin-top:9px;display:flex;flex-wrap:wrap;gap:6px}
- .trial-chip{font-family:var(--mono);font-size:10.5px;border:1px solid var(--line);background:var(--panel-2);border-radius:99px;padding:3px 9px;color:var(--tx-dim)}
- @media(max-width:1500px){
-   .pipe-board{grid-template-columns:1fr 1fr}
-   .pipe-arrow{display:none}
- }
- @media(max-width:900px){
-   .pipe-board{grid-template-columns:1fr}
-   .mast{flex-wrap:wrap}
- }
+  :root{
+    --bg:#0a0d12; --panel:#12161d; --panel-2:#171c24; --line:#232a35; --line-soft:#1a2029;
+    --tx:#e7ebf3; --tx-dim:#8792a6; --tx-faint:#535e70; --tx-muted:#6b7588;
+    --up:#33c9b5; --up-soft:#12302c;
+    --down:#f0684d; --down-soft:#3a201a;
+    --gold:#e8b84b; --gold-soft:#3a2f18;
+    --proj:#7b9bf7; --proj-soft:#1c2540;
+    --alert:#ff5c5c;
+    --r-xl:12px; --r-md:8px; --r-sm:5px;
+    --disp:'Space Grotesk',system-ui,sans-serif;
+    --mono:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace;
+    --body:'IBM Plex Sans',system-ui,-apple-system,"Segoe UI",sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 var(--body);-webkit-font-smoothing:antialiased}
+  a{color:inherit;text-decoration:none}
+  a:hover{color:var(--proj)}
+  a:focus-visible,button:focus-visible{outline:2px solid var(--proj);outline-offset:2px}
+  .mono{font-family:var(--mono)}
+  .dim{color:var(--tx-dim)} .faint{color:var(--tx-faint)} .up{color:var(--up)} .down{color:var(--down)} .proj{color:var(--proj)} .gold{color:var(--gold)} .bold{font-weight:600}
+  .mast{display:flex;align-items:center;gap:14px;padding:14px 24px;background:var(--panel);border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .mast-id{font-family:var(--disp);font-weight:700;font-size:16px;letter-spacing:.01em}
+  .mast-id b{color:var(--gold)}
+  .mast-sub{font-size:11px;color:var(--tx-dim);letter-spacing:.02em;margin-left:2px}
+  .tag{border:1px solid var(--down);color:var(--down);border-radius:99px;padding:3px 10px;font-size:11px;font-weight:600;letter-spacing:.06em}
+  .legend{display:flex;gap:14px;font-size:11px;color:var(--tx-dim);letter-spacing:.02em}
+  .legend span{display:inline-flex;align-items:center;gap:5px}
+  .legend i{width:7px;height:7px;border-radius:50%;display:inline-block}
+  .live{font-size:12px;font-weight:600}
+  .pipe-view{padding:20px 24px;max-width:1600px;margin:0 auto}
+  .section-label{font:700 11px/1 var(--disp);letter-spacing:.12em;text-transform:uppercase;color:var(--tx-faint);margin:0 0 8px;display:flex;align-items:center;gap:8px}
+  .hint{font-size:11px;color:var(--tx-muted);line-height:1.5}
+  .hint b{color:var(--tx-dim)}
+  .hero-grid{display:grid;grid-template-columns:1fr 1.35fr .95fr;gap:12px;margin-bottom:14px}
+  .hero-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-xl);padding:14px 16px;position:relative;overflow:hidden}
+  .hero-card::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;opacity:.9}
+  .hero-card--source::before{background:linear-gradient(90deg,var(--proj),var(--up))}
+  .hero-card--gates::before{background:linear-gradient(90deg,var(--gold),var(--down))}
+  .hero-card--scan::before{background:linear-gradient(90deg,var(--tx-faint),var(--proj))}
+  .hero-kicker{font:700 10px/1 var(--disp);letter-spacing:.14em;text-transform:uppercase;color:var(--tx-faint);margin-bottom:8px;display:flex;align-items:center;gap:6px}
+  .hero-kicker .ico{width:20px;height:20px;border-radius:99px;display:inline-flex;align-items:center;justify-content:center;font-size:11px;background:var(--panel-2);border:1px solid var(--line)}
+  .hero-title{font:700 13px/1.2 var(--disp);margin-bottom:4px}
+  .hero-metrics{display:flex;gap:10px;margin:10px 0;flex-wrap:wrap}
+  .metric{flex:1;min-width:90px;background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-md);padding:8px 9px}
+  .metric-label{font:600 9px/1 var(--disp);letter-spacing:.08em;text-transform:uppercase;color:var(--tx-faint)}
+  .metric-value{font:700 18px/1 var(--mono);margin-top:2px}
+  .metric-sub{font:400 10px/1.2 var(--mono);color:var(--tx-dim);margin-top:3px}
+  .metric--accent .metric-value{color:var(--up)}
+  .chip-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+  .g-chip{font:600 10.5px/1 var(--mono);padding:5px 9px;border-radius:99px;border:1px solid var(--line);background:var(--panel-2);color:var(--tx-dim);display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
+  .g-chip b{color:var(--tx);font-weight:700}
+  .g-chip.trial{border-color:rgba(232,184,75,.45);background:rgba(232,184,75,.10);color:var(--gold)}
+  .g-chip.trial i{font-size:8px;letter-spacing:.06em;background:var(--gold);color:#111;border-radius:99px;padding:1px 5px;font-style:normal;font-weight:700}
+  .meta-line{margin-top:8px;font:400 11px/1.4 var(--mono);color:var(--tx-dim);border-top:1px dashed var(--line);padding-top:8px}
+  .stepper{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-xl);padding:14px 16px;margin-bottom:12px}
+  .stepper-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+  .stepper-title{font:700 12px/1 var(--disp);letter-spacing:.08em;text-transform:uppercase}
+  .stepper-age{font:500 11px/1 var(--mono);padding:4px 8px;border-radius:99px;border:1px solid var(--line);background:var(--panel-2)}
+  .steps{display:flex;align-items:stretch;gap:0}
+  .step{flex:1;display:flex;flex-direction:column;align-items:center;text-align:center;padding:10px 6px;background:var(--panel-2);border:1px solid var(--line);min-width:0}
+  .step:first-child{border-radius:var(--r-md) 0 0 var(--r-md)}
+  .step:last-child{border-radius:0 var(--r-md) var(--r-md) 0}
+  .step + .step{margin-left:-1px}
+  .step.is-raw{border-top:2px solid var(--tx-faint)}
+  .step.is-filter{border-top:2px solid var(--down)}
+  .step.is-final{border-top:2px solid var(--proj)}
+  .step.is-grad{border-top:2px solid var(--up)}
+  .step-arrow{width:28px;display:flex;align-items:center;justify-content:center;color:var(--tx-faint);font-size:14px;flex-shrink:0}
+  .step-label{font:700 10px/1 var(--disp);letter-spacing:.1em;text-transform:uppercase;color:var(--tx-faint)}
+  .step-value{font:700 22px/1 var(--mono);margin-top:4px;letter-spacing:-.02em}
+  .step-sub{font:400 10px/1.3 var(--mono);color:var(--tx-dim);margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+  .step-conv{margin-top:6px;font:600 9px/1 var(--mono);padding:2px 6px;border-radius:99px;background:var(--bg);border:1px solid var(--line);color:var(--tx-dim)}
+  .step.is-grad .step-value{color:var(--up)}
+  .step.is-final .step-value{color:var(--proj)}
+  .step.is-filter .step-value{color:var(--down)}
+  .census-toggle{margin-top:10px}
+  .census-toggle summary{cursor:pointer;font:600 10.5px/1 var(--disp);letter-spacing:.07em;text-transform:uppercase;color:var(--tx-faint);user-select:none}
+  .census-toggle[open] summary{margin-bottom:6px}
+  .census-text{font:400 11.5px/1.5 var(--mono);color:var(--tx-dim);background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 10px}
+  .gates-line{margin-top:6px;font:400 10.5px/1.4 var(--mono);color:var(--tx-faint);border-top:1px dashed var(--line);padding-top:6px}
+  .trial-callout{display:none;background:linear-gradient(180deg,rgba(232,184,75,.11),rgba(232,184,75,.03));border:1px solid rgba(232,184,75,.45);border-radius:var(--r-xl);padding:14px 16px;margin-bottom:14px;position:relative}
+  .trial-callout::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--gold),var(--up));border-radius:var(--r-xl) var(--r-xl) 0 0}
+  .trial-hdr{font:700 12px/1.3 var(--disp);letter-spacing:.08em;text-transform:uppercase;color:var(--gold);display:flex;align-items:center;gap:8px}
+  .trial-txt{margin-top:6px;font-size:11.5px;color:var(--tx-dim);line-height:1.55}
+  .trial-txt b{color:var(--tx)}
+  .trial-row{margin-top:10px;display:flex;flex-wrap:wrap;gap:6px}
+  .trial-chip{font-family:var(--mono);font-size:10.5px;border:1px solid var(--line);background:var(--panel-2);border-radius:99px;padding:4px 10px;color:var(--tx-dim)}
+  .trackers-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px}
+  .tracker-card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-xl);padding:14px 16px;position:relative}
+  .tracker-card.ready{border-color:rgba(51,201,181,.45);background:linear-gradient(180deg,rgba(51,201,181,.07),var(--panel))}
+  .tracker-card::before{content:"";position:absolute;top:0;left:0;right:0;height:2px;border-radius:var(--r-xl) var(--r-xl) 0 0}
+  .tracker-card.depth::before{background:var(--proj)}
+  .tracker-card.volume::before{background:var(--up)}
+  .tracker-card.ready::before{background:var(--up)}
+  .tracker-hdr{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:12px}
+  .tracker-name{font:700 11px/1 var(--disp);letter-spacing:.1em;text-transform:uppercase;color:var(--tx)}
+  .tracker-sub{font-size:10.5px;color:var(--tx-dim);margin-top:3px;line-height:1.4}
+  .tracker-badge{font:700 9px/1 var(--disp);letter-spacing:.08em;padding:4px 8px;border-radius:99px;border:1px solid var(--line);white-space:nowrap}
+  .badge-ready{background:var(--up-soft);color:var(--up);border-color:rgba(51,201,181,.35)}
+  .badge-collect{background:var(--panel-2);color:var(--tx-dim)}
+  .badge-nodata{background:var(--panel-2);color:var(--tx-faint);border-style:dashed}
+  .bar-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 14px}
+  .bar-row{display:flex;flex-direction:column;gap:4px}
+  .bar-head{display:flex;justify-content:space-between;align-items:center;gap:8px}
+  .bar-label{font:600 9px/1 var(--disp);letter-spacing:.07em;text-transform:uppercase;color:var(--tx-faint)}
+  .bar-value{font:700 11px/1 var(--mono);color:var(--tx-dim)}
+  .bar-value.ok{color:var(--up)}
+  .bar-track{height:6px;background:var(--panel-2);border:1px solid var(--line);border-radius:99px;overflow:hidden}
+  .bar-fill{height:100%;border-radius:99px;transition:width .35s ease}
+  .bar-fill.ok{background:var(--up)}
+  .bar-fill.warn{background:var(--proj)}
+  .bar-fill.mid{background:var(--gold)}
+  .tracker-foot{margin-top:10px;font:400 11px/1.5 var(--body);color:var(--tx-dim);border-top:1px dashed var(--line);padding-top:8px}
+  .tracker-foot b{color:var(--tx)}
+  .tracker-meta{margin-top:8px;display:flex;flex-wrap:wrap;gap:6px}
+  .meta-pill{font:600 10px/1 var(--mono);padding:4px 8px;border-radius:99px;background:var(--panel-2);border:1px solid var(--line);color:var(--tx-dim)}
+  .tracker-causes{margin-top:8px;font:400 10px/1.4 var(--mono);color:var(--tx-faint)}
+  .closest-list{margin-top:8px;display:flex;flex-direction:column;gap:4px}
+  .closest-item{font:400 11px/1.3 var(--mono);background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-sm);padding:6px 8px;display:flex;justify-content:space-between;gap:8px;align-items:center}
+  .closest-item a{color:var(--tx);font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
+  .closest-item a:hover{color:var(--proj)}
+  .closest-meta{font-size:10px;color:var(--tx-dim);white-space:nowrap}
+  .pipe-board{display:grid;grid-template-columns:minmax(250px,1fr) 26px minmax(280px,1.35fr) 26px minmax(250px,1fr) 26px minmax(280px,1.2fr);gap:8px;align-items:stretch}
+  .pipe-arrow{align-self:center;text-align:center;font-size:20px;color:var(--tx-faint);user-select:none}
+  .pipe-lane{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-xl);display:flex;flex-direction:column;min-height:340px;max-height:680px;overflow:hidden}
+  .pipe-lane-raw{border-top:2px solid var(--tx-faint)}
+  .pipe-lane-filter{border-top:2px solid var(--down)}
+  .pipe-lane-final{border-top:2px solid var(--proj)}
+  .pipe-lane-grad{border-top:2px solid var(--up)}
+  .pipe-lane-hdr{padding:12px 14px;border-bottom:1px solid var(--line);display:flex;align-items:flex-start;justify-content:space-between;gap:8px;background:linear-gradient(180deg,rgba(255,255,255,.02),transparent)}
+  .pipe-lane-hdr h3{margin:0;font:700 11px/1.2 var(--disp);letter-spacing:.08em;text-transform:uppercase}
+  .pipe-lane-hdr p{margin:2px 0 0;font-size:10px;color:var(--tx-faint);line-height:1.3}
+  .pipe-count{font:700 13px/1 var(--mono);border-radius:99px;padding:5px 10px;background:var(--panel-2);border:1px solid var(--line);white-space:nowrap}
+  .pipe-count.up{background:var(--up-soft);color:var(--up);border-color:rgba(51,201,181,.3)}
+  .pipe-count.down{background:var(--down-soft);color:var(--down);border-color:rgba(240,104,77,.25)}
+  .pipe-count.proj{background:var(--proj-soft);color:var(--proj);border-color:rgba(123,155,247,.25)}
+  .pipe-lane-body{padding:8px;overflow:auto;display:flex;flex-direction:column;gap:8px;flex:1}
+  .pipe-lane-body::-webkit-scrollbar{width:6px}
+  .pipe-lane-body::-webkit-scrollbar-thumb{background:var(--line);border-radius:3px}
+  .pipe-group{border:1px solid var(--line-soft);border-radius:var(--r-sm);padding:6px;background:var(--panel-2)}
+  .pipe-group-hdr{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--tx-faint);font-weight:600;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center}
+  .pipe-empty{padding:10px;font-size:11px;color:var(--tx-dim);background:var(--panel-2);border:1px dashed var(--line);border-radius:var(--r-sm);text-align:center}
+  .chip{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-sm);padding:6px 8px;font-size:11px;line-height:1.3;transition:border-color .15s,background .15s}
+  .chip:hover{border-color:var(--proj);background:var(--panel)}
+  .chip a{color:var(--tx);font-weight:500;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:230px}
+  .chip a:hover{color:var(--proj)}
+  .chip-s{font-family:var(--mono);font-size:10px;color:var(--tx-dim);margin-top:2px;display:flex;gap:8px;flex-wrap:wrap}
+  .chip-external{font-size:9px;color:var(--proj);margin-left:4px}
+  .gate-card{background:var(--down-soft);border:1px solid rgba(240,104,77,.25);border-radius:var(--r-sm);padding:8px 9px}
+  .gate-card:hover{border-color:rgba(240,104,77,.4)}
+  .gate-hdr{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .gate-name{font-weight:700;font-size:11px;text-transform:capitalize;letter-spacing:.02em}
+  .gate-n{font:700 12px/1 var(--mono);color:var(--down);background:rgba(240,104,77,.15);border-radius:99px;padding:3px 8px}
+  .gate-exs{margin-top:6px;display:flex;flex-direction:column;gap:5px}
+  .gate-ex{font-size:10.5px;color:var(--tx-dim);background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-sm);padding:5px 7px}
+  .gate-ex a{color:var(--tx);font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block}
+  .gate-ex a:hover{color:var(--proj)}
+  .gate-ex .r{color:var(--tx-faint);font-size:10px}
+  .gate-marg{margin-top:3px;font:10px/1.3 var(--mono);padding:3px 6px;border-radius:4px;background:var(--bg);border:1px solid var(--line)}
+  .gate-marg.trap{color:var(--gold);border-color:rgba(232,184,75,.3);background:rgba(232,184,75,.08)}
+  .gate-near{margin-top:6px;font:600 10px/1.3 var(--mono);padding:4px 7px;border-radius:99px;display:inline-flex}
+  .gate-near.up{background:rgba(51,201,181,.10);color:var(--up);border:1px solid rgba(51,201,181,.25)}
+  .gate-near.trap{background:rgba(232,184,75,.10);color:var(--gold);border:1px solid rgba(232,184,75,.25)}
+  .mkt-card{background:var(--panel-2);border:1px solid var(--line);border-radius:var(--r-sm);padding:8px 9px;transition:border-color .15s,transform .12s}
+  .mkt-card:hover{border-color:var(--proj);transform:translateY(-1px)}
+  .mkt-top{display:flex;align-items:center;justify-content:space-between;gap:6px}
+  .mkt-t{font-size:11.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:200px;color:var(--tx)}
+  .mkt-t a{color:var(--tx)}
+  .mkt-t a:hover{color:var(--proj);text-decoration:underline;text-underline-offset:2px}
+  .mkt-t a::after{content:" \2197";font-size:9px;color:var(--proj);opacity:.8}
+  .mkt-mid{display:flex;gap:10px;margin-top:5px;font-size:11px;flex-wrap:wrap}
+  .mkt-sub{margin-top:3px;font-size:10px}
+  .alloc-line{margin-top:5px;padding-top:4px;border-top:1px dashed var(--line);font-size:10px}
+  .alloc-line .alloc-nums{margin-top:2px}
+  .pill{font-size:9px;letter-spacing:.07em;font-weight:700;border-radius:99px;padding:3px 8px;white-space:nowrap;display:inline-flex;align-items:center;gap:4px}
+  .pill-rew{color:var(--gold);background:var(--gold-soft);border:1px solid rgba(232,184,75,.2)}
+  .pill-spr{color:var(--proj);background:var(--proj-soft);border:1px solid rgba(123,155,247,.2)}
+  .pill-live{color:var(--up);background:var(--up-soft);border:1px solid rgba(51,201,181,.25)}
+  .pill-wait{color:var(--tx-dim);background:var(--panel-2);border:1px solid var(--line)}
+  .pipe-guide{background:var(--panel);border:1px solid var(--line);border-radius:var(--r-xl);padding:12px 14px;margin-bottom:12px;font-size:11.5px;color:var(--tx-dim);line-height:1.55}
+  .pipe-guide summary{cursor:pointer;font:700 11px/1.4 var(--disp);letter-spacing:.08em;text-transform:uppercase;color:var(--tx);user-select:none}
+  .pipe-guide[open] summary{margin-bottom:9px}
+  .pipe-guide ol{margin:6px 0 0;padding-left:17px}
+  .pipe-guide li{margin:4px 0}
+  .pipe-guide b{color:var(--tx)}
+  .pipe-guide code{font-family:var(--mono);font-size:10.5px;color:var(--gold)}
+  @media(max-width:1500px){
+    .hero-grid{grid-template-columns:1fr 1fr}
+    .hero-card--scan{grid-column:1 / -1}
+    .trackers-grid{grid-template-columns:1fr}
+    .pipe-board{grid-template-columns:1fr 1fr}
+    .pipe-arrow{display:none}
+  }
+  @media(max-width:900px){
+    .hero-grid{grid-template-columns:1fr}
+    .pipe-board{grid-template-columns:1fr}
+    .mast{flex-wrap:wrap}
+    .steps{flex-wrap:wrap}
+    .step{flex:1 1 46%}
+    .step-arrow{display:none}
+    .bar-grid{grid-template-columns:1fr}
+  }
 </style></head><body>
 <header class="mast">
-  <div class="mast-id"><b>◆</b> Spread Hunter Fleet</div>
+  <div class="mast-id"><b>◆</b> Spread Hunter Fleet <span class="mast-sub">Market Scan / סריקת שווקים</span></div>
   <span class="tag">Paper · simulated fills</span>
   <span class="legend">
     <span><i style="background:var(--up)"></i>gain</span>
@@ -1098,26 +1175,28 @@ PAGE = r"""<!doctype html>
     <span><i style="background:var(--gold)"></i>income</span>
     <span><i style="background:var(--proj)"></i>projected</span>
   </span>
-
   <span style="flex:1"></span>
   <span id="live" class="live"></span>
   <span id="health" class="live"></span>
 </header>
 <section id="view-pipeline" class="pipe-view">
-  <details class="pipe-guide" id="pipeGuide">
-    <summary>How to read this page · what to do with it</summary>
+  <details class="pipe-guide" id="pipeGuide" open>
+    <summary>How to read this page · איך לקרוא את העמוד <span style="font-weight:400;letter-spacing:.02em;text-transform:none;color:var(--tx-dim);margin-left:6px">— מדריך למפעיל</span></summary>
     <ol>
-      <li><b>The four lanes are the ranker's real funnel.</b> ① RAW — everything the venue lists (reward pool + liquid). ② FILTERS — every refusal, bucketed by gate, with real example titles. ③ FINAL — cleared every gate, ranked by return per dollar. ④ GRADUATED — the fleet's universe right now, live state included. When ③ and ④ differ, the allocator dropped markets the ranker admitted — the reason is on the card.</li>
-      <li><b>Start at the census chain.</b> RAW → scored → rejected → eligible → picked is the whole evening in one line. A funnel that lands on 0 picked is the gates doing their job, not a broken bot.</li>
-      <li><b>Read the big rejection buckets first.</b> Each gate card shows the refusal count and example titles. The "if adopted" line is the ranker's optimistic single-snapshot estimate of what the allocator would have said.</li>
-      <li><b>The two near-miss trackers are the decision instruments.</b> They log markets the gates refuse that would clear the 2%/day floor. <b>READY TO TRIAL</b> means the evidence is consistent (days · unique markets · stability) and the next step is a controlled trial — loosen one gate, watch markouts — not an immediate gate change.</li>
-      <li><b>The graduated lane answers "what is the bot doing now".</b> A market showing $0.00/day with a refusal string on its card is being actively refused, not ignored.</li>
+      <li><b>מאיפה השווקים?</b> כרטיס <b>Source</b> מראה את שני המאגרים שהסורק סורק: <code>sampling-markets</code> (שוקי תגמול — 999 שווקים קבועים שמשלמים על נזילות) ו-<code>gamma liquid</code> (שוקי ספרד נזילים ב-24ש האחרונות). זה לפני כל פילטר.</li>
+      <li><b>איזה פילטרים רצים עכשיו?</b> כרטיס <b>Gates</b> מפרק את שורת השערים: נפח, עומק, ספרד, אופק זמן ותקרת הכנסה. תג <span style="background:rgba(232,184,75,.15);border:1px solid rgba(232,184,75,.35);color:var(--gold);border-radius:99px;padding:1px 6px;font-size:10px">TRIAL</span> = שער ניסוי מוקל (קבוע ה-permanent בסוגריים).</li>
+      <li><b>ארבעת המסלולים = המשפך האמיתי של המדרג.</b> ① RAW — מה שהווניו מחזיר. ② FILTERS — כל דחייה, מקובצת לפי שער עם דוגמאות אמיתיות. ③ FINAL — עברו הכל, מדורגים לפי תשואה/$. ④ GRADUATED — מה שה-fleet אימץ עכשיו (עם מצב חי). כשלישי ורביעי שונים — ה-allocator ויתר.</li>
+      <li><b>מה עשו בדירוג האחרון · Trial ready.</b> הבאנר הצהוב מופיע רק כשה-near-miss trackers חצו את ספי העקביות (ימים · שווקים ייחודיים · יציבות). זו <b>החלטה</b>: הצעד הבא הוא ניסוי מבוקר בשער אחד, לא שינוי קבוע.</li>
+      <li><b>כל כותרת שוק לחיצה → Polymarket.</b> כל קלף RAW/FILTERS/FINAL/GRADUATED מקשר ישירות לעמוד השוק. לחיצה פותחת טאב חדש.</li>
     </ol>
   </details>
   <div class="trial-callout" id="trialCallout"></div>
-  <div class="pipe-strip" id="pipeStrip"></div>
-  <div class="pipe-near" id="nearMiss"></div>
-  <div class="pipe-near" id="volumeNearMiss"></div>
+  <div class="hero-grid" id="heroGrid"></div>
+  <div class="stepper" id="pipeStrip"></div>
+  <div class="trackers-grid">
+    <div id="nearMiss" class="tracker-card depth"></div>
+    <div id="volumeNearMiss" class="tracker-card volume"></div>
+  </div>
   <div class="pipe-board" id="pipeBoard">
     <div class="pipe-lane pipe-lane-raw" id="laneRaw"></div>
     <div class="pipe-arrow" aria-hidden="true">→</div>
@@ -1133,163 +1212,162 @@ const $=x=>document.getElementById(x);
 const esc=s=>String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 const usd=(v,d=2)=>v==null?'-':'$'+Number(v).toFixed(d);
 const pct=(v,d=1)=>v==null?'-':(100*v).toFixed(d)+'%';
-const hms=s=>{s=Math.max(0,Math.floor(s));
-  const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
-  const p=n=>String(n).padStart(2,'0');
-  return h?`${h}h ${p(m)}m ${p(x)}s`:`${m}m ${p(x)}s`;};
-
-
-// ---------- market pipeline: the selection funnel, live ----------
-// Four lanes mirror the ranker's actual funnel -- RAW (what the venue
-// lists) -> FILTERS (the selector gates, bucketed by refusal cause) ->
-// FINAL (eligible, ranked by return per dollar) -> GRADUATED (what the
-// fleet adopted). Data comes from run/pipeline.json, which
-// scripts/rank_markets.py rewrites every rank.
+const hms=s=>{s=Math.max(0,Math.floor(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;const p=n=>String(n).padStart(2,'0');return h?`${h}h ${p(m)}m ${p(x)}s`:`${m}m ${p(x)}s`;};
+const pmLink=(slug, title)=>{
+  if(!slug) return `<span>${esc(title)}</span>`;
+  const href=`https://polymarket.com/market/${encodeURIComponent(slug)}`;
+  return `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="Open on Polymarket — ${esc(title)}">${esc(title)}</a>`;
+};
+const barPct=(have, need)=> Math.min(100, Math.round((have/Math.max(1,need))*100));
+const barCls=p=> p>=100?'ok':p>=60?'warn':'mid';
 function pipeLane(title,sub,count,countCls,body){
-  return `<div class="pipe-lane-hdr"><div><h3>${title}</h3><div class="dim" style="font-size:10px;margin-top:3px">${sub}</div></div><span class="pipe-count ${countCls||''}">${count}</span></div><div class="pipe-lane-body">${body}</div>`;
+  return `<div class="pipe-lane-hdr"><div><h3>${title}</h3><p>${sub}</p></div><span class="pipe-count ${countCls||''}">${count}</span></div><div class="pipe-lane-body">${body}</div>`;
 }
 function pipeEmpty(txt){return `<div class="pipe-empty">${txt}</div>`;}
-function pipeChip(t,sub){
-  return `<div class="chip"><div class="chip-t">${esc(t)}</div><div class="chip-s">${sub}</div></div>`;
+function pipeChip(t, sub, slug){
+  const link = pmLink(slug, t);
+  return `<div class="chip"><div class="chip-t">${link}</div><div class="chip-s"><span>${sub}</span> ${slug?'<span class="chip-external">↗ Polymarket</span>':''}</div></div>`;
 }
 function gateCard(g){
-  // `e.marg` is the ranker's estimate of what the allocator would have said
-  // had this rejected market been adopted -- first-dollar marginal %/day on
-  // the venue's own score reading, the same math the GRADUATED lane shows
-  // for a refused market. Absent for identity rejects (no book was fetched).
   const ex=(g.examples||[]).map(e=>{
     const m=e.marg;
+    const href = e.url || (e.slug ? `https://polymarket.com/market/${e.slug}` : "");
+    const titleHtml = href ? `<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(e.title)}</a>` : esc(e.title);
     const margHtml=m?`<div class="gate-marg ${m.trap?'trap':m.would_fund?'up':'down'}" title="${esc(m.reason)} · pot $${m.pot_day}/day · competition ${Number(m.competition).toLocaleString()} · floor ${m.threshold_pct}%/day">if adopted: ~${m.marg_pct_day}%/day · ${m.trap?'EMPTY-BOOK MIRAGE — nobody resting in the reward window, the estimate is not real':m.would_fund?'would clear the floor':'below floor'}</div>`:'';
-    return `<div class="gate-ex" title="${esc(e.reason)}"><div class="gate-ex-t">${esc(e.title)}<span class="r"> — ${esc((e.reason||'').slice(0,46))}</span></div>${margHtml}</div>`;
+    return `<div class="gate-ex"><div class="gate-ex-t">${titleHtml}<span class="r"> — ${esc((e.reason||'').slice(0,56))}</span></div>${margHtml}</div>`;
   }).join('');
-  // First-dollar admission is not a funded quote -- the allocator can still
-  // drop a market at its min-lot payout check -- so the headline says "clear
-  // the floor", the claim that is actually being made. would_fund counts
-  // CREDIBLE near-misses only: an empty-book mirage (pot divided by ~zero
-  // competition) is evidence of nothing, so it is shown separately in amber,
-  // not counted as a green.
   const near=(g.would_fund||0)>0?`<div class="gate-near up">${g.would_fund} of ${g.n} rejected here would clear the 2%/day floor</div>`:'';
   const traps=(g.traps||0)>0?`<div class="gate-near trap">${g.traps} empty-book mirages here — the estimate divides by ~zero competition and is not real</div>`:'';
   return `<div class="gate-card"><div class="gate-hdr"><span class="gate-name">${esc(g.cause||'other')}</span><span class="gate-n">${g.n||0}</span></div>${near}${traps}${ex?`<div class="gate-exs">${ex}</div>`:''}</div>`;
 }
 function mktCard(m){
   const src=m.source==='spread';
-  return `<div class="mkt-card"><div class="mkt-top"><span class="mkt-t" title="${esc(m.title)}">${esc(m.title)}</span><span class="pill ${src?'pill-spr':'pill-rew'}">${src?'SPREAD':'REWARD'}</span></div><div class="mkt-mid"><span class="proj bold mono">${usd(m.income)}/d</span><span class="dim mono">${usd(m.capital,0)} cap</span><span class="dim mono">${m.ret_day_pct==null?'-':m.ret_day_pct.toFixed(2)+'%/d'}</span></div><div class="mkt-sub dim mono">${m.volume==null?'vol ?':'$'+(m.volume/1000).toFixed(0)+'K vol'} · ${m.days==null?'horizon ?':m.days.toFixed(1)+'d'}</div></div>`;
+  const titleHtml = pmLink(m.slug, m.title);
+  return `<div class="mkt-card"><div class="mkt-top"><span class="mkt-t" title="${esc(m.title)}">${titleHtml}</span><span class="pill ${src?'pill-spr':'pill-rew'}">${src?'SPREAD':'REWARD'}</span></div><div class="mkt-mid"><span class="proj bold mono">${usd(m.income)}/d</span><span class="dim mono">${usd(m.capital,0)} cap</span><span class="dim mono">${m.ret_day_pct==null?'-':m.ret_day_pct.toFixed(2)+'%/d'}</span></div><div class="mkt-sub dim mono">${m.volume==null?'vol ?':'$'+(m.volume/1000).toFixed(0)+'K vol'} · ${m.days==null?'horizon ?':m.days.toFixed(1)+'d'}</div></div>`;
 }
 function gradCard(m){
   const st=m.live?(m.err?'ERR':'LIVE'):'QUEUED';
   const pillCls=m.live?(m.err?'pill-spr':'pill-live'):'pill-wait';
   const a=m.alloc;
   const allocHtml=a?`<div class="alloc-line"><div class="${a.funded?'up':'down'}" title="first dollar ${a.first_marginal_pct}%/day · pot $${a.pot_day}/day · allocated $${a.dollars}">${esc(a.reason)}</div><div class="alloc-nums dim mono">marginal ${a.marginal_pct}%/day · competition ${Number(a.competition_avg).toLocaleString()} · floor ${a.threshold_pct}%/day</div></div>`:`<div class="alloc-line dim">allocator: no verdict yet</div>`;
-  // WHY THIS MARKET ISN'T QUOTING. A funded market that rests nothing reads
-  // as "the bot does nothing" unless the named refusal is on the card: the
-  // live book-gate error (depth/spread), the allocator's funding verdict, or
-  // the requote's blocked reason. All three are now on the same card.
   const reasonHtml=(m.err_text||m.why||(!m.live?'not adopted yet':''))
     ?`<div class="alloc-line" style="border-top-color:rgba(240,104,77,.35)"><div class="down" title="live gate refusal">${esc(m.err_text||m.why||(!m.live?'queued — not adopted yet':''))}</div></div>`
     :(m.income<=0?'<div class="alloc-line dim">resting nothing — allocator has not funded this market</div>':'');
-  return `<div class="mkt-card"><div class="mkt-top"><span class="mkt-t" title="${esc(m.title)}">${esc(m.title)}</span><span class="pill ${pillCls}">${st}</span></div><div class="mkt-mid"><span class="proj bold mono">${usd(m.income)}/d</span><span class="dim mono">${usd(m.capital,0)} cap</span><span class="dim mono">${pct(m.share,1)} share</span></div><div class="mkt-sub dim mono">${m.fills||0} fills · ${pct(m.uptime,0)} uptime</div>${allocHtml}${reasonHtml}</div>`;
+  const titleHtml = pmLink(m.slug, m.title);
+  return `<div class="mkt-card"><div class="mkt-top"><span class="mkt-t" title="${esc(m.title)}">${titleHtml}</span><span class="pill ${pillCls}">${st}</span></div><div class="mkt-mid"><span class="proj bold mono">${usd(m.income)}/d</span><span class="dim mono">${usd(m.capital,0)} cap</span><span class="dim mono">${pct(m.share,1)} share</span></div><div class="mkt-sub dim mono">${m.fills||0} fills · ${pct(m.uptime,0)} uptime</div>${allocHtml}${reasonHtml}</div>`;
 }
 function trialCallout(nm,vn){
-  // The actionable layer: when a near-miss tracker crosses its consistency
-  // bars, that is a decision on the desk, not a status tile -- the funnel
-  // landing on 0 picked is only a mystery until this explains it.
   const ready=[];
-  if(nm&&nm.status==='READY_TO_TRIAL') ready.push({name:'Depth/spread near-miss',pot:nm.uniq_pot_day,d:nm.days,u:nm.unique_markets});
+  if(nm&&nm.status==='READY_TO_TRIAL') ready.push({name:'Depth / spread near-miss',pot:nm.uniq_pot_day,d:nm.days,u:nm.unique_markets});
   if(vn&&vn.status==='READY_TO_TRIAL') ready.push({name:'Volume near-miss',pot:vn.uniq_pot_day,d:vn.days,u:vn.unique_markets});
   if(!ready.length) return '';
-  const chips=ready.map(r=>`<span class="trial-chip">${r.name} · pot $${Math.round(r.pot)}/d · ${r.d} days · ${r.u} unique markets</span>`).join('');
-  return `<div class="trial-hdr">Trial ready — the evidence is in</div>`+
-    `<div class="trial-txt">The near-miss trackers have crossed their consistency bars, so an empty funnel bottom is a <b>decision</b>, not a mystery. Next step: a <b>controlled trial</b> — adopt the small-margin greens on one gate and watch their markouts, not an immediate gate change. That trial is the actual use of this page.</div>`+
+  const chips=ready.map(r=>`<span class="trial-chip">● ${r.name} · pot $${Math.round(r.pot)}/d · ${r.d} days · ${r.u} unique markets</span>`).join('');
+  return `<div class="trial-hdr">◆ Trial ready — the evidence is in · מוכן לניסוי</div>`+
+    `<div class="trial-txt">The near-miss trackers have crossed their consistency bars, so an empty funnel bottom is a <b>decision</b>, not a mystery. Next step: a <b>controlled trial</b> — adopt the small-margin greens on one gate and watch their markouts, not an immediate gate change. That trial is the actual use of this page.<br><span class="faint">ספי העקביות חצו — הצעד הבא הוא ניסוי מבוקר בשער אחד ומעקב markout, לא שינוי קבוע.</span></div>`+
     `<div class="trial-row">${chips}</div>`;
+}
+function heroGrid(s, snap){
+  const c=snap ? snap.counts : null;
+  const gates = snap ? (snap.gates||"") : "";
+  const depthUsd = snap ? snap.depth_gate_usd : null;
+  const trialDepth = snap ? snap.trial_depth_usd : null;
+  const volUsd = snap ? snap.volume_gate_usd : null;
+  const trialVol = snap ? snap.trial_volume_usd : null;
+  const isTrialDepth = depthUsd!=null && trialDepth!=null && depthUsd!==1000;
+  const isTrialVol = volUsd!=null && trialVol!=null && volUsd!==250000;
+  const fmtUsd = v=> v>=1000 ? `$${(v/1000).toFixed(v>=100000?'0':'1')}K` : `$${v}`;
+  const chips=[];
+  if(depthUsd!=null) chips.push(`<span class="g-chip ${isTrialDepth?'trial':''}">Depth ≥ <b>${fmtUsd(depthUsd)}</b> ${isTrialDepth?`<i>TRIAL</i><span style="font-size:9px;color:var(--tx-faint)"> perm $1K</span>`:''}</span>`);
+  else chips.push(`<span class="g-chip">Depth —</span>`);
+  if(volUsd!=null) chips.push(`<span class="g-chip ${isTrialVol?'trial':''}">Volume ≥ <b>${fmtUsd(volUsd)}/24h</b> ${isTrialVol?`<i>TRIAL</i><span style="font-size:9px;color:var(--tx-faint)"> perm $250K</span>`:''}</span>`);
+  chips.push(`<span class="g-chip">Spread ≤ <b>0.06</b></span>`);
+  chips.push(`<span class="g-chip">Resolves ≤ <b>30d</b></span>`);
+  chips.push(`<span class="g-chip">Income ≥ <b>$1.50/d</b></span>`);
+  const sourceCard = `<div class="hero-card hero-card--source">
+    <div class="hero-kicker"><span class="ico">◈</span> Where markets come from · מאיפה השווקים</div>
+    <div class="hero-title">${c?`${(c.funded||0).toLocaleString()} funded + ${(c.spread_universe||0).toLocaleString()} liquid`:'—'} <span style="font-weight:400;color:var(--tx-dim);font-size:11px">raw universe</span></div>
+    <div class="hero-metrics">
+      <div class="metric"><div class="metric-label">Sampling-markets · תגמול</div><div class="metric-value">${c?c.funded:'—'}</div><div class="metric-sub">reward pool — clob.polymarket.com/sampling-markets</div></div>
+      <div class="metric"><div class="metric-label">Gamma liquid · נזילות</div><div class="metric-value">${c?c.spread_universe:'—'}</div><div class="metric-sub">unfunded high-volume (gamma)</div></div>
+      <div class="metric metric--proj"><div class="metric-label">Attempted → Scored</div><div class="metric-value" style="font-size:16px">${c?`${c.attempted} → ${c.scored}`:'—'}</div><div class="metric-sub">${c?`${c.dropped_no_verdict} dropped (no book)`:'waiting for rank'}</div></div>
+    </div>
+    <div class="hint">כל שוק נסרק מהווניו לפני כל פילטר. <b>Funded</b> = משלם פרס על נזילות. <b>Gamma liquid</b> = ספרד עם ווליום גבוה גם בלי פרס.</div>
+  </div>`;
+  const gatesCard = `<div class="hero-card hero-card--gates">
+    <div class="hero-kicker"><span class="ico">⛩</span> The gates it used · השערים שסיננו</div>
+    <div class="hint" style="margin-bottom:6px">כל שוק חייב לעבור את כל השערים. שער <span style="background:rgba(232,184,75,.15);border:1px solid rgba(232,184,75,.35);color:var(--gold);border-radius:99px;padding:1px 6px;font-size:9px">TRIAL</span> = הקלה זמנית — הקבוע בסוגריים.</div>
+    <div class="chip-row">${chips.join('')}</div>
+    <div class="meta-line"><span class="faint">Raw gate line:</span> ${esc(gates.trim()||'— no snapshot yet')}</div>
+  </div>`;
+  const age = s.snapshot_age;
+  const stale = age!=null && age>900;
+  const census = snap ? snap.census : "";
+  const scanCard = `<div class="hero-card hero-card--scan">
+    <div class="hero-kicker"><span class="ico">◎</span> Last rank · מה עשו בדירוג האחרון</div>
+    <div class="hero-title" style="font-size:12px;line-height:1.5">${esc(census||'No snapshot yet — the ranker writes run/pipeline.json every ~10 min')}</div>
+    <div class="hero-metrics" style="margin-top:10px">
+      <div class="metric"><div class="metric-label">Snapshot age</div><div class="metric-value" style="font-size:15px;color:${stale?'var(--down)':'var(--tx)'}">${age==null?'—':hms(age)}</div><div class="metric-sub">${stale?'STALE — ranker may be down':'fresh — ranker is alive'}</div></div>
+      <div class="metric"><div class="metric-label">Fleet</div><div class="metric-value" style="font-size:13px">${s.fleet_alive===true?'● ALIVE':s.fleet_alive===false?'● DOWN':'● unknown'}</div><div class="metric-sub">${s.live||0}/${s.picked||0} graduated live</div></div>
+    </div>
+    <div class="hint" style="margin-top:6px">Picked = top picks של המדרג. Graduated = מה שה-fleet מריץ עכשיו עם מצב חי.</div>
+  </div>`;
+  return sourceCard + gatesCard + scanCard;
 }
 function pipeStrip(s,snap){
   if(!snap){
     const fleetTxt=s.fleet_alive===true?' The fleet is alive.':s.fleet_alive===false?' The fleet is down.':'';
-    return pipeEmpty('No pipeline snapshot yet — the ranker writes <span class="mono">run/pipeline.json</span> on its next pass (every 10 min).'+fleetTxt+(s.picked?' '+s.picked+' market(s) adopted':''));
+    return `<div class="stepper-head"><span class="stepper-title">Selection funnel · משפך הסינון</span><span class="stepper-age dim">no snapshot</span></div><div class="pipe-empty">No pipeline snapshot yet — the ranker writes <span class="mono">run/pipeline.json</span> on its next pass (every 10 min).${fleetTxt}${s.picked?' '+s.picked+' market(s) adopted':''}</div>`;
   }
   const c=snap.counts||{};
   const age=Math.max(0,s.snapshot_age||0);
   const stale=age>900;
-  const chain=`<span class="up">RAW ${(c.funded||0)+(c.spread_universe||0)}</span><span>→</span><span>scored ${c.scored||0}</span><span>→</span><span class="down">rejected ${c.rejected||0}</span><span>→</span><span class="proj">eligible ${c.eligible||0}</span><span>→</span><span class="up bold">picked ${c.picked||0}</span>`;
-  // One glanceable line -- the chain -- and the rank's prose under a
-  // collapsed details so the strip reads top-to-bottom, not as a paragraph.
-  // A stale snapshot auto-opens: "the ranker died" is exactly when the
-  // census detail matters most.
-  const gates=(snap.gates||'').trim();
-  return `<div class="pipe-chain">${chain} <span class="${stale?'down':'dim'}">· snapshot ${hms(age)} old</span></div>`+
-    `<details class="pipe-census" ${stale?'open':''}><summary>what the last rank did · the gates it used</summary>`+
-    `<div>${esc(snap.census||'')}</div>`+
-    (gates?`<div class="pipe-gates">${esc(gates)}</div>`:'')+
-    `</details>`;
+  const rawN=(c.funded||0)+(c.spread_universe||0);
+  const scored=c.scored||0, rejected=c.rejected||0, eligible=c.eligible||0, picked=c.picked||0;
+  const pctScored = rawN?Math.round(scored/rawN*100):0;
+  const pctEligible = scored?Math.round(eligible/scored*100):0;
+  const conv = (have, total)=> total?Math.round(have/total*100):0;
+  return `<div class="stepper-head"><span class="stepper-title">Selection funnel · משפך הסינון</span><span class="stepper-age ${stale?'down':''}" style="${stale?'background:var(--down-soft);color:var(--down);border-color:rgba(240,104,77,.35)':''}">snapshot ${hms(age)} old ${stale?'· STALE':''}</span></div>`+
+    `<div class="steps"><div class="step is-raw"><span class="step-label">① RAW</span><span class="step-value">${rawN}</span><span class="step-sub">venue lists</span><span class="step-conv">${pctScored}% scored</span></div><div class="step-arrow">→</div><div class="step is-filter"><span class="step-label">② FILTERS</span><span class="step-value">${rejected}</span><span class="step-sub">rejected</span><span class="step-conv">${conv(rejected,scored)}% of scored</span></div><div class="step-arrow">→</div><div class="step is-final"><span class="step-label">③ FINAL</span><span class="step-value">${eligible}</span><span class="step-sub">eligible, ranked</span><span class="step-conv">${pctEligible}% pass</span></div><div class="step-arrow">→</div><div class="step is-grad"><span class="step-label">④ GRADUATED</span><span class="step-value">${picked}</span><span class="step-sub">fleet adopted</span><span class="step-conv">${s.live||0} live now</span></div></div>`+
+    `<details class="census-toggle" ${stale?'open':''}><summary>what the last rank did · the gates it used — פירוט הדירוג</summary><div class="census-text">${esc(snap.census||'')}</div>${(snap.gates||'').trim()?`<div class="gates-line">${esc((snap.gates||'').trim())}</div>`:''}</details>`;
 }
 function pipeNearMiss(nm){
   if(!nm) return '';
   const st=nm.status;
-  const badge=st==='READY_TO_TRIAL'?'<span class="pill pill-live">READY TO TRIAL</span>'
-    :st==='COLLECTING'?'<span class="pill pill-wait">COLLECTING</span>'
-    :'<span class="pill pill-wait">NO DATA</span>';
-  const tile=(label,val,cls)=>`<span class="pn-tile"><span class="pn-tl">${label}</span><span class="pn-tv ${cls||''}">${val}</span></span>`;
+  const badge=st==='READY_TO_TRIAL'?'<span class="tracker-badge badge-ready">● READY TO TRIAL · מוכן לניסוי</span>':st==='COLLECTING'?'<span class="tracker-badge badge-collect">○ COLLECTING</span>':'<span class="tracker-badge badge-nodata">― NO DATA</span>';
+  const barPct2=(have, need)=> Math.min(100, Math.round((have/Math.max(1,need))*100));
+  const barCls2=p=> p>=100?'ok':p>=60?'warn':'mid';
+  const daysP=barPct2(nm.days,nm.min_days), uniqP=barPct2(nm.unique_markets,nm.min_unique), smP=barPct2(nm.small_margin_depth,nm.min_small_margin), stabP=Math.round((nm.stability||0)*100);
+  const potText = `$${(nm.uniq_pot_day||0).toLocaleString()}/d`;
+  const rawPot = nm.raw_uniq_pot_day||0, credPot = nm.uniq_pot_day||0;
+  const note=st==='READY_TO_TRIAL'?`<span class="up bold">Enough consistent evidence — the next step is a controlled trial (adopt the small-margin greens, watch markouts), not an immediate gate change.</span><br><span class="faint">יש עקביות מספקת — ניסוי מבוקר בירוקים הקרובים לשער ומעקב markout, לא שינוי קבוע.</span>`: (st==='COLLECTING'&&nm.greens===0&&nm.traps>0?`<span class="dim">Only empty-book mirages so far (${nm.traps} excluded) — no credible near-miss yet, so the bars stay at zero. Not a malfunction; real candidates will move them.</span>`:`<span class="dim">Logging the green near-misses the floor would fund but the gates refuse — the estimate is single-snapshot and optimistic, so this validates it is CONSISTENT over time; a trial measures whether it actually pays.</span><br><span class="faint">שוק שהשער דחה אבל ה-allocator היה מממן — רק עקביות לאורך ימים מצדיקה ניסוי.</span>`);
   const causes=Object.entries(nm.top_causes||{}).slice(0,3).map(([k,v])=>`${esc(k)} ${v}`).join(' · ');
-  const note=st==='READY_TO_TRIAL'
-    ?`<span class="up bold">Enough consistent evidence — the next step is a controlled trial (adopt the small-margin greens, watch markouts), not an immediate gate change.</span>`
-    :(st==='COLLECTING'&&nm.greens===0&&nm.traps>0
-      ?`<span class="dim">Only empty-book mirages so far (${nm.traps} excluded) — no credible near-miss yet, so the bars stay at zero. Not a malfunction; real candidates will move them.</span>`
-      :`<span class="dim">Logging the green near-misses the floor would fund but the gates refuse — the estimate is single-snapshot and optimistic, so this validates it is CONSISTENT over time; a trial measures whether it actually pays.</span>`);
-  return `<div class="pipe-near-hdr"><span class="pipe-near-t">NEAR-MISS TRACKER</span>${badge}</div>`+
-    `<div class="pipe-near-body">`+
-    tile('days',`${nm.days}/${nm.min_days}`,nm.days>=nm.min_days?'up':'proj')+
-    tile('unique markets',`${nm.unique_markets}/${nm.min_unique}`,nm.unique_markets>=nm.min_unique?'up':'proj')+
-    tile('small-margin depth',`${nm.small_margin_depth}/${nm.min_small_margin}`,nm.small_margin_depth>=nm.min_small_margin?'up':'proj')+
-    (nm.depth_unparsed?`<span class="pn-tile"><span class="pn-tl">unparsed depth reasons</span><span class="pn-tv down">${nm.depth_unparsed}</span></span>`:'')+
-    tile('stability (72 ranks)',`${Math.round(100*nm.stability)}%`,nm.stability>=nm.min_stability?'up':'proj')+
-    tile('pot on the table',`$${nm.uniq_pot_day}/d`,'')+
-    (nm.pot_traps?`<span class="pn-tile"><span class="pn-tl">excl. traps</span><span class="pn-tv dim">${nm.pot_traps} ($${Math.round((nm.raw_uniq_pot_day||0)-(nm.uniq_pot_day||0))}/d)</span></span>`:'')+
-    (nm.traps?`<span class="pn-tile"><span class="pn-tl">mirages seen</span><span class="pn-tv down">${nm.traps} (not counted)</span></span>`:'')+
-    tile('ranks logged',`${nm.ranks}`,'')+
-    `</div>`+
-    (causes?`<div class="pipe-near-sub dim mono">credible green by gate: ${causes}</div>`:'')+
-    `<div class="pipe-near-note">${note}</div>`;
+  const barRow=(label,have,need,pctVal)=>`<div class="bar-row"><div class="bar-head"><span class="bar-label">${label}</span><span class="bar-value ${pctVal>=100?'ok':''}">${have}/${need} · ${pctVal}%</span></div><div class="bar-track"><div class="bar-fill ${barCls2(pctVal)}" style="width:${Math.min(100,pctVal)}%"></div></div></div>`;
+  return `<div class="tracker-hdr"><div><div class="tracker-name">Near-miss tracker · שער עומק/ספרד</div><div class="tracker-sub">Depth & spread gates — greens the allocator would fund but depth/spread refused</div></div>${badge}</div><div class="bar-grid">`+barRow('Days', nm.days, nm.min_days, daysP)+barRow('Unique markets', nm.unique_markets, nm.min_unique, uniqP)+barRow('Small-margin depth ≥½ bar', nm.small_margin_depth, nm.min_small_margin, smP)+barRow('Stability (72 ranks)', `${Math.round((nm.stability||0)*100)}%`, '50%', stabP)+`</div><div class="tracker-meta"><span class="meta-pill">pot on table <b style="color:var(--gold)">${potText}</b></span>`+(nm.pot_traps?`<span class="meta-pill">excl. traps ${nm.pot_traps} ($${Math.round(rawPot-credPot)}/d)</span>`:'')+(nm.traps?`<span class="meta-pill" style="color:var(--down)">${nm.traps} mirages excluded</span>`:'')+`<span class="meta-pill">${nm.ranks} ranks logged</span>`+(nm.depth_unparsed?`<span class="meta-pill" style="color:var(--down)">⚠ ${nm.depth_unparsed} unparsed depth</span>`:'')+`</div>`+(causes?`<div class="tracker-causes">credible green by gate: ${causes}</div>`:'')+`<div class="tracker-foot">${note}</div>`;
 }
 function pipeVolumeNearMiss(nm){
   if(!nm) return '';
   const st=nm.status;
-  const badge=st==='READY_TO_TRIAL'?'<span class="pill pill-live">READY TO TRIAL</span>'
-    :st==='COLLECTING'?'<span class="pill pill-wait">COLLECTING</span>'
-    :'<span class="pill pill-wait">NO DATA</span>';
-  const tile=(label,val,cls)=>`<span class="pn-tile"><span class="pn-tl">${label}</span><span class="pn-tv ${cls||''}">${val}</span></span>`;
+  const badge=st==='READY_TO_TRIAL'?'<span class="tracker-badge badge-ready">● READY TO TRIAL · מוכן לניסוי</span>':st==='COLLECTING'?'<span class="tracker-badge badge-collect">○ COLLECTING</span>':'<span class="tracker-badge badge-nodata">― NO DATA</span>';
   const half=Math.round((nm.half_bar_usd||0)/1000);
   const bar=Math.round((nm.volume_bar||250000)/1000);
+  const barPct2=(have,need)=> Math.min(100, Math.round((have/Math.max(1,need))*100)), barCls2=p=> p>=100?'ok':p>=60?'warn':'mid';
+  const daysP=barPct2(nm.days||0, nm.min_days), uniqP=barPct2(nm.unique_markets||0,nm.min_unique), smP=barPct2(nm.small_margin_volume||0,nm.min_small_margin), stabP=Math.round((nm.stability||0)*100);
   const closest=(nm.closest||[]).slice(0,3).map(m=>{
-    const t=(m.title||'').slice(0,44);
-    return `<div class="gate-ex" title="${esc(t)} · ${esc(m.slug||'')}"><div class="gate-ex-t">${esc(t)}<span class="r"> — ${(100*(m.ratio||0)).toFixed(1)}% of bar · $${Math.round((m.volume||0)/1000)}K/24h${m.pot_day?' · pot $'+Math.round(m.pot_day)+'/d':''}</span></div></div>`;
+    const t=(m.title||'').slice(0,48);
+    const href=m.slug?`https://polymarket.com/market/${m.slug}`:'';
+    const link = href?`<a href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(t)}</a>`:esc(t);
+    return `<div class="closest-item"><span style="min-width:0">${link}</span><span class="closest-meta">${(100*(m.ratio||0)).toFixed(1)}% of bar · $${Math.round((m.volume||0)/1000)}K/24h${m.pot_day?' · pot $'+Math.round(m.pot_day)+'/d':''}</span></div>`;
   }).join('');
-  const note=st==='READY_TO_TRIAL'
-    ?`<span class="up bold">Enough consistent evidence — the next step is a controlled volume trial (loosen to half the bar, watch markouts), not an immediate gate change.</span>`
-    :(st==='NO_DATA'
-      ?`<span class="dim">No volume-reject log yet — the ranker writes <span class="mono">run/volume_near_misses.jsonl</span> from the next rank after it runs the updated code.</span>`
-      :`<span class="dim">Watching every market the $${bar}k/24h gate refuses. A small-margin market (measured volume ≥ $${half}k) is the concrete candidate a loosening would admit — U33 showed most rejects are 1-3 orders of magnitude under the bar, so a low count is the honest read, not a malfunction.</span>`);
-  return `<div class="pipe-near-hdr"><span class="pipe-near-t">VOLUME NEAR-MISS TRACKER</span>${badge}</div>`+
-    `<div class="pipe-near-body">`+
-    tile('watched',`${nm.watched||0}`,nm.watched?'':'dim')+
-    tile('days',`${nm.days||0}/${nm.min_days}`,(nm.days||0)>=nm.min_days?'up':'proj')+
-    tile('unique markets',`${nm.unique_markets||0}/${nm.min_unique}`,(nm.unique_markets||0)>=nm.min_unique?'up':'proj')+
-    tile(`≥ half bar (≥$${half}k)`,`${nm.small_margin_volume||0}/${nm.min_small_margin}`,(nm.small_margin_volume||0)>=nm.min_small_margin?'up':'proj')+
-    tile('stability (72 ranks)',`${Math.round(100*(nm.stability||0))}%`,(nm.stability||0)>=nm.min_stability?'up':'proj')+
-    tile('pot on the table',`$${nm.uniq_pot_day||0}/d`,'')+
-    ((nm.gaps||nm.volume_unknown_total)?`<span class="pn-tile"><span class="pn-tl">unmeasured</span><span class="pn-tv dim">${(nm.gaps||0)+(nm.volume_unknown_total||0)} (not counted)</span></span>`:'')+
-    tile('ranks logged',`${nm.ranks||0}`,'')+
-    `</div>`+
-    (closest?`<div class="pipe-near-sub dim">closest to the bar now (last reading — rank-time snapshot, not today's book):</div><div class="gate-exs">${closest}</div>`:'')+
-    `<div class="pipe-near-note">${note}</div>`;
+  const barRow=(label,have,need,pctVal)=>`<div class="bar-row"><div class="bar-head"><span class="bar-label">${label}</span><span class="bar-value ${pctVal>=100?'ok':''}">${have}/${need} · ${pctVal}%</span></div><div class="bar-track"><div class="bar-fill ${barCls2(pctVal)}" style="width:${Math.min(100,pctVal)}%"></div></div></div>`;
+  const note=st==='READY_TO_TRIAL'?`<span class="up bold">Enough consistent evidence — the next step is a controlled volume trial (loosen to half the bar, watch markouts), not an immediate gate change.</span><br><span class="faint">יש עקביות — ניסוי נפח ל-$${half}K ומעקב markout.</span>`: (st==='NO_DATA'?`<span class="dim">No volume-reject log yet — the ranker writes <span class="mono">run/volume_near_misses.jsonl</span> from the next rank after it runs the updated code.</span>`:`<span class="dim">Watching every market the $${bar}k/24h gate refuses. A small-margin market (measured volume ≥ $${half}k) is the concrete candidate a loosening would admit — U33 showed most rejects are 1-3 orders of magnitude under the bar, so a low count is the honest read, not a malfunction.</span><br><span class="faint">כל שוק שנדחה על נפח נמוך — רחוק מהשער ≠ תקלה.</span>`);
+  return `<div class="tracker-hdr"><div><div class="tracker-name">Volume near-miss tracker · שער נפח</div><div class="tracker-sub">24h volume gate — markets that would fund but for volume</div></div>${badge}</div><div class="bar-grid">`+barRow('Watched', nm.watched||0, 1, (nm.watched||0)>0?100:0)+barRow('Days', nm.days||0, nm.min_days, daysP)+barRow('Unique markets', nm.unique_markets||0, nm.min_unique, uniqP)+barRow(`≥ half bar (≥$${half}K)`, nm.small_margin_volume||0, nm.min_small_margin, smP)+`</div><div class="bar-grid" style="margin-top:8px">`+barRow('Stability (72 ranks)', `${Math.round((nm.stability||0)*100)}%`, '50%', stabP)+`<div class="bar-row"><div class="bar-head"><span class="bar-label">Pot on table</span><span class="bar-value">$${nm.uniq_pot_day||0}/d</span></div><div class="bar-track"><div class="bar-fill mid" style="width:100%"></div></div></div>`+`</div><div class="tracker-meta"><span class="meta-pill">${nm.ranks||0} ranks logged</span>`+((nm.gaps||nm.volume_unknown_total)?`<span class="meta-pill">${(nm.gaps||0)+(nm.volume_unknown_total||0)} unmeasured (not counted)</span>`:'')+`</div>`+(closest?`<div class="tracker-causes" style="font-weight:600;color:var(--tx-dim)">Closest to the bar now <span style="font-weight:400;color:var(--tx-faint)">(last reading — rank-time snapshot, not today's book)</span>:</div><div class="closest-list">${closest}</div>`:'')+`<div class="tracker-foot">${note}</div>`;
 }
 function pipeRaw(snap){
   const c=snap.counts||{};
   const raw=snap.raw||{};
-  const rew=(raw.rewards||[]).map(m=>pipeChip(m.title,'$'+Number(m.rate||0).toFixed(2)+'/day · '+(m.days==null?'?':m.days.toFixed(1))+'d')).join('');
-  const spr=(raw.spread||[]).map(m=>pipeChip(m.title,'$'+(Number(m.volume||0)/1000).toFixed(0)+'K vol · sp '+(m.spread==null?'?':m.spread)+' · '+(m.days==null?'?':m.days.toFixed(1))+'d')).join('');
-  return pipeLane('① RAW — what the venue lists','sampling-markets reward pool + gamma liquid pool',(c.funded||0)+(c.spread_universe||0),'',
-    `<div class="pipe-group"><div class="pipe-group-hdr">Reward-funded (${c.funded||0}) · top by rate shown</div>${rew||pipeEmpty('no funded reward markets listed')}</div><div class="pipe-group"><div class="pipe-group-hdr">Unfunded liquid (${c.spread_universe||0}) · by 24h volume</div>${spr||pipeEmpty('no unfunded markets cleared the listing scan')}</div>`);
+  const rew=(raw.rewards||[]).map(m=>pipeChip(m.title,'$'+Number(m.rate||0).toFixed(2)+'/day · '+(m.days==null?'?':m.days.toFixed(1))+'d', m.slug)).join('');
+  const spr=(raw.spread||[]).map(m=>pipeChip(m.title,'$'+(Number(m.volume||0)/1000).toFixed(0)+'K vol · sp '+(m.spread==null?'?':m.spread)+' · '+(m.days==null?'?':m.days.toFixed(1))+'d', m.slug)).join('');
+  return pipeLane('① RAW — what the venue lists','sampling-markets reward pool + gamma liquid pool',(c.funded||0)+(c.spread_universe||0),'',`<div class="pipe-group"><div class="pipe-group-hdr"><span>Reward-funded (${c.funded||0})</span><span class="faint" style="font-size:9px;letter-spacing:.06em">TOP BY RATE — כולם לחיצים ↗</span></div>${rew||pipeEmpty('no funded reward markets listed')}</div><div class="pipe-group"><div class="pipe-group-hdr"><span>Unfunded liquid (${c.spread_universe||0})</span><span class="faint" style="font-size:9px;letter-spacing:.06em">BY 24H VOLUME — כולם לחיצים ↗</span></div>${spr||pipeEmpty('no unfunded markets cleared the listing scan')}</div>`);
 }
 function pipeFilter(snap){
   const c=snap.counts||{};
@@ -1300,8 +1378,8 @@ function pipeFilter(snap){
 }
 function pipeFinal(snap){
   const fin=snap.final||[];
-  const body=fin.length?fin.map(mktCard).join(''):pipeEmpty('nothing cleared every gate on the last rank — the bars are doing their job');
-  return pipeLane('③ FINAL STAGE — eligible, ranked','passed every gate · return per $ of capital',fin.length,'proj',body);
+  const body=fin.length?fin.map(mktCard).join(''):pipeEmpty('nothing cleared every gate on the last rank — the bars are doing their job<br><span class="faint">אף שוק לא עבר את כל השערים — זו החלטה, לא תקלה</span>');
+  return pipeLane('③ FINAL — eligible, ranked','passed every gate · return per $ of capital',fin.length,'proj',body);
 }
 function pipeGrad(s){
   const g=s.graduated||[];
@@ -1311,12 +1389,9 @@ function pipeGrad(s){
 async function tickPipeline(){
   let s; try{ s=await (await fetch('/api/pipeline',{cache:'no-store'})).json(); }catch(e){ return; }
   const snap=s.snapshot||null;
-  // Mast liveness, previously driven by the fleet-page tick (removed): the
-  // pipeline payload carries the fleet heartbeat and the snapshot age.
-  // The fleet heartbeat and the snapshot age were previously driven by the
-  // removed fleet-page tick; the pipeline payload carries both now.
   $('live').innerHTML = s.fleet_alive===true?'<span class="up">● FLEET ALIVE</span>':s.fleet_alive===false?'<span class="down">● FLEET DOWN</span>':'<span class="dim">● fleet status unknown</span>';
   $('health').innerHTML = s.snapshot_age==null?'<span class="dim">● NO SNAPSHOT</span>':(s.snapshot_age>900?'<span class="alert-tx">● STALE SNAPSHOT</span>':'<span class="up">● RANK FRESH</span>');
+  $('heroGrid').innerHTML = heroGrid(s, snap);
   $('pipeStrip').innerHTML=pipeStrip(s,snap);
   const nm=s.near_miss||null, vn=s.volume_near_miss||null;
   const tcEl=$('trialCallout'), tc=trialCallout(nm,vn);
@@ -1325,11 +1400,10 @@ async function tickPipeline(){
   $('volumeNearMiss').innerHTML=pipeVolumeNearMiss(vn);
   $('laneRaw').innerHTML=snap?pipeRaw(snap):pipeLane('① RAW','','-','',pipeEmpty('waiting for the next rank…'));
   $('laneFilter').innerHTML=snap?pipeFilter(snap):pipeLane('② FILTERS','','-','',pipeEmpty('waiting for the next rank…'));
-  $('laneFinal').innerHTML=snap?pipeFinal(snap):pipeLane('③ FINAL STAGE','','-','',pipeEmpty('waiting for the next rank…'));
+  $('laneFinal').innerHTML=snap?pipeFinal(snap):pipeLane('③ FINAL','','-','',pipeEmpty('waiting for the next rank…'));
   $('laneGrad').innerHTML=pipeGrad(s);
 }
 tickPipeline(); setInterval(tickPipeline,10000);
-
 </script>
 </body></html>
 """
