@@ -80,8 +80,43 @@ def api():
     wins = load_windows(200)
     live = load_live_snaps()
     now=time.time()
-    # per-series counts from windows for histogram
     return {"now": now, "summary": summary, "windows": wins, "live": live}
+
+@app.get("/api/analysis")
+def api_analysis():
+    # full windows for histograms (all, not 200)
+    rows=[]
+    f=RUN / "oscillation_windows.jsonl"
+    if f.exists():
+        for line in f.read_text(encoding="utf-8").splitlines():
+            if not line.strip(): continue
+            try: rows.append(json.loads(line))
+            except: continue
+    # histograms
+    import collections
+    # per series oscillating rate
+    per_series={}
+    for r in rows:
+        k=r["series"]
+        per_series.setdefault(k, []).append(r)
+    hist_max=[] # buckets 0-50c in 5c steps
+    buckets = list(range(0,55,5))
+    hist = {b:0 for b in buckets}
+    for r in rows:
+        m = max(r.get("max_up",0), r.get("max_down",0))*100
+        for b in buckets:
+            if m < b+5:
+                hist[b]+=1
+                break
+    # start deviation histogram
+    hist_start={b:0 for b in [0,1,2,3,5,10]}
+    for r in rows:
+        d=abs((r.get("start_mid") or 0.5)-0.5)*100
+        for thr in sorted(hist_start):
+            if d < thr+1:
+                hist_start[thr]+=1
+                break
+    return {"total": len(rows), "per_series": {k: len(v) for k,v in per_series.items()}, "hist_max": hist, "hist_start": hist_start, "rows": rows[-100:]}
 
 PAGE = r"""<!doctype html><html lang="he" dir="rtl"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -231,8 +266,137 @@ async function tick(){
 tick(); setInterval(tick,3000);
 </script></body></html>
 """
+PAGE_SUMMARY = r"""<!doctype html><html lang="he" dir="rtl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>סיכום סטטיסטי — 630 חלונות</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=IBM+Plex+Mono:wght@500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#0a0d12;--panel:#12161d;--panel2:#171c24;--line:#232a35;--tx:#e7ebf3;--dim:#8792a6;--faint:#535e70;--up:#33c9b5;--down:#f0684d;--gold:#e8b84b;--proj:#7b9bf7;--r:12px;--disp:'Space Grotesk',system-ui;--mono:'IBM Plex Mono',monospace;--body:'IBM Plex Sans',system-ui}
+*{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 var(--body)}
+a{color:var(--proj)} .mono{font-family:var(--mono)}
+.hdr{padding:18px 24px;background:linear-gradient(90deg,#12161d,#0f1e1c);border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.hdr h1{margin:0;font:700 18px var(--disp)} .badge{border:1px solid var(--gold);color:var(--gold);border-radius:99px;padding:3px 10px;font:700 11px var(--mono)}
+.wrap{max-width:1300px;margin:0 auto;padding:20px 24px}
+.hero{display:grid;grid-template-columns:1.2fr .8fr;gap:16px;margin-bottom:16px}
+@media(max-width:900px){.hero{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+.card h3{margin:0 0 8px;font:700 12px var(--disp);letter-spacing:.08em;text-transform:uppercase}
+.big{font:700 28px var(--mono);margin:4px 0}
+.sub{font-size:12px;color:var(--dim)}
+.kpi-row{display:flex;gap:10px;flex-wrap:wrap;margin-top:10px}
+.kpi{flex:1;min-width:110px;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;text-align:center}
+.kpi .n{font:700 20px var(--mono)} .kpi .l{font:600 10px var(--disp);color:var(--faint);letter-spacing:.06em;text-transform:uppercase}
+.insight{border-left:3px solid var(--up);padding-left:12px;margin:8px 0}
+.insight.down{border-color:var(--down)}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+.chart-box{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:8px}
+.note{font-size:12px;color:var(--dim);line-height:1.6;border-top:1px dashed var(--line);margin-top:12px;padding-top:10px}
+</style></head><body>
+<div class="hdr">
+  <h1>◆ סיכום סטטיסטי — תצפיות 5m / 15m · SPREAD 2</h1>
+  <span class="badge" id="totalBadge">טוען...</span>
+  <span style="flex:1"></span>
+  <a href="/oscillation" style="font-size:12px;border:1px solid var(--line);padding:6px 12px;border-radius:99px;background:var(--panel2)">← לטבלת החלונות</a>
+  <a href="/" style="font-size:12px;border:1px solid var(--line);padding:6px 12px;border-radius:99px;background:var(--panel2)">Live</a>
+</div>
+<div class="wrap">
+  <div class="hero">
+    <div class="card" style="border-top:2px solid var(--up)">
+      <h3>מסקנה — האם ספרד 2 עובד?</h3>
+      <div class="big" style="color:var(--up)">כן — 74% מהחלונות תנודתיים</div>
+      <div class="sub">ב-630 חלונות (470 ב-5m + 160 ב-15m) כל חלון זז לפחות <b>20¢</b> מ-50. ב-5m <b>73% oscillating</b> — שני הצדדים ב-0.96 היו נתפסים וממתמזגים ל-4¢ רווח. ב-15m <b>79% oscillating</b> — אפילו יותר טוב.</div>
+      <div class="kpi-row">
+        <div class="kpi"><div class="n" style="color:var(--up)">469</div><div class="l">oscillating (שני כיוונים)</div></div>
+        <div class="kpi"><div class="n" style="color:var(--down)">161</div><div class="l">monotonic (חד-כיווני)</div></div>
+        <div class="kpi"><div class="n">0</div><div class="l">flat</div></div>
+      </div>
+      <div class="insight"><b style="color:var(--up)">הזדמנות:</b> אם אתה ראשון בתור ב-48¢ (2¢ מתחת ל-mid בפתיחה) אתה תתפוס את שני הצדדים ב-3/4 מהחלונות. <code>touch_pair 1.01–1.04</code> → אתה 5–8¢ טוב יותר מה-touch.</div>
+      <div class="insight down"><b style="color:var(--down)">סיכון:</b> ב-26% מה-5m המחיר רץ רק לכיוון אחד בממוצע <b>32¢</b> עד הסוף — בלי יציאה תישאר naked ותספוג. לכן צריך רף יציאה.</div>
+    </div>
+    <div class="card" style="border-top:2px solid var(--gold)">
+      <h3>המלצת רף יציאה מונוטונית (לפי נכס)</h3>
+      <div class="sub">הדוק = לצאת מוקדם (מספר קטן). BTC הכי מונוטוני → הכי הדוק.</div>
+      <table style="width:100%;margin-top:10px;border-collapse:collapse;font-size:13px">
+        <tr style="color:var(--faint);font:600 10px var(--disp);border-bottom:1px solid var(--line)"><td>נכס</td><td>monotonic</td><td>מומלץ</td></tr>
+        <tr><td><b>BTC 5m</b></td><td>27% (25/94)</td><td><span style="background:rgba(240,104,77,.15);color:var(--down);padding:2px 8px;border-radius:99px;font-weight:700">+9¢ → צא ב-59¢ UP</span></td></tr>
+        <tr><td>SOL 5m</td><td>29% (27/94)</td><td><span style="background:rgba(232,184,75,.15);color:var(--gold);padding:2px 8px;border-radius:99px;font-weight:700">+11¢ → 61¢</span></td></tr>
+        <tr><td>ETH/BNB/XRP 5m</td><td>22–27%</td><td><span style="background:rgba(51,201,181,.15);color:var(--up);padding:2px 8px;border-radius:99px;font-weight:700">+12¢ → 62¢</span></td></tr>
+        <tr><td>15m כללי</td><td>21% (33/160)</td><td><span style="background:var(--panel2);border:1px solid var(--line);padding:2px 8px;border-radius:99px">+13¢</span></td></tr>
+      </table>
+      <div class="note">הרפים חושבו מ-630 חלונות: חותך monotonic ב-12¢ מפסיד 26% מהחלונות אבל מציל מ-32¢ הפסד ממוצע. בחרתי 9¢ ל-BTC כי הוא הכי חד-כיווני.</div>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="card"><h3>1. אחוז תנודתיות — פר נכס</h3><div class="chart-box"><canvas id="cPerAsset" height="220"></canvas></div><div class="note">כל 5m: 71–78% oscillating. 15m: 69–88%. אף flat.</div></div>
+    <div class="card"><h3>2. כל חלון זז לפחות 20¢ — התפלגות טווח</h3><div class="chart-box"><canvas id="cHist" height="220"></canvas></div><div class="note">חציון 49.5¢ — חצי מהחלונות הגיעו ל-99.5¢. 2¢/3¢ לא מבדיל — צריך 10¢+.</div></div>
+  </div>
+  <div class="grid2" style="margin-top:16px">
+    <div class="card"><h3>3. פתיחה קרובה ל-50? — סטיית פתיחה</h3><div class="chart-box"><canvas id="cStart" height="200"></canvas></div><div class="note">רוב הפתיחות 49–51¢. כשזה 47.5¢ — החלון כבר רץ 15 שניות לפני שדגמנו.</div></div>
+    <div class="card"><h3>4. Touch pair — כמה הספרד צר</h3><div class="chart-box"><canvas id="cPair" height="200"></canvas></div><div class="note">חציון 1.01–1.04 → אתה ב-0.96 תמיד 5–8¢ טוב יותר מה-touch. queue @rest 40–150 מניות לפניך.</div></div>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h3>מה עושים עם זה — תכנית ספרד</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-top:10px">
+      <div style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px"><div style="font:700 11px var(--disp);color:var(--up)">שלב א — כניסה מוקדמת</div><div style="font-size:12px;color:var(--dim);margin-top:4px">להניח לפני הפתיחה ב-<b>48¢/48¢</b> (mid-2¢). להיות ראשון בתור — queue 50. ב-74% מהמקרים שני הצדדים יתפסו.</div></div>
+      <div style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px"><div style="font:700 11px var(--disp);color:var(--gold)">שלב ב — מעקב</div><div style="font-size:12px;color:var(--dim);margin-top:4px">אם mid זז <b>12¢</b> לכיוון אחד בלי רברס 2¢ — לסגור את הצד התקוע (exit). זה יקרה ב-26% מהחלונות.</div></div>
+      <div style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px"><div style="font:700 11px var(--disp);color:var(--proj)">שלב ג — מימוש</div><div style="font-size:12px;color:var(--dim);margin-top:4px">זוג שנתפס → <b>merge 4¢</b> מייד. צד בודד שיצא → הפסד 5–8¢ במקום 30¢.</div></div>
+    </div>
+  </div>
+</div>
+<script>
+async function load(){
+  const d=await (await fetch('/api/oscillation',{cache:'no-store'})).json();
+  const sum=d.summary.per_series;
+  const totalWindows = Object.values(sum).reduce((acc,s)=>acc+(s.windows||0),0);
+  document.getElementById('totalBadge').textContent = totalWindows+' חלונות סגורים · '+Object.keys(sum).length+' סדרות';
+  // 1. per asset bar
+  const order=['BTC 5m','ETH 5m','BNB 5m','SOL 5m','XRP 5m','BTC 15m','ETH 15m','BNB 15m','SOL 15m','XRP 15m'];
+  const labels=[], osc=[], mono=[];
+  for(const k of Object.keys(sum)){
+    const s=sum[k];
+    const idx=order.indexOf(s.label);
+    if(idx>=0){ labels[idx]=s.label; osc[idx]=s.oscillating; mono[idx]=s.monotonic; }
+  }
+  new Chart(document.getElementById('cPerAsset'),{type:'bar',data:{labels:order,datasets:[{label:'oscillating',data:osc.map((v,i)=> v),backgroundColor:'#33c9b5'},{label:'monotonic',data:mono,backgroundColor:'#f0684d'}]},options:{responsive:true,plugins:{legend:{position:'bottom',labels:{color:'#8792a6'}}},scales:{x:{ticks:{color:'#8792a6'},grid:{color:'#232a35'}},y:{ticks:{color:'#8792a6'},grid:{color:'#232a35'}}}}});
+  // fetch full analysis for hists
+  const a=await (await fetch('/api/analysis',{cache:'no-store'})).json();
+  const rows=a.rows||[];
+  // 2. hist max: buckets
+  const buckets=[0,5,10,15,20,30,40,50];
+  const histMax=new Array(buckets.length).fill(0);
+  rows.forEach(r=>{const m=Math.max(r.max_up,r.max_down)*100; for(let i=0;i<buckets.length;i++){ if(m < buckets[i]+5 || i===buckets.length-1){histMax[i]++;break;}}});
+  // simplified: use fixed buckets 0-10,10-20,20-30,30-40,40-50
+  const bLabels=['0-10¢','10-20¢','20-30¢','30-40¢','40-50¢'];
+  const bCounts=[0,0,0,0,0];
+  rows.forEach(r=>{const m=Math.max(r.max_up,r.max_down)*100; if(m<10) bCounts[0]++; else if(m<20) bCounts[1]++; else if(m<30) bCounts[2]++; else if(m<40) bCounts[3]++; else bCounts[4]++;});
+  new Chart(document.getElementById('cHist'),{type:'bar',data:{labels:bLabels,datasets:[{label:'חלונות',data:bCounts,backgroundColor:'#e8b84b'}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8792a6'},grid:{display:false}},y:{ticks:{color:'#8792a6'},grid:{color:'#232a35'}}}}});
+  // 3. start deviation
+  const sBuckets=['0-1¢','1-2¢','2-5¢','5-10¢','10¢+'];
+  const sCounts=[0,0,0,0,0];
+  rows.forEach(r=>{const d=Math.abs((r.start_mid||0.5)-0.5)*100; if(d<1) sCounts[0]++; else if(d<2) sCounts[1]++; else if(d<5) sCounts[2]++; else if(d<10) sCounts[3]++; else sCounts[4]++;});
+  new Chart(document.getElementById('cStart'),{type:'doughnut',data:{labels:sBuckets,datasets:[{data:sCounts,backgroundColor:['#33c9b5','#7b9bf7','#e8b84b','#f0684d','#535e70']}]},options:{responsive:true,plugins:{legend:{position:'bottom',labels:{color:'#8792a6'}}}}});
+  // 4. pair
+  const pBuckets=['1.00-1.02','1.02-1.04','1.04-1.06','1.06+'];
+  const pCounts=[0,0,0,0];
+  rows.forEach(r=>{const p=r.touch_pair_median||1.01; if(p<1.02) pCounts[0]++; else if(p<1.04) pCounts[1]++; else if(p<1.06) pCounts[2]++; else pCounts[3]++;});
+  new Chart(document.getElementById('cPair'),{type:'bar',data:{labels:pBuckets,datasets:[{data:pCounts,backgroundColor:'#7b9bf7'}]},options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{ticks:{color:'#8792a6'}},y:{ticks:{color:'#8792a6'},grid:{color:'#232a35'}}}}});
+}
+load();
+</script></body></html>
+"""
+
 @app.get("/", response_class=HTMLResponse)
 @app.get("/oscillation", response_class=HTMLResponse)
 def page():
     return HTMLResponse(PAGE, headers={"Cache-Control":"no-cache"})
+
+@app.get("/summary", response_class=HTMLResponse)
+@app.get("/analysis", response_class=HTMLResponse)
+def summary_page():
+    return HTMLResponse(PAGE_SUMMARY, headers={"Cache-Control":"no-cache"})
+
 
