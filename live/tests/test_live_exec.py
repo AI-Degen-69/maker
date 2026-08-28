@@ -88,66 +88,6 @@ def test_live_exec_arg_parsing():
     assert args_redeem.skip_resolution_check is True
 
 
-def test_encode_redeem_positions():
-    cond_id = "0x26b64228a9fb13e5c2221cd5879fa0f235cee8ab254c0f094977cc86beeb6a2f"
-    res = le.encode_redeem_positions(
-        le.USDC_E_CONTRACT,
-        le.ZERO_BYTES32,
-        cond_id,
-        [1, 2]
-    )
-    assert res.startswith("0x01b7037c")
-    assert len(res) == 458  # 2 + 8 (selector) + 7 * 64 (params)
-    assert le.USDC_E_CONTRACT.lower().replace("0x", "") in res
-    assert cond_id.lower().replace("0x", "") in res
-
-
-def test_build_redeem_typed_data():
-    funder = "0xBa7c21Ac8968983e90BEcB989fe978889FEC266b"
-    nonce = 121
-    deadline = 1786855000
-    call_data = "0x01b7037c" + "00" * 224
-
-    domain, types, message = le.build_redeem_typed_data(funder, nonce, deadline, call_data)
-    assert domain["name"] == "DepositWallet"
-    assert domain["version"] == "1"
-    assert domain["chainId"] == 137
-    assert domain["verifyingContract"] == funder
-
-    assert "Call" in types and "Batch" in types
-    assert len(types["Call"]) == 3
-    assert len(types["Batch"]) == 4
-
-    assert message["wallet"] == funder
-    assert isinstance(message["nonce"], int)
-    assert message["nonce"] == nonce
-    assert isinstance(message["deadline"], int)
-    assert message["deadline"] == deadline
-    assert len(message["calls"]) == 1
-    assert message["calls"][0]["target"] == le.CTF_CONTRACT
-    assert isinstance(message["calls"][0]["value"], int)
-    assert message["calls"][0]["value"] == 0
-
-
-def test_sign_redeem_transaction():
-    acc = Account.create()
-    funder = "0xBa7c21Ac8968983e90BEcB989fe978889FEC266b"
-    nonce = 121
-    deadline = 1786855000
-    call_data = "0x01b7037c" + "00" * 224
-
-    signer_addr, sig = le.sign_redeem_transaction(
-        acc.key.hex(),
-        funder,
-        nonce,
-        deadline,
-        call_data
-    )
-    assert signer_addr == acc.address
-    assert sig.startswith("0x")
-    assert len(sig) == 132  # 0x + 130 hex chars
-
-
 def test_build_redeem_submit_payload():
     from_addr = "0xD2C7F5514580184d32C70F6FEA95B69C5Cd72fa0"
     funder = "0xBa7c21Ac8968983e90BEcB989fe978889FEC266b"
@@ -792,89 +732,6 @@ def test_log_order_write_failure_aborts_without_submitting(tmp_path):
     assert not any("submit" in u for u in urls_called)
 
 
-def test_derived_position_ids_match_canonical_cthelpers():
-    """Round-trip test verifying get_collection_id and get_position_id against real Polymarket CLOB token IDs.
-
-    Provenance:
-      Fetched from live Gamma API (https://gamma-api.polymarket.com/markets)
-      Market: 'Xi Jinping out before 2027?'
-      conditionId: '0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7'
-      clobTokenIds:
-        indexSet 1 (Yes): '32338220190071351435772801779725302244575775216413325951443816017994629993401'
-        indexSet 2 (No):  '25659310674993675562345759665114759892400026242514633218387667107987341231962'
-    """
-    cond_id = "0xa467b14d51f01b957109d9cbb1d6c124fab2a089d52ed8f471d23c2812e743b7"
-    expected_token_id_1 = "32338220190071351435772801779725302244575775216413325951443816017994629993401"
-    expected_token_id_2 = "25659310674993675562345759665114759892400026242514633218387667107987341231962"
-
-    collection_id_1 = le.get_collection_id(le.ZERO_BYTES32, cond_id, 1)
-    pos_id_1 = le.get_position_id(le.USDC_E_CONTRACT, collection_id_1)
-
-    collection_id_2 = le.get_collection_id(le.ZERO_BYTES32, cond_id, 2)
-    pos_id_2 = le.get_position_id(le.USDC_E_CONTRACT, collection_id_2)
-
-    assert pos_id_1 == expected_token_id_1
-    assert pos_id_2 == expected_token_id_2
-
-
-# The round-trip test above only ever passes ZERO_BYTES32 as the parent, which is
-# all Polymarket itself uses. That leaves the entire `x2 != 0` branch of
-# get_collection_id — parent point decode, parity restore, curve check, and the
-# alt_bn128 point addition — with no coverage at all. The three tests below enter
-# that branch. Constants are conditionId-shaped but synthetic: the branch is pure
-# curve arithmetic and does not care whether a condition exists on chain.
-
-_COND_A = "0x" + "11" * 32
-_COND_B = "0x" + "22" * 32
-
-
-def test_non_zero_parent_collection_id_is_distinct_and_deterministic():
-    """A non-zero parent must change the result and must do so reproducibly."""
-    parent = le.get_collection_id(le.ZERO_BYTES32, _COND_A, 1)
-
-    with_parent = le.get_collection_id(parent, _COND_B, 1)
-    without_parent = le.get_collection_id(le.ZERO_BYTES32, _COND_B, 1)
-
-    # Well-formed: 0x + 64 hex chars, parseable as a 256-bit integer.
-    assert with_parent.startswith("0x")
-    assert len(with_parent) == 66
-    int(with_parent, 16)
-
-    # The parent point was actually added, not silently dropped.
-    assert with_parent != without_parent
-
-    # Same inputs, same output — no dependence on iteration order or state.
-    assert le.get_collection_id(parent, _COND_B, 1) == with_parent
-
-
-def test_collection_id_point_addition_is_order_independent():
-    """P_A + P_B == P_B + P_A: which condition acts as parent must not matter.
-
-    Each outcome point derives from (conditionId, indexSet) alone, so combining
-    two of them is commutative. If this fails, the parent decode or the point
-    addition is wrong, not the test.
-    """
-    parent_a = le.get_collection_id(le.ZERO_BYTES32, _COND_A, 1)
-    parent_b = le.get_collection_id(le.ZERO_BYTES32, _COND_B, 1)
-
-    a_then_b = le.get_collection_id(parent_a, _COND_B, 1)
-    b_then_a = le.get_collection_id(parent_b, _COND_A, 1)
-
-    assert a_then_b == b_then_a
-
-
-def test_parent_collection_id_off_the_curve_is_rejected():
-    """A parent x-coordinate with no square root must raise, not silently add garbage.
-
-    x = 4 is the smallest positive integer for which x^3 + 3 is a non-residue mod
-    the alt_bn128 field prime, so it cannot be the x-coordinate of any curve point.
-    """
-    off_curve_parent = "0x" + hex(4)[2:].zfill(64)
-
-    with pytest.raises(ValueError, match="invalid parent collection ID"):
-        le.get_collection_id(off_curve_parent, _COND_A, 1)
-
-
 # ===========================================================================
 # Milestone 4 — Quote flags, Cancellation verbs, and Set B commands
 # ===========================================================================
@@ -894,8 +751,8 @@ def test_quote_passes_post_only_default_true(tmp_path):
     db_path = tmp_path / "live.db"
 
     with patch("engine.markets.fetch_pinned_market", return_value=dummy_market), \
-         patch.object(le, "_client", return_value=mock_client), \
-         patch.object(le, "_open_notional", return_value=0.0), \
+         patch.object(le, "client", return_value=mock_client), \
+         patch.object(le, "open_notional", return_value=0.0), \
          patch.object(le, "RUN", tmp_path):
         le.quote(cond_id, price=0.50, size=10.0, live=True, db_path=db_path)
 
@@ -933,7 +790,7 @@ def test_quote_does_not_require_maker_rewards(tmp_path):
         lambda vid: {"asset_id": "tok_up"} if vid == "venue-up" else {"asset_id": "tok_dn"}
     )
 
-    with patch("engine.markets.fetch_pinned_market", side_effect=_fetch),          patch.object(le, "_client", return_value=mock_client),          patch.object(le, "_open_notional", return_value=0.0),          patch.object(le, "RUN", tmp_path):
+    with patch("engine.markets.fetch_pinned_market", side_effect=_fetch),          patch.object(le, "client", return_value=mock_client),          patch.object(le, "open_notional", return_value=0.0),          patch.object(le, "RUN", tmp_path):
         le.quote(cond_id, price=0.50, size=5.0, live=True,
                  db_path=tmp_path / "live.db")
 
@@ -955,8 +812,8 @@ def test_quote_allows_explicit_no_post_only(tmp_path):
     db_path = tmp_path / "live.db"
 
     with patch("engine.markets.fetch_pinned_market", return_value=dummy_market), \
-         patch.object(le, "_client", return_value=mock_client), \
-         patch.object(le, "_open_notional", return_value=0.0), \
+         patch.object(le, "client", return_value=mock_client), \
+         patch.object(le, "open_notional", return_value=0.0), \
          patch.object(le, "RUN", tmp_path):
         le.quote(cond_id, price=0.50, size=10.0, live=True, post_only=False, db_path=db_path)
 
@@ -979,8 +836,8 @@ def test_quote_tif_gtd_with_expiration(tmp_path):
     db_path = tmp_path / "live.db"
 
     with patch("engine.markets.fetch_pinned_market", return_value=dummy_market), \
-         patch.object(le, "_client", return_value=mock_client), \
-         patch.object(le, "_open_notional", return_value=0.0), \
+         patch.object(le, "client", return_value=mock_client), \
+         patch.object(le, "open_notional", return_value=0.0), \
          patch.object(le, "RUN", tmp_path):
         le.quote(cond_id, price=0.50, size=10.0, live=True, tif="GTD", expiration=1786855000, db_path=db_path)
 
@@ -1011,8 +868,8 @@ def test_batch_quote_happy_path_both_succeed(tmp_path):
     db_path = tmp_path / "live.db"
 
     with patch("engine.markets.fetch_pinned_market", return_value=dummy_market), \
-         patch.object(le, "_client", return_value=mock_client), \
-         patch.object(le, "_open_notional", return_value=0.0), \
+         patch.object(le, "client", return_value=mock_client), \
+         patch.object(le, "open_notional", return_value=0.0), \
          patch.object(le, "RUN", tmp_path):
         le.quote(cond_id, price=0.60, size=10.0, live=True, db_path=db_path)
 
@@ -1043,8 +900,8 @@ def test_batch_quote_partial_failure_auto_cancels_naked_leg(tmp_path, capsys):
     db_path = tmp_path / "live.db"
 
     with patch("engine.markets.fetch_pinned_market", return_value=dummy_market), \
-         patch.object(le, "_client", return_value=mock_client), \
-         patch.object(le, "_open_notional", return_value=0.0), \
+         patch.object(le, "client", return_value=mock_client), \
+         patch.object(le, "open_notional", return_value=0.0), \
          patch.object(le, "RUN", tmp_path):
         with pytest.raises(SystemExit) as exc:
             le.quote(cond_id, price=0.60, size=10.0, live=True, db_path=db_path)
@@ -1084,8 +941,8 @@ def test_batch_quote_reverse_response_attribution_and_half_price(tmp_path):
     db_path = tmp_path / "live.db"
 
     with patch("engine.markets.fetch_pinned_market", return_value=dummy_market), \
-         patch.object(le, "_client", return_value=mock_client), \
-         patch.object(le, "_open_notional", return_value=0.0), \
+         patch.object(le, "client", return_value=mock_client), \
+         patch.object(le, "open_notional", return_value=0.0), \
          patch.object(le, "RUN", tmp_path):
         with pytest.raises(SystemExit) as exc:
             # price = 0.50: UP cost = 5.0, DOWN cost = 5.0 (amounts identical)
@@ -1122,8 +979,8 @@ def test_batch_quote_verification_mismatch_fails_closed(tmp_path):
     db_path = tmp_path / "live.db"
 
     with patch("engine.markets.fetch_pinned_market", return_value=dummy_market), \
-         patch.object(le, "_client", return_value=mock_client), \
-         patch.object(le, "_open_notional", return_value=0.0), \
+         patch.object(le, "client", return_value=mock_client), \
+         patch.object(le, "open_notional", return_value=0.0), \
          patch.object(le, "RUN", tmp_path):
         with pytest.raises(SystemExit) as exc:
             le.quote(cond_id, price=0.60, size=10.0, live=True, db_path=db_path)
@@ -1152,8 +1009,8 @@ def test_batch_quote_both_fail(tmp_path, capsys):
     db_path = tmp_path / "live.db"
 
     with patch("engine.markets.fetch_pinned_market", return_value=dummy_market), \
-         patch.object(le, "_client", return_value=mock_client), \
-         patch.object(le, "_open_notional", return_value=0.0), \
+         patch.object(le, "client", return_value=mock_client), \
+         patch.object(le, "open_notional", return_value=0.0), \
          patch.object(le, "RUN", tmp_path):
         le.quote(cond_id, price=0.60, size=10.0, live=True, db_path=db_path)
 
@@ -1214,7 +1071,7 @@ def test_cancel_single_order_dry_run_and_live(tmp_path, capsys):
     # 2. Live execution
     mock_client = MagicMock()
     mock_client.cancel_order.return_value = {"canceled": ["venue-order-99"]}
-    with patch.object(le, "_client", return_value=mock_client):
+    with patch.object(le, "client", return_value=mock_client):
         le.cancel_single_order("venue-order-99", live=True, db_path=db_path)
 
     out_live = capsys.readouterr().out
@@ -1228,7 +1085,7 @@ def test_cancel_single_order_handles_venue_rejection(tmp_path):
     mock_client = MagicMock()
     mock_client.cancel_order.side_effect = RuntimeError("Order not found or already closed")
 
-    with patch.object(le, "_client", return_value=mock_client):
+    with patch.object(le, "client", return_value=mock_client):
         with pytest.raises(SystemExit) as exc:
             le.cancel_single_order("venue-order-missing", live=True, db_path=db_path)
 
@@ -1266,7 +1123,7 @@ def test_cancel_market_dry_run_and_live(tmp_path, capsys):
     # 2. Live execution
     mock_client = MagicMock()
     mock_client.cancel_market_orders.return_value = {"canceled": ["venue-1"]}
-    with patch.object(le, "_client", return_value=mock_client):
+    with patch.object(le, "client", return_value=mock_client):
         le.cancel_market("0xmarketA", live=True, db_path=db_path)
 
     assert registry.get_order("local-1").status == "cancelled"
@@ -1279,7 +1136,7 @@ def test_cancel_market_handles_venue_error(tmp_path):
     mock_client = MagicMock()
     mock_client.cancel_market_orders.side_effect = RuntimeError("Market cancel failed")
 
-    with patch.object(le, "_client", return_value=mock_client):
+    with patch.object(le, "client", return_value=mock_client):
         with pytest.raises(SystemExit) as exc:
             le.cancel_market("0xmarket-fail", live=True, db_path=db_path)
 
@@ -1297,13 +1154,13 @@ def test_cancel_all_cmd_dry_run_and_live(capsys):
     # 2. Live execution
     mock_client = MagicMock()
     mock_client.cancel_all.return_value = {"canceled": ["ord-1", "ord-2"]}
-    with patch.object(le, "_client", return_value=mock_client):
+    with patch.object(le, "client", return_value=mock_client):
         le.cancel_all(live=True)
     assert "ord-1" in capsys.readouterr().out
 
     # 3. Live failure
     mock_client.cancel_all.side_effect = RuntimeError("Unauthorized")
-    with patch.object(le, "_client", return_value=mock_client):
+    with patch.object(le, "client", return_value=mock_client):
         with pytest.raises(SystemExit) as exc:
             le.cancel_all(live=True)
     assert "CANCEL-ALL REFUSED" in str(exc.value)
@@ -1317,7 +1174,7 @@ def test_status_cmd_reports_auth_and_balances(capsys):
         {"side": "BUY", "original_size": "100", "price": "0.50", "id": "venue-ord-1"}
     ]
 
-    with patch.object(le, "_client", return_value=mock_client), \
+    with patch.object(le, "client", return_value=mock_client), \
          patch.dict(os.environ, {"POLY_FUNDER": "0xfunder1234"}, clear=False):
         le.status()
 
@@ -1337,7 +1194,7 @@ def test_balance_cmd_queries_funder_and_collateral(capsys):
         "allowances": {"0xexchange_contract": "100000000"}
     }
 
-    with patch.object(le, "_client", return_value=mock_client):
+    with patch.object(le, "client", return_value=mock_client):
         le.balance("0xfunder_addr")
 
     out = capsys.readouterr().out
@@ -1377,8 +1234,8 @@ def test_quote_rejects_unknown_tif(tmp_path):
     db_path = tmp_path / "live.db"
 
     with patch("engine.markets.fetch_pinned_market", return_value=dummy_market), \
-         patch.object(le, "_client", return_value=mock_client), \
-         patch.object(le, "_open_notional", return_value=0.0), \
+         patch.object(le, "client", return_value=mock_client), \
+         patch.object(le, "open_notional", return_value=0.0), \
          patch.object(le, "RUN", tmp_path):
         with pytest.raises(SystemExit) as exc:
             le.quote(cond_id, price=0.50, size=10.0, live=True, post_only=False, tif="INVALID", db_path=db_path)
@@ -1409,7 +1266,7 @@ def test_probe_posts_with_post_only_true():
             pass
 
     with patch("websocket.WebSocketApp", FakeWSApp), \
-         patch.object(le, "_client", return_value=mock_client), \
+         patch.object(le, "client", return_value=mock_client), \
          patch("time.sleep", return_value=None):
         le.probe(token_id="tok_fixed_123", cycles=1, live=True)
 

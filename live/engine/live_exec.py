@@ -40,7 +40,6 @@ from __future__ import annotations
 import argparse
 import json
 import contextlib
-import hashlib
 import os
 import sys
 import threading
@@ -72,6 +71,30 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+# Settlement primitives (ABI encoding, id derivation, EIP-712 signing) live in
+# engine.settlement; the relayer/RPC submit path stays here with the CLI verbs.
+from engine.settlement import (
+    CTF_CONTRACT,
+    USDC_E_CONTRACT,
+    ZERO_BYTES32,
+    encode_merge_positions,
+    encode_redeem_positions,
+    get_collection_id,
+    get_position_id,
+    sign_redeem_transaction,
+)
+from engine.venue import (
+    MAX_ORDER_USD,
+    MAX_TOTAL_USD,
+    api_creds_from_env,
+    client,
+    open_notional,
+    venue_order_id,
+)
+from engine.account import fetch_live_balance, log_float_mark_if_measured
+
+
+
 def _find_env_file() -> Path | None:
     curr = Path(__file__).resolve().parent
     for _ in range(4):
@@ -92,106 +115,10 @@ _env_file = _find_env_file()
 if _env_file is not None:
     load_dotenv(_env_file)
 
-# Hard ceilings. Not configuration -- this is the difference between a POC and
-# an unbounded loss, so they live in code where a stray env var cannot raise
-# them. Edit deliberately, never to "just get this order through".
-MAX_ORDER_USD = 25.0
-
 # The venue's four time-in-force values. Named here so quote() can reject an
-# unknown one outright: OrderType is a plain constants class, not an Enum, so a
-# getattr default would silently downgrade an unrecognised tif to a resting GTC.
+# unknown one outright: OrderType is a plain constants class, not an Enum, so
+# a getattr default would silently downgrade an unrecognised tif to a resting GTC.
 _TIF_CHOICES = ("GTC", "GTD", "FOK", "FAK")
-MAX_TOTAL_USD = 100.0
-
-
-# ── UA patch ──────────────────────────────────────────────────────────────────
-# Polymarket's WAF now returns HTTP 403 for the SDK's default User-Agent
-# ("py_clob_client_v2"). Monkey-patch _overload_headers at import time so
-# every request carries a browser-like UA. Done here rather than in
-# site-packages so pip upgrades don't silently revert it.
-def _patch_sdk_user_agent():
-    import py_clob_client_v2.http_helpers.helpers as _h
-    _orig = _h._overload_headers
-    def _patched(method, headers):
-        headers = _orig(method, headers)
-        headers["User-Agent"] = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/131.0.0.0 Safari/537.36"
-        )
-        return headers
-    _h._overload_headers = _patched
-
-_patch_sdk_user_agent()
-
-# One built client per (funder, sig_type, host) for the life of the process.
-# Every _client() call used to POST /auth/api-key and then GET
-# /auth/derive-api-key, so a single command that touched the venue twice
-# derived twice, and a session of CLI runs derived once per run. Derivation is
-# the most rate-limit-sensitive call in the API. Process-local only: the creds
-# are never written to disk, matching the "never stored" rule below.
-_CLIENT_CACHE: dict = {}
-
-
-def _client(funder: str | None = None):
-    """Build a CLOB client from the environment. Raises if anything is absent.
-
-    The key is read and passed on in a single expression: never bound to a
-    module global, never returned, never in a log line.
-
-    `funder` overrides POLY_FUNDER for one call. That exists so a candidate
-    address can be balance-checked before it is committed to .env.
-    """
-    from py_clob_client_v2.client import ClobClient
-
-    key = os.environ.get("POLY_PRIVATE_KEY") or os.environ.get("POLY_KEY")
-    if not key:
-        raise SystemExit(
-            "POLY_PRIVATE_KEY not set. Put it in .env -- and confirm .env is "
-            "in .gitignore before you paste anything into it.")
-
-    funder = funder or os.environ.get("POLY_FUNDER")
-    sig_type = int(os.environ.get("POLY_SIG_TYPE", "3"))
-    host = os.environ.get("CLOB_HOST", "https://clob.polymarket.com")
-
-    # Keyed on the signing key too, so a changed key never reuses a client
-    # authenticated as someone else. Hashed: the key itself stays out of any
-    # structure that could be printed or logged.
-    cache_key = (hashlib.sha256(key.encode()).hexdigest(), funder, sig_type, host)
-    cached = _CLIENT_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    c = ClobClient(host, key=key, chain_id=137,
-                   signature_type=sig_type, funder=funder)
-    creds = _api_creds_from_env()
-    if creds is not None:
-        # Already-issued L2 credentials. This is the path that makes no network
-        # call at all: derivation is the most rate-limit-sensitive endpoint in
-        # the API, and deriving once per command is what got this account
-        # throttled -- `balance` succeeded and `account-sweep` timed out on the
-        # same credentials twenty seconds later.
-        c.set_api_creds(creds)
-    else:
-        c.set_api_creds(c.create_or_derive_api_key())
-    _CLIENT_CACHE[cache_key] = c
-    return c
-
-
-def _api_creds_from_env():
-    """L2 API credentials from the environment, or None if incomplete.
-
-    All three must be present. A partial set would build a client that fails
-    every signed request with an error that looks like a venue outage.
-    """
-    from py_clob_client_v2.clob_types import ApiCreds
-
-    api_key = os.environ.get("POLY_API_KEY")
-    secret = os.environ.get("POLY_API_SECRET")
-    passphrase = os.environ.get("POLY_API_PASSPHRASE")
-    if not (api_key and secret and passphrase):
-        return None
-    return ApiCreds(api_key=api_key, api_secret=secret, api_passphrase=passphrase)
 
 
 def _atomic_write_json(file_path: Path, data: list) -> bool:
@@ -342,27 +269,16 @@ def _check_idempotency_guard(condition_id: str, force: bool = False) -> None:
             )
 
 
-def _open_notional(c) -> float:
-
-    try:
-        orders = c.get_open_orders() or []
-        return sum(float(o.get("price", 0) or 0)
-                   * float(o.get("original_size", 0) or 0)
-                   for o in orders)
-    except Exception:
-        return 0.0
-
-
 def status() -> None:
     """Who are we, and what is already resting. Read-only, safe anytime."""
-    c = _client()
+    c = client()
     print(f"address        {c.get_address()}")
     print(f"funder         {os.environ.get('POLY_FUNDER') or '(same as address)'}")
     print(f"signature type {os.environ.get('POLY_SIG_TYPE', '3')}")
     try:
         orders = c.get_open_orders() or []
         print(f"open orders    {len(orders)} "
-              f"(${_open_notional(c):.2f} notional)")
+              f"(${open_notional(c):.2f} notional)")
         for o in orders[:10]:
             print(f"  {str(o.get('side')):4} {o.get('original_size')} @ "
                   f"{o.get('price')}  id={str(o.get('id') or o.get('order_hash'))[:16]}")
@@ -380,7 +296,7 @@ def balance(funder: str | None) -> None:
     sig_type = int(os.environ.get("POLY_SIG_TYPE", "3"))
     print(f"funder     {who}")
     try:
-        r = _client(funder).get_balance_allowance(
+        r = client(funder).get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL,
                                    signature_type=sig_type))
     except Exception as e:
@@ -444,22 +360,6 @@ def pairs(db_path: str | Path | None = None) -> None:
               f"{pair['naked']:>9.2f}  {legs}")
 
 
-def _venue_order_id(resp) -> str | None:
-    """Pull the venue order id out of a post_order response.
-
-    Several spellings are accepted because the field name has moved across SDK
-    versions, and a missing id is reported rather than guessed: attaching the
-    wrong id would bind our row to somebody else's order.
-    """
-    if resp is None:
-        return None
-    for key in ("orderID", "orderId", "order_id", "id"):
-        value = resp.get(key) if isinstance(resp, dict) else getattr(resp, key, None)
-        if value:
-            return str(value)
-    return None
-
-
 def quote(condition_id: str, price: float, size: float, live: bool,
           down_price: float | None = None,
           post_only: bool = True, tif: str = "GTC",
@@ -521,8 +421,8 @@ def quote(condition_id: str, price: float, size: float, live: bool,
         print("\nDRY RUN -- nothing sent. Re-run with --live to place.")
         return
 
-    c = _client()
-    already = _open_notional(c)
+    c = client()
+    already = open_notional(c)
     if already + cost > MAX_TOTAL_USD:
         raise SystemExit(f"open ${already:.2f} + ${cost:.2f} exceeds "
                          f"MAX_TOTAL_USD ${MAX_TOTAL_USD:.2f}")
@@ -593,7 +493,7 @@ def quote(condition_id: str, price: float, size: float, live: bool,
     extracted_venue_ids = []
     for idx, leg in enumerate(local_legs):
         item_resp = resp_list[idx] if idx < len(resp_list) else None
-        v_id = _venue_order_id(item_resp)
+        v_id = venue_order_id(item_resp)
         extracted_venue_ids.append(v_id)
 
     # 4. Partial failure detection: if one succeeded and one failed, immediately
@@ -713,182 +613,11 @@ def quote(condition_id: str, price: float, size: float, live: bool,
     print(f"  complete: python -m engine.live_exec complete {pair_id}")
 
 
-CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-USDC_E_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000"
 # Provenance: matches the 598s delta measured on transaction 0x66bc709b1a1d515d813e9d191a84b8863d8f2a251e1698a85d452152c7602135, block 92098496.
 REDEEM_DEADLINE_SECONDS = 600
 # Polymarket DepositWalletFactory address used by @polymarket/builder-relayer-client (config.DepositWalletFactory),
 # confirmed as outer 'to' of reference transaction 0x66bc709b1a1d515d813e9d191a84b8863d8f2a251e1698a85d452152c7602135.
 DEPOSIT_WALLET_FACTORY = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07"
-
-
-def encode_redeem_positions(collateral_token: str, parent_collection_id: str,
-                            condition_id: str, index_sets: list[int]) -> str:
-    """Encode ABI call for ConditionalTokens.redeemPositions(address,bytes32,bytes32,uint256[])
-    Selector: 0x01b7037c
-    """
-    selector = "01b7037c"
-    p_col = collateral_token.lower().replace("0x", "").zfill(64)
-    p_parent = parent_collection_id.lower().replace("0x", "").zfill(64)
-    p_cond = condition_id.lower().replace("0x", "").zfill(64)
-    offset = hex(128)[2:].zfill(64)
-    len_idx = hex(len(index_sets))[2:].zfill(64)
-    elem_idx = "".join(hex(idx)[2:].zfill(64) for idx in index_sets)
-    return "0x" + selector + p_col + p_parent + p_cond + offset + len_idx + elem_idx
-
-
-ALT_BN128_P = 21888242871839275222246405745257275088696311157297823662689037894645226208583
-ALT_BN128_B = 3
-
-
-def _alt_bn128_sqrt(x: int) -> int:
-    """Modular square root on F_P for alt_bn128 (P % 4 == 3)."""
-    return pow(x, (ALT_BN128_P + 1) // 4, ALT_BN128_P)
-
-
-def _alt_bn128_add(x1: int, y1: int, x2: int, y2: int) -> tuple[int, int]:
-    """Affine point addition on alt_bn128 (E: y^2 = x^3 + 3 over F_P).
-    Equivalent to EVM ecAdd precompile at address(6).
-    """
-    p = ALT_BN128_P
-    if x1 == 0 and y1 == 0:
-        return x2, y2
-    if x2 == 0 and y2 == 0:
-        return x1, y1
-    if x1 == x2:
-        if (y1 + y2) % p == 0:
-            return 0, 0
-        slope = (3 * x1 * x1) * pow(2 * y1, p - 2, p) % p
-    else:
-        slope = (y2 - y1) * pow(x2 - x1, p - 2, p) % p
-    x3 = (slope * slope - x1 - x2) % p
-    y3 = (slope * (x1 - x3) - y1) % p
-    return x3, y3
-
-
-def get_collection_id(parent_collection_id: str, condition_id: str, index_set: int) -> str:
-    """Construct an outcome collection ID from a parent collection and an outcome collection.
-    Canonical port of CTHelpers.sol:392-424 (gnosis/conditional-tokens-contracts).
-    """
-    from eth_utils import keccak
-    p = ALT_BN128_P
-    b = ALT_BN128_B
-
-    cond_bytes = bytes.fromhex(condition_id.lower().replace("0x", "").zfill(64))
-    idx_bytes = int(index_set).to_bytes(32, byteorder="big")
-    raw_hash = keccak(cond_bytes + idx_bytes)
-    x1 = int.from_bytes(raw_hash, byteorder="big")
-    odd = (x1 >> 255) != 0
-
-    while True:
-        x1 = (x1 + 1) % p
-        yy = (pow(x1, 3, p) + b) % p
-        y1 = _alt_bn128_sqrt(yy)
-        if (y1 * y1) % p == yy:
-            break
-
-    if (odd and y1 % 2 == 0) or (not odd and y1 % 2 == 1):
-        y1 = p - y1
-
-    x2 = int(parent_collection_id, 16) if parent_collection_id else 0
-    if x2 != 0:
-        odd_parent = (x2 >> 254) != 0
-        x2 = x2 & ((1 << 254) - 1)
-        yy_parent = (pow(x2, 3, p) + b) % p
-        y2 = _alt_bn128_sqrt(yy_parent)
-        if (odd_parent and y2 % 2 == 0) or (not odd_parent and y2 % 2 == 1):
-            y2 = p - y2
-        if (y2 * y2) % p != yy_parent:
-            raise ValueError("invalid parent collection ID")
-        x1, y1 = _alt_bn128_add(x1, y1, x2, y2)
-
-    if y1 % 2 == 1:
-        x1 ^= 1 << 254
-
-    return "0x" + hex(x1)[2:].zfill(64)
-
-
-
-def get_position_id(collateral_token: str, collection_id: str) -> str:
-    """Compute positionId = uint256(keccak256(abi.encodePacked(collateralToken, collectionId))).
-    Source: CTHelpers.sol getPositionId (gnosis/conditional-tokens-contracts).
-    """
-    from eth_utils import keccak
-    col_bytes = bytes.fromhex(collateral_token.lower().replace("0x", "").zfill(40))
-    coll_bytes = bytes.fromhex(collection_id.lower().replace("0x", "").zfill(64))
-    return str(int.from_bytes(keccak(col_bytes + coll_bytes), byteorder="big"))
-
-
-def encode_merge_positions(collateral_token: str, parent_collection_id: str,
-                           condition_id: str, index_sets: list[int],
-                           amount: int) -> str:
-    """Encode ABI call for ConditionalTokens.mergePositions(address,bytes32,bytes32,uint256[],uint256)
-    Selector: 0x9e7212ad (keccak256(b"mergePositions(address,bytes32,bytes32,uint256[],uint256)")[:4])
-    Source: ConditionalTokens.sol:165-171 (gnosis/conditional-tokens-contracts).
-    """
-    selector = "9e7212ad"
-    p_col = collateral_token.lower().replace("0x", "").zfill(64)
-    p_parent = parent_collection_id.lower().replace("0x", "").zfill(64)
-    p_cond = condition_id.lower().replace("0x", "").zfill(64)
-    offset = hex(160)[2:].zfill(64)  # 5 static words in head * 32 bytes = 160 = 0xa0
-    p_amount = hex(int(amount))[2:].zfill(64)
-    len_idx = hex(len(index_sets))[2:].zfill(64)
-    elem_idx = "".join(hex(int(idx))[2:].zfill(64) for idx in index_sets)
-    return "0x" + selector + p_col + p_parent + p_cond + offset + p_amount + len_idx + elem_idx
-
-
-def build_redeem_typed_data(funder: str, nonce: int, deadline: int, call_data: str) -> tuple[dict, dict, dict]:
-
-    """Build EIP-712 typed data structures for DepositWallet.Batch."""
-    domain = {
-        "name": "DepositWallet",
-        "version": "1",
-        "chainId": 137,
-        "verifyingContract": funder,
-    }
-    types = {
-        "Call": [
-            {"name": "target", "type": "address"},
-            {"name": "value", "type": "uint256"},
-            {"name": "data", "type": "bytes"},
-        ],
-        "Batch": [
-            {"name": "wallet", "type": "address"},
-            {"name": "nonce", "type": "uint256"},
-            {"name": "deadline", "type": "uint256"},
-            {"name": "calls", "type": "Call[]"},
-        ],
-    }
-    call_bytes = bytes.fromhex(call_data[2:] if call_data.startswith("0x") else call_data)
-    message = {
-        "wallet": funder,
-        "nonce": int(nonce),
-        "deadline": int(deadline),
-        "calls": [
-            {
-                "target": CTF_CONTRACT,
-                "value": 0,
-                "data": call_bytes,
-            }
-        ],
-    }
-    return domain, types, message
-
-
-def sign_redeem_transaction(key: str, funder: str, nonce: int, deadline: int, call_data: str) -> tuple[str, str]:
-    """Sign DepositWallet EIP-712 Batch transaction with EOA key."""
-    from eth_account import Account
-    from eth_account.messages import encode_typed_data
-
-    domain, types, message = build_redeem_typed_data(funder, nonce, deadline, call_data)
-    typed = encode_typed_data(domain_data=domain, message_types=types, message_data=message)
-    signer_acc = Account.from_key(key)
-    signed = signer_acc.sign_message(typed)
-    sig = signed.signature.hex()
-    if not sig.startswith("0x"):
-        sig = "0x" + sig
-    return signer_acc.address, sig
 
 
 # Origin: live/scripts/audit_settlement.py:19-24
@@ -1403,7 +1132,7 @@ def merge(condition_id: str,
         try:
             from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
             sig_type = int(os.environ.get("POLY_SIG_TYPE", "3"))
-            c = _client(funder)
+            c = client(funder)
             if up_tok_id:
                 r_up = c.get_balance_allowance(
                     BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=up_tok_id, signature_type=sig_type)
@@ -1631,7 +1360,7 @@ def probe(series: str | None = None,
     from engine.markets import fetch_live_market
 
     gamma_host = os.environ.get("GAMMA_HOST", "https://gamma-api.polymarket.com")
-    client = _client()
+    _clob = client()
 
     # Dynamic WebSocket subscription state
     last_delta_event = {}
@@ -1752,7 +1481,7 @@ def probe(series: str | None = None,
         # 2. Complement best bid guard check
         comp_top_bid = comp_best_bid[0]
         try:
-            book_comp = client.get_order_book(comp_token_id)
+            book_comp = _clob.get_order_book(comp_token_id)
             if book_comp and getattr(book_comp, "bids", None):
                 comp_top_bid = max(float(b.price) for b in book_comp.bids)
             elif isinstance(book_comp, dict) and book_comp.get("bids"):
@@ -1775,14 +1504,14 @@ def probe(series: str | None = None,
             side=BUY,
             token_id=active_token_id,
         )
-        signed_order = client.create_order(order_args)
+        signed_order = _clob.create_order(order_args)
 
         t1_socket_write = time.perf_counter_ns()
         # post_only: the probe measures ACCEPT latency, so the order must rest.
         # A fill would corrupt the measurement and open a position the probe
         # never intended -- $0.01 is far from the book, but "far" is a market
         # condition and post_only is a venue guarantee.
-        resp = client.post_order(signed_order, OrderType.GTC, post_only=True)
+        resp = _clob.post_order(signed_order, OrderType.GTC, post_only=True)
         t2_http_ack = time.perf_counter_ns()
 
         order_id = resp.get("orderID") or resp.get("id")
@@ -1802,14 +1531,14 @@ def probe(series: str | None = None,
 
         # Immediate cancel
         try:
-            client.cancel_orders([order_id])
+            _clob.cancel_orders([order_id])
         except Exception as exc:
             print(f"(Cancel status: {exc})", end=" ")
 
         # Post-cancel fill check & loss guard
         time.sleep(0.05)
         try:
-            order_status = client.get_order(order_id)
+            order_status = _clob.get_order(order_id)
             size_matched = float(order_status.get("size_matched", 0) if isinstance(order_status, dict) else getattr(order_status, "size_matched", 0) or 0)
             if size_matched > 0:
                 cumulative_fills += 1
@@ -1827,7 +1556,7 @@ def probe(series: str | None = None,
             # transient blip, then abort rather than keep posting blind.
             try:
                 time.sleep(0.25)
-                order_status = client.get_order(order_id)
+                order_status = _clob.get_order(order_id)
                 size_matched = float(order_status.get("size_matched", 0)
                                      if isinstance(order_status, dict)
                                      else getattr(order_status, "size_matched", 0) or 0)
@@ -1954,107 +1683,6 @@ def _sweep_due(
     return cycle % sweep_every == 0
 
 
-def _registry_naked_usd(registry) -> float:
-    """Dollars at risk on open, one-sided live exposure, from the registry.
-
-    Pairs whose condition already has a close are skipped: a merged pair has
-    no open exposure, and counting its fills would bill risk the venue no
-    longer carries. A partially-exited pair is skipped whole rather than
-    over-stated, which is the safe direction for a risk figure.
-    """
-    from engine.live_pairs import load_pair, PairExitRefused
-
-    with registry._conn() as conn:
-        closed_cids = {
-            r["condition_id"]
-            for r in conn.execute(
-                "SELECT DISTINCT condition_id FROM closes WHERE condition_id IS NOT NULL"
-            ).fetchall()
-        }
-        rows = conn.execute(
-            "SELECT DISTINCT condition_id, pair_id FROM orders "
-            "WHERE pair_id IS NOT NULL"
-        ).fetchall()
-
-    total = 0.0
-    for r in rows:
-        if r["condition_id"] in closed_cids:
-            continue
-        try:
-            pair = load_pair(registry, r["pair_id"])
-        except PairExitRefused:
-            continue
-        naked_sh = pair.get("naked") or 0.0
-        if naked_sh > 0:
-            total += naked_sh * (pair.get("fill_cost") or 0.0)
-    return total
-
-
-def _registry_committed_usd(registry) -> float:
-    """Dollars committed fleet-wide, from the registry.
-
-    Inventory cost (every filled share's cost basis whose pair is still open)
-    plus the notional resting in unfilled offers. Both are spoken for right
-    now: the venue holds collateral against an open bid, and a fill converts
-    that promise into inventory without asking -- the same two terms the
-    simulation's `fleet_committed_cost` sums, and the same gap that let $767
-    of naked exposure hide behind $9,588 of committed capital in 2026-07-30.
-
-    Pairs whose condition already has a close are skipped whole: merged or
-    exited inventory is no longer committed. A filled SELL reduces cost basis
-    (money came back), so it subtracts; a resting SELL commits no new capital
-    and is excluded.
-    """
-    with registry._conn() as conn:
-        closed_cids = {
-            r["condition_id"]
-            for r in conn.execute(
-                "SELECT DISTINCT condition_id FROM closes WHERE condition_id IS NOT NULL"
-            ).fetchall()
-        }
-        inventory = conn.execute(
-            """
-            SELECT COALESCE(SUM(
-                CASE WHEN o.side = 'BUY' THEN f.size * f.price
-                     ELSE -f.size * f.price END
-            ), 0.0)
-            FROM fills f
-            JOIN orders o ON f.order_uuid = o.id
-            WHERE o.condition_id NOT IN (
-                SELECT DISTINCT condition_id FROM closes
-                WHERE condition_id IS NOT NULL
-            )
-            """
-        ).fetchone()[0]
-
-    resting = 0.0
-    for o in registry.get_active_orders():
-        if o.side != "BUY" or o.condition_id in closed_cids:
-            continue
-        resting += o.price * max(0.0, o.original_size - registry.get_size_matched(o.id))
-
-    return float(inventory) + resting
-
-
-def _log_float_mark_if_measured(registry, mark: dict) -> None:
-    """Record an open-exposure float mark when the venue gave real numbers.
-
-    Unrealised and committed come from the venue sweep; naked is registry-
-    derived because the venue has no notion of a one-sided live leg. A
-    partial sweep skips rather than writing 0.0 for a number the venue never
-    reported.
-    """
-    unrealized = mark.get("unrealized_usd")
-    committed = mark.get("committed_usd")
-    if unrealized is None or committed is None:
-        return
-    registry.log_float_mark(
-        unrealized_usd=float(unrealized),
-        committed_open_usd=float(committed),
-        naked_usd=_registry_naked_usd(registry),
-    )
-
-
 def _spawn_guardrail_watcher(db_path: str | Path | None = None):
     """Launch the guardrail watcher as a child of the poll process.
 
@@ -2102,7 +1730,6 @@ def _supervise_watcher(proc, db_path, last_restart_ts, log_fn=None,
             pass
     return _spawn_guardrail_watcher(db_path), time.time()
 
-
 def poll(
     interval: float = 5.0,
     once: bool = False,
@@ -2146,7 +1773,8 @@ def poll(
     # dry-run client whose presence means "do not reach the venue yourself".
     injected_client = client is not None
     if client is None:
-        client = _client()
+        from engine.venue import client as _client_builder
+        client = _client_builder()
 
     funder = os.environ.get("POLY_FUNDER")
     sweep_every = max(1, int(sweep_every))
@@ -2205,7 +1833,7 @@ def poll(
             _log_event(f"[{now_iso}] SWEEP ERROR: {exc}")
             return "error"
         try:
-            _log_float_mark_if_measured(registry, mark)
+            log_float_mark_if_measured(registry, mark)
         except Exception as exc:
             _log_event(f"[{now_iso}] FLOAT MARK ERROR: {exc}")
             return "error"
@@ -2462,7 +2090,7 @@ def exit_pair(pair_id: str, live: bool, db_path: str | Path | None = None,
     from engine import config as strategy_config
 
     registry = OrderRegistry(db_path=Path(db_path) if db_path else DEFAULT_DB_PATH)
-    client = _client()
+    _clob = client()
     funder = os.environ.get("POLY_FUNDER")
 
     # Same discipline as merge, redeem and complete: this sends a real market
@@ -2508,7 +2136,7 @@ def exit_pair(pair_id: str, live: bool, db_path: str | Path | None = None,
 
     try:
         result = exit_naked_leg(
-            client, registry, pair_id,
+            _clob, registry, pair_id,
             max_pair_cost=strategy_config.load().max_pair_cost,
             live=live,
             venue_positions=venue_positions,
@@ -2627,7 +2255,7 @@ def complete_pair_cmd(pair_id: str, live: bool, db_path: str | Path | None = Non
 
     try:
         result = complete_pair(
-            _client(), registry, pair_id,
+            client(), registry, pair_id,
             max_pair_cost=strategy_config.load().max_pair_cost,
             live=live,
             max_order_usd=MAX_ORDER_USD,
@@ -2668,7 +2296,7 @@ def cancel_single_order(order_id: str, live: bool,
     from py_clob_client_v2.clob_types import OrderPayload
     from engine.order_registry import OrderRegistry, DEFAULT_DB_PATH
 
-    c = _client()
+    c = client()
     try:
         resp = c.cancel_order(OrderPayload(orderID=order_id))
     except Exception as exc:
@@ -2702,7 +2330,7 @@ def cancel_market(condition_id: str, live: bool,
     from py_clob_client_v2.clob_types import OrderMarketCancelParams
     from engine.order_registry import OrderRegistry, DEFAULT_DB_PATH
 
-    c = _client()
+    c = client()
     try:
         resp = c.cancel_market_orders(OrderMarketCancelParams(market=condition_id))
     except Exception as exc:
@@ -2731,26 +2359,10 @@ def cancel_all(live: bool) -> None:
         print("DRY RUN -- would cancel ALL open orders. Re-run with --live.")
         return
     try:
-        resp = _client().cancel_all()
+        resp = client().cancel_all()
     except Exception as exc:
         raise SystemExit(f"CANCEL-ALL REFUSED: venue rejected cancel-all: {exc}") from exc
     print(json.dumps(resp, indent=2, default=str) if isinstance(resp, (dict, list)) else resp)
-
-
-def _fetch_live_balance(funder: str | None = None) -> float | None:
-    """Fetch live USDC collateral balance from venue. Returns None on network error / offline / no credentials."""
-    if not (os.environ.get("POLY_PRIVATE_KEY") or os.environ.get("POLY_KEY")):
-        return None
-    try:
-        from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
-        who = funder or os.environ.get("POLY_FUNDER")
-        sig_type = int(os.environ.get("POLY_SIG_TYPE", "3"))
-        r = _client(who).get_balance_allowance(
-            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL,
-                                   signature_type=sig_type))
-        return float(r.get("balance", 0) or 0) / 1e6
-    except Exception:
-        return None
 
 
 def api_creds(force: bool = False) -> None:
@@ -2758,7 +2370,7 @@ def api_creds(force: bool = False) -> None:
 
     Every command used to derive a fresh key, and derivation is the most
     rate-limit-sensitive endpoint the venue exposes. Once these three values are
-    in .env, `_client()` uses them directly and no command ever calls
+    in .env, `client()` uses them directly and no command ever calls
     /auth/derive-api-key again.
 
     The values are written straight to the file and never printed. .env already
@@ -2770,7 +2382,7 @@ def api_creds(force: bool = False) -> None:
         raise SystemExit(
             "No .env found. Create one at the repo root before running this.")
 
-    existing = _api_creds_from_env()
+    existing = api_creds_from_env()
     if existing is not None and not force:
         print(f"{env_file} already has POLY_API_KEY, POLY_API_SECRET, and "
               f"POLY_API_PASSPHRASE.\nNothing to do. Re-derive with --force.")
@@ -2839,7 +2451,7 @@ def account_sweep(funder: str | None = None, db_path: str | None = None,
     # Collateral needs signed CLOB credentials; everything else is a public GET
     # keyed by address. None here (no credentials, or a network failure) leaves
     # account_value NULL rather than reporting positions-only as the total.
-    collateral = _fetch_live_balance(who)
+    collateral = fetch_live_balance(who)
     mark = read_account(who, collateral_usd=collateral)
 
     registry = OrderRegistry(db_path=Path(db_path) if db_path else None)
@@ -2897,7 +2509,7 @@ def venue_sync(funder=None, db_path=None, quiet=False):
     if not who:
         raise SystemExit("POLY_FUNDER not set. Cannot identify the account to read.")
 
-    collateral = _fetch_live_balance(who)
+    collateral = fetch_live_balance(who)
     mark = read_account(who, collateral_usd=collateral)
 
     registry = OrderRegistry(db_path=Path(db_path) if db_path else None)
@@ -3070,7 +2682,7 @@ def decide(
     from engine.order_registry import DEFAULT_DB_PATH
 
     cfg = load()
-    live_bal = _fetch_live_balance()
+    live_bal = fetch_live_balance()
     if live_bal is not None and live_bal > 0:
         cfg = replace(cfg, bankroll_usd=live_bal)
 
@@ -3118,29 +2730,36 @@ def _evaluate_single_market_quote(
     """Evaluate and print strategy quote decision for one market."""
     from engine.markets import fetch_pinned_market, full_book
     from engine.order_registry import inventory_from_registry, OrderRegistry
-    from engine.quotes import decide_quotes
+    from engine.quotes import (
+        MarketQuoteError, MarketUnavailable, decide_quotes, evaluate_market_quote,
+    )
 
     registry = OrderRegistry(db_path=reg_db)
+    clob_host = getattr(cfg, "clob_host", "https://clob.polymarket.com")
 
-    m = fetch_pinned_market(cid, require_rewards=False)
-    if m is None:
+    try:
+        ev = evaluate_market_quote(
+            cid, cfg, clob_host,
+            fetch_market=lambda c: fetch_pinned_market(c, require_rewards=False),
+            fetch_books=full_book,
+            inventory_for=lambda m: inventory_from_registry(
+                m.condition_id, m.up_token, m.down_token, db_path=reg_db),
+            decide=decide_quotes,
+        )
+    except MarketUnavailable:
         print(f"MARKET {cid[:16]}...: unable to load on venue (missing, closed, or not 2 tokens)")
         return {"cid": cid, "status": "ERROR", "why": "market unavailable"}
+    except MarketQuoteError as e:
+        print(f"MARKET {cid[:16]}...: book fetch error: {e}")
+        return {"cid": cid, "status": "ERROR", "why": f"book fetch error: {e}"}
+
+    m = ev.market
+    up_book, down_book = ev.up_book, ev.down_book
+    inv = ev.inventory
+    intents, why = ev.intents, ev.why
 
     title = gm.title if gm and gm.title else m.market_slug
     slug = gm.slug if gm and gm.slug else m.market_slug
-
-    clob_host = getattr(cfg, "clob_host", "https://clob.polymarket.com")
-    try:
-        up_book = full_book(clob_host, m.up_token)
-        down_book = full_book(clob_host, m.down_token)
-    except Exception as e:
-        print(f"MARKET {title} ({cid[:16]}...): book fetch error: {e}")
-        return {"cid": cid, "status": "ERROR", "why": f"book fetch error: {e}"}
-
-    inv = inventory_from_registry(m.condition_id, m.up_token, m.down_token, db_path=reg_db)
-
-    intents, why = decide_quotes(cfg, up_book, down_book, inv, 1e9, None)
 
     bb_up, ba_up = up_book.get("best_bid"), up_book.get("best_ask")
     mid_up = (bb_up + ba_up) / 2.0 if (bb_up is not None and ba_up is not None) else None
@@ -3399,7 +3018,7 @@ def main() -> None:
         balance(a.funder)
     elif a.cmd == "audit":
         from engine.audit import audit_three_way, format_audit_report
-        res = audit_three_way(a.target, client=_client(), funder=a.funder, db_path=a.db)
+        res = audit_three_way(a.target, client=client(), funder=a.funder, db_path=a.db)
         print(format_audit_report(res))
         if not res.agree:
             sys.exit(1)

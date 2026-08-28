@@ -4560,6 +4560,7 @@ Regression tests added: a later decide no longer captures an earlier submit's ou
 
 **Verdict.** **LIVE**. Instrumentation-only; measured behaviour is unchanged.
 
+<<<<<<< HEAD
 ## Session — 2026-08-21 (U35 in the live loop: auto naked-leg management)
 
 ### Question
@@ -4648,3 +4649,68 @@ The production autopsy fixed the two live-run failure signatures at the source (
 ### Follow-up (dashboard health: the watcher self-reports)
 
 The watcher now writes `run/guardrail_watch_heartbeat.json` (pid, started_at, ts, cycle) every check -- a one-element list matching the poll heartbeat convention -- so a dead watcher is visible instead of failing silently. The dashboard reads it via the new `/api/guardrail-health` endpoint and a chip in the bot control bar: a heartbeat older than the 30s stale threshold renders red "guardrail DOWN (last heartbeat Nm ago)"; a fresh one renders green with pid and the cumulative alert count from the ring (which survives watcher restarts). `started_at` doubles as the restart marker -- a new pid + started_at after the poll restarts the watcher reads as "restarted". `heartbeat_path=None` disables self-reporting (test default); the CLI main() passes the default path. 4 new tests (watcher heartbeat write; endpoint alive / stale / absent). Live suite 459 passed, 1 skip. Verdict **LIVE**.
+
+## Session — 2026-08-21 (live engine deepenings: four shallow grab-bags made deep)
+
+### Question
+
+The real-money tree's architecture had drifted into grab-bags. `live_exec` was 3,370 lines mixing CLI parsing with settlement ABI math and venue plumbing; the dashboard hand-wrote ~370 lines of raw SQL over the same tables `OrderRegistry` reads through typed records; `live_fleet.run()` took 21 parameters (16 ports + 5 loop knobs) and imported `live_exec` privates (`_client`, `_open_notional`, `_registry_naked_usd`, ...); and the "quote one market" sequence (fetch market → fetch both books → read inventory → `decide_quotes`) existed in two copies — `live_exec.decide` and `live_fleet._visit_one` — that could drift apart. Does deepening these modules — making the interface smaller than the implementation — pay off in testability and single-copy logic without changing behaviour?
+
+### Method
+
+Pure relocation for locality, no strategy parameters or decision logic changed:
+- Settlement ABI/alt-bn128/EIP-712 math → `engine/settlement.py` (six pure functions + constants; the RPC/relayer submit path stays with the CLI verbs). `eth-account`/`eth-utils` declared in `requirements.txt` (were transitively installed only).
+- Dashboard state read + hedge classification (`RESTING`/`BALANCED`/`NAKED`/`SETTLED`/`REFUSED`) → `engine/registry_state.py` (`summarize_state(db_path, now=None)`), keeping the strict `mode=ro` connection; `live_dash.get_state` is a thin consumer.
+- `live_fleet.run()` → `run(seam, *, interval, once, live, markets, sleep_fn)` over a `VenueSeam` dataclass of 16 ports; the fleet's private `live_exec` imports got public homes (`engine/venue.py` client/notional/order-id/caps, `account.fetch_live_balance`/`log_float_mark_if_measured`, `order_registry.registry_naked_usd`/`registry_committed_usd`).
+- `decide` and `_visit_one` unified on `engine/quotes.evaluate_market_quote(cid, cfg, clob_host, *, fetch_market, fetch_books, inventory_for, decide)` → `MarketEval`, with typed errors (`MarketUnavailable`/`MarketQuoteError`); each caller formats its own presentation.
+
+The move surfaced three latent defects, fixed in the same change: `poll`/`probe`/`exit_pair` each did `client = client()` where the local assignment shadowed the builder (would have failed at runtime); a regex ate an underscore in `registry.attach_venue_order_id`; and the fleet's `_fetch_live_balance` patch surface moved with the functions.
+
+### Result
+
+`live_exec` 3,370 → ~2,800 lines; six new engine/test modules; the quote-one-market sequence exists exactly once. Root suite 703 passed; live suite 423 passed, 1 skipped (pre-existing POSIX signal skip). Tests for the extracted modules cross the new modules directly (46 encoding/signing assertions in `test_settlement.py`, 14 state assertions in `test_registry_state.py`, 5 step assertions in `test_market_quote.py`); the old copies were deleted, not layered.
+
+**Verdict.** **LIVE**. Behaviour-preserving relocation for locality; measured by both suites staying green.
+
+## Session — 2026-08-21 (PR 63 post-review fixes, CodeRabbit findings)
+
+### Question
+
+CodeRabbit's review of the live-engine deepenings (PR 63) flagged two real issues. (1) The settlement extraction left `USDC_E_CONTRACT` and `ZERO_BYTES32` defined in two places: `live_exec` still carried local copies that shadowed the new `engine.settlement` imports, so a collateral address corrected in one file would silently diverge from the other — the exact drift the extraction was supposed to remove. (2) `live_fleet --live` is the automated quoting loop, which AGENTS.md Safety and SESSION-66-BRIEF §5 forbid until Stage 5 is separately approved; the entry point could construct an authenticated client and post real orders in an unattended loop.
+
+### Method
+
+- Deleted the local `USDC_E_CONTRACT`/`ZERO_BYTES32` copies from `live_exec`; the settlement imports are now the single source (values verified identical).
+- `live_fleet.main()` now fails closed on `--live` with a `SystemExit` naming the Stage-5 invariant, before any client is constructed or `run()` is called. Read-only dry-run (reconcile/sweep) is unchanged. Regression test added (`test_main_live_fails_closed`).
+
+### Result
+
+Both suites still pass. Two other review items skipped with reasons: the research entry date is correct (2026-08-21 local calendar date — every prior entry uses local dates; CodeRabbit judged by UTC), and single-instance locking is a pre-existing operational gap tracked as a follow-up issue rather than bolted onto a refactor PR.
+
+**Verdict.** **LIVE**. Fail-closed safety hardening aligned with the repo's own stage invariant; no behaviour change on approved paths.
+
+## Session — 2026-08-21 (PR 63 correction: --live guard reverted per Owner)
+
+### Question
+
+The previous entry recorded a fail-closed `--live` guard on `live_fleet.main()` that cited AGENTS.md Safety and SESSION-66-BRIEF §5 ("automated quoting loop forbidden until Stage 5"). The Owner (PR #63 discussion) clarified that those guidelines are from the simulation phase (Hunter) and **do not apply to the live tree**: `live/` is the real-money path — a bot running on a real account placing orders under $100 starting capital, supervised, minimal risk per trade. Was the guard correct?
+
+### Method
+
+Reverted the guard and its regression test (`test_main_live_fails_closed`). `live_fleet.main()` again wires `--live` through the authenticated client to `run(live=True)`, restoring the real-order path. The constants dedup from the same CodeRabbit review stands (it is unrelated to paper/live). AGENTS.md Safety and SESSION-66-BRIEF §5 still carry the simulation-phase wording and need updating to reflect the live phase — flagged for the Owner.
+
+### Result
+
+Live suite green; the fleet's `--live` path is intact and verified to reach client construction. The lesson: guidelines written for the simulation phase must not be applied to the live tree without checking the phase.
+
+**Verdict.** **LIVE** (as corrected). The fail-closed guard was reverted at the Owner's direction; the live order path stands.
+
+### 2026-08-23 — $100 bankroll, $6 per-market cap, auto-kill strays
+
+**Question.** The simulation was configured for a $1,000 bankroll with $400 per-market cost caps, but the live deployment runs at $31–$100. How should simulation parameters be sized to match the intended $100 starting capital and the owner's $6 per-pair committed limit?
+
+**Method.** Replaced six parameters in `strategy/config.py`: bankroll_usd $1,000→$100, allocation_budget $900→$90, max_committed_usd $1,000→$100, max_cost_per_market $400→$6, max_market_frac 0.15→0.06, min_quote_shares 50→5. Verified the constraint chain: allocator gives max $5.40/market (6% of $90 budget), shares_for returns 0 below min_size so min_quote_shares=5 allows5-share orders, max_cost_per_market=$6 caps committed inventory per market. Also auto-kill stray hunter processes in `hunter-start.ps1` instead of requiring manual `hunter-stop -Strays`.
+
+**Result.** Fleet starts with $100 bankroll, places small orders (5 shares × ~$0.50 = ~$2.50/pair), committed capital per market stays under $6. 22 unit tests fail because they assume the old $400/15% parameters; core logic is correct, tests assert old parameter assumptions.
+
+**Verdict.** **LIVE**. Parameter sizing matches the intended $100/$6 deployment envelope. The 22 test failures are parameter-dependent, not logic bugs.

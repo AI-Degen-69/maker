@@ -26,7 +26,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from engine.quotes import Inventory, QuoteIntent
+from engine.quotes import Inventory, QuoteIntent, evaluate_market_quote
 from engine.cycle_stream import emit as _emit_cycle_event
 
 log = logging.getLogger("live_fleet")
@@ -116,60 +116,75 @@ def _market_cfg(base, spec: Any):
     )
 
 
+@dataclass
+class VenueSeam:
+    """Every venue-touching port the fleet loop needs, in one object.
+
+    The interface of the loop: `run` reads every port off the seam, so
+    adding a port does not rewire every call site. Production builds one
+    in `main` (real venue calls); tests build one with fakes. A seam
+    missing a required port raises in `run`, never silently.
+    """
+    client: Any = None
+    registry: Any = None
+    base_cfg: Any = None
+    maker_address: Optional[str] = None
+    clob_host: str = "https://clob.polymarket.com"
+    fetch_market: Optional[Callable] = None
+    fetch_books: Optional[Callable] = None
+    decide: Optional[Callable] = None
+    submit_fn: Optional[Callable] = None
+    cancel_fn: Optional[Callable] = None
+    reconcile_fn: Optional[Callable] = None
+    sweep_fn: Optional[Callable] = None
+    inventory_fn: Optional[Callable] = None
+    open_orders_fn: Optional[Callable] = None
+    fleet_state_fn: Optional[Callable] = None
+    emit_fn: Optional[Callable] = None
+
+
 def run(
+    seam: VenueSeam,
+    *,
     interval: float = 1.0,
     once: bool = False,
     live: bool = False,
     markets: Optional[list] = None,
-    client: Any = None,
-    fetch_market: Optional[Callable] = None,
-    fetch_books: Optional[Callable] = None,
-    decide: Optional[Callable] = None,
-    submit_fn: Optional[Callable] = None,
-    cancel_fn: Optional[Callable] = None,
-    reconcile_fn: Optional[Callable] = None,
-    sweep_fn: Optional[Callable] = None,
     sleep_fn: Optional[Callable] = None,
-    base_cfg: Any = None,
-    registry: Any = None,
-    maker_address: Optional[str] = None,
-    clob_host: Optional[str] = None,
-    inventory_fn: Optional[Callable] = None,
-    open_orders_fn: Optional[Callable] = None,
-    fleet_state_fn: Optional[Callable] = None,
-    emit_fn: Optional[Callable] = None,
 ) -> list[LiveFleetResult]:
     """Rotate over `markets`: reconcile, then decide+submit per market, then sweep.
 
-    The three venue-touching seams that could kill the loop -- reconcile, sweep,
-    and each market visit -- are each isolated so one failure degrades the cycle
-    rather than stopping it. In dry-run (`live=False`) nothing is submitted or
-    cancelled; reconcile and sweep are read-only and still run.
+    All venue-touching behaviour comes off `seam`; only loop control stays on
+    the signature. The three venue-touching steps that could kill the loop --
+    reconcile, sweep, and each market visit -- are each isolated so one failure
+    degrades the cycle rather than stopping it. In dry-run (`live=False`)
+    nothing is submitted or cancelled; reconcile and sweep are read-only and
+    still run.
 
     With `once=True` the results of that one rotation are returned. In the
     long-running loop only the most recent rotation is kept, so a hands-off run
     does not accumulate every market visit in memory.
     """
-    if base_cfg is None:
+    if seam.base_cfg is None:
         from engine.config import load
-        base_cfg = load()
+        seam.base_cfg = load()
     if sleep_fn is None:
         sleep_fn = time.sleep
-    if clob_host is None:
-        clob_host = os.environ.get("CLOB_HOST", "https://clob.polymarket.com")
+    if seam.clob_host is None:
+        seam.clob_host = os.environ.get("CLOB_HOST", "https://clob.polymarket.com")
 
     missing = [n for n, v in (
-        ("fetch_market", fetch_market), ("fetch_books", fetch_books),
-        ("decide", decide), ("submit_fn", submit_fn), ("cancel_fn", cancel_fn),
-        ("reconcile_fn", reconcile_fn), ("sweep_fn", sweep_fn),
+        ("fetch_market", seam.fetch_market), ("fetch_books", seam.fetch_books),
+        ("decide", seam.decide), ("submit_fn", seam.submit_fn),
+        ("cancel_fn", seam.cancel_fn), ("reconcile_fn", seam.reconcile_fn),
+        ("sweep_fn", seam.sweep_fn),
     ) if v is None]
     if missing:
-        raise TypeError(f"live_fleet.run missing required callables: {', '.join(missing)}")
+        raise TypeError(f"VenueSeam missing required ports: {', '.join(missing)}")
 
     # Telemetry is opt-in: main() wires engine.cycle_stream.emit; tests drive
     # the loop without it so no test ever writes into live/run/.
-    if emit_fn is None:
-        emit_fn = lambda *a, **k: None
+    emit_fn = seam.emit_fn or (lambda *a, **k: None)
 
     once_results: list[LiveFleetResult] = []
     last_cycle: list[LiveFleetResult] = []
@@ -180,14 +195,14 @@ def run(
         # are recomputed once per cycle and merged into the base config, so the
         # fleet-level gates inside decide_quotes see live numbers rather than
         # their 0.0 defaults. A failure here degrades to the defaults.
-        if fleet_state_fn is not None:
+        if seam.fleet_state_fn is not None:
             try:
-                base_cfg = replace(base_cfg, **fleet_state_fn(registry))
+                seam.base_cfg = replace(seam.base_cfg, **seam.fleet_state_fn(seam.registry))
             except Exception as e:
                 log.warning("fleet state failed: %s: %s", type(e).__name__, e)
 
         try:
-            reconcile_fn(client, registry, maker_address)
+            seam.reconcile_fn(seam.client, seam.registry, seam.maker_address)
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -196,19 +211,15 @@ def run(
         cycle_results: list[LiveFleetResult] = []
         for spec in list(markets or []):
             cycle_results.append(_visit_one(
-                spec=spec, base_cfg=base_cfg, live=live, client=client,
-                registry=registry, fetch_market=fetch_market,
-                fetch_books=fetch_books, decide=decide, submit_fn=submit_fn,
-                cancel_fn=cancel_fn, clob_host=clob_host,
-                inventory_fn=inventory_fn, open_orders_fn=open_orders_fn,
-                cycle=cycle, emit_fn=emit_fn,
+                seam=seam, spec=spec, live=live, cycle=cycle,
+                emit_fn=emit_fn,
             ))
         last_cycle = cycle_results
         if once:
             once_results.extend(cycle_results)
 
         try:
-            sweep_fn()
+            seam.sweep_fn()
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -225,9 +236,9 @@ def run(
 
 
 def _visit_one(
-    spec, base_cfg, live, client, registry,
-    fetch_market, fetch_books, decide, submit_fn, cancel_fn,
-    clob_host, inventory_fn, open_orders_fn,
+    seam: VenueSeam,
+    spec,
+    live: bool,
     cycle: int = 0,
     emit_fn: Optional[Callable] = None,
 ) -> LiveFleetResult:
@@ -236,7 +247,7 @@ def _visit_one(
     if emit_fn is None:
         emit_fn = lambda *a, **k: None
     try:
-        market = fetch_market(cid)
+        market = seam.fetch_market(cid)
     except Exception as e:
         emit_fn(service="fleet", cycle=cycle, phase="quoting",
                 action="market_error", market_slug="",
@@ -245,13 +256,20 @@ def _visit_one(
                                error=f"{type(e).__name__}: {e}")
 
     title = getattr(market, "market_slug", "") or cid[:16]
-    cfg = _market_cfg(base_cfg, spec)
+    cfg = _market_cfg(seam.base_cfg, spec)
     try:
-        up_book = fetch_books(clob_host, market.up_token)
-        down_book = fetch_books(clob_host, market.down_token)
-        inv = inventory_fn(market) if inventory_fn else Inventory()
-        intents, why = decide(cfg, up_book, down_book, inv, 1e9, None)
-        open_orders = open_orders_fn(market) if open_orders_fn else []
+        ev = evaluate_market_quote(
+            cid, cfg, seam.clob_host,
+            # The market is already fetched (the block above exists so a fetch
+            # failure degrades to ERROR with no title); hand it to the shared
+            # step, which owns the books -> inventory -> decide sequence.
+            fetch_market=lambda c: market,
+            fetch_books=seam.fetch_books,
+            inventory_for=seam.inventory_fn or (lambda m: Inventory()),
+            decide=seam.decide,
+        )
+        intents, why = ev.intents, ev.why
+        open_orders = seam.open_orders_fn(market) if seam.open_orders_fn else []
         to_cancel, to_submit = plan_orders(open_orders, intents)
     except Exception as e:
         emit_fn(service="fleet", cycle=cycle, phase="quoting",
@@ -272,9 +290,9 @@ def _visit_one(
     submitted = cancelled = 0
     try:
         if to_submit:
-            submitted = submit_fn(client, registry, market, to_submit, cfg)
+            submitted = seam.submit_fn(seam.client, seam.registry, market, to_submit, cfg)
         if to_cancel:
-            cancelled = cancel_fn(client, registry, to_cancel)
+            cancelled = seam.cancel_fn(seam.client, seam.registry, to_cancel)
     except Exception as e:
         # A submit/cancel failure (venue rejection, a split couple rolled back)
         # must degrade this market to ERROR, never stop the rotation.
@@ -372,8 +390,8 @@ def _submit_intents(client, registry, market, intents, cfg) -> int:
         OrderArgsV2, OrderPayload, OrderType, PostOrdersV2Args,
     )
     from py_clob_client_v2.order_builder.constants import BUY
-    from engine.live_exec import (
-        MAX_ORDER_USD, MAX_TOTAL_USD, _open_notional, _venue_order_id,
+    from engine.venue import (
+        MAX_ORDER_USD, MAX_TOTAL_USD, open_notional, venue_order_id,
     )
     from engine.order_registry import OrderRecord, QuoteRecord, get_run_id
 
@@ -386,7 +404,7 @@ def _submit_intents(client, registry, market, intents, cfg) -> int:
             raise RuntimeError(
                 f"leg {i.side} ${i.price * i.size:.2f} exceeds "
                 f"MAX_ORDER_USD ${MAX_ORDER_USD:.2f}")
-    already = _open_notional(client)
+    already = open_notional(client)
     if already + total_cost > MAX_TOTAL_USD:
         raise RuntimeError(
             f"open ${already:.2f} + ${total_cost:.2f} exceeds "
@@ -437,7 +455,7 @@ def _submit_intents(client, registry, market, intents, cfg) -> int:
         extracted = []
         for idx, leg in enumerate(local_legs):
             item = resp_list[idx] if idx < len(resp_list) else None
-            extracted.append(_venue_order_id(item))
+            extracted.append(venue_order_id(item))
 
         ok = sum(1 for v in extracted if v is not None)
 
@@ -508,11 +526,12 @@ def _cancel_orders(client, registry, orders) -> int:
 def _make_sweep_fn(funder: Optional[str], db_path: Path, registry):
     """Sweep the account and log a float mark, without failing the loop."""
     def sweep_fn() -> None:
-        from engine.live_exec import account_sweep, _log_float_mark_if_measured
+        from engine.account import log_float_mark_if_measured
+        from engine.live_exec import account_sweep
         if not funder:
             return
         mark = account_sweep(funder=funder, db_path=str(db_path), quiet=True)
-        _log_float_mark_if_measured(registry, mark)
+        log_float_mark_if_measured(registry, mark)
     return sweep_fn
 
 
@@ -526,12 +545,14 @@ def _fleet_state(registry, cfg) -> dict:
     a bad read.
     """
     from engine.gate import fleet_posture
-    from engine.live_exec import _registry_naked_usd, _registry_committed_usd
     from engine.markout import fleet_stats
+    from engine.order_registry import (
+        registry_committed_usd, registry_naked_usd,
+    )
 
     return {
-        "fleet_naked_usd": _registry_naked_usd(registry),
-        "committed_usd": _registry_committed_usd(registry),
+        "fleet_naked_usd": registry_naked_usd(registry),
+        "committed_usd": registry_committed_usd(registry),
         "fleet_posture": fleet_posture(
             fleet_stats(registry, cfg.markout_fleet_min_sample), cfg),
     }
@@ -580,8 +601,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cfg = load()
     try:
-        from engine.live_exec import _fetch_live_balance
-        live_bal = _fetch_live_balance(a.funder)
+        from engine.account import fetch_live_balance
+        live_bal = fetch_live_balance(a.funder)
         if live_bal is not None and live_bal > 0:
             cfg = replace(cfg, bankroll_usd=live_bal)
     except Exception as e:
@@ -600,20 +621,23 @@ def main(argv: Optional[list[str]] = None) -> int:
     maker = a.funder or os.environ.get("POLY_FUNDER")
 
     if a.live:
-        from engine.live_exec import _client
-        client = _client(a.funder)
+        from engine.venue import client
+        client = client(a.funder)
     elif os.environ.get("POLY_PRIVATE_KEY") or os.environ.get("POLY_KEY"):
         # Dry-run with credentials: reconcile and sweep (read-only) can run.
-        from engine.live_exec import _client
-        client = _client(a.funder)
+        from engine.venue import client
+        client = client(a.funder)
     else:
         log.info("no credentials in env: dry-run will skip reconcile/sweep "
                  "(they need auth) and only show decide/plan outcomes")
         client = object()
 
-    results = run(
-        interval=a.interval, once=a.once, live=a.live, markets=specs,
+    seam = VenueSeam(
         client=client,
+        registry=registry,
+        base_cfg=cfg,
+        maker_address=maker,
+        clob_host=os.environ.get("CLOB_HOST", "https://clob.polymarket.com"),
         fetch_market=_fetch_market,
         fetch_books=full_book,
         decide=decide_quotes,
@@ -627,26 +651,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             (lambda: None) if a.no_sweep
             else _make_sweep_fn(maker, db_path, registry)
         ),
-        base_cfg=cfg,
-        registry=registry,
-        maker_address=maker,
-        clob_host=os.environ.get("CLOB_HOST", "https://clob.polymarket.com"),
         inventory_fn=_make_inventory_fn(registry, db_path),
         open_orders_fn=_make_open_orders_fn(registry),
         fleet_state_fn=lambda r: _fleet_state(r, cfg),
         emit_fn=partial(_emit_cycle_event, db_path=db_path),
     )
-
-    for r in results:
-        line = f"{r.status:9} {r.condition_id[:12]:12} {r.title[:44]}"
-        if r.error:
-            line += f" | {r.error[:80]}"
-        elif r.why:
-            line += f" | {r.why[:80]}"
-        print(line, file=sys.stderr)
-
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    results = run(
+        seam,
+        interval=a.interval, once=a.once, live=a.live, markets=specs,
+    )

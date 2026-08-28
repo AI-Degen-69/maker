@@ -43,53 +43,6 @@ def make_live_env(acc, funder: str) -> dict:
     }
 
 
-def test_merge_selector_derivation():
-    """1. Selector derivation matches canonical Solidity signature:
-    mergePositions(address,bytes32,bytes32,uint256[],uint256) -> 0x9e7212ad.
-    """
-    canonical_sig = b"mergePositions(address,bytes32,bytes32,uint256[],uint256)"
-    derived_selector = "0x" + keccak(canonical_sig)[:4].hex()
-    assert derived_selector == "0x9e7212ad"
-
-
-def test_encode_merge_positions_hand_constructed_comparison():
-    """2. Encoder output matches hand-constructed expected hex string.
-    Verifies selector, static words, dynamic array offset 0xa0 (160 bytes),
-    amount, array length, and elements.
-    """
-    collateral = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-    parent_coll = "0x0000000000000000000000000000000000000000000000000000000000000000"
-    cond_id = "0x1111111111111111111111111111111111111111111111111111111111111111"
-    index_sets = [1, 2]
-    amount_base_units = 5000000  # 5 shares = 0x4c4b40
-
-    # Hand-constructed expected layout:
-    # 4 bytes selector + 5 words head + 3 words tail = 260 bytes (520 hex chars + '0x')
-    expected_hex = (
-        "0x"
-        "9e7212ad"  # Selector (4 bytes)
-        "0000000000000000000000002791bca1f2de4661ed88a30c99a7a9449aa84174"  # Word 0: collateralToken (32 bytes)
-        "0000000000000000000000000000000000000000000000000000000000000000"  # Word 1: parentCollectionId (32 bytes)
-        "1111111111111111111111111111111111111111111111111111111111111111"  # Word 2: conditionId (32 bytes)
-        "00000000000000000000000000000000000000000000000000000000000000a0"  # Word 3: offset to partition array (160 bytes)
-        "00000000000000000000000000000000000000000000000000000000004c4b40"  # Word 4: amount (5000000)
-        "0000000000000000000000000000000000000000000000000000000000000002"  # Word 5: length of partition (2)
-        "0000000000000000000000000000000000000000000000000000000000000001"  # Word 6: partition[0] (1)
-        "0000000000000000000000000000000000000000000000000000000000000002"  # Word 7: partition[1] (2)
-    )
-
-    encoded = le.encode_merge_positions(
-        collateral_token=collateral,
-        parent_collection_id=parent_coll,
-        condition_id=cond_id,
-        index_sets=index_sets,
-        amount=amount_base_units,
-    )
-
-    assert encoded == expected_hex
-    assert len(encoded) == 2 + 8 + (8 * 64)  # 522 characters
-
-
 def test_merge_guard_exceeds_max_order_usd(tmp_path):
     """3. Guard: Refuse if amount * $1.00 exceeds MAX_ORDER_USD."""
     cond_id = "0x26b64228a9fb13e5c2221cd5879fa0f235cee8ab254c0f094977cc86beeb6a2f"
@@ -136,7 +89,7 @@ def test_merge_guard_idempotency_force_override(tmp_path):
     # and the condition unresolved, every other guard passes and the dry run is clean.
     with patch.dict(os.environ, env_vars, clear=False), \
          patch.object(le, "RUN", tmp_path), \
-         patch.object(le, "_client", return_value=mock_client), \
+         patch.object(le, "client", return_value=mock_client), \
          patch.object(le, "get_payout_denominator", return_value=0), \
          patch("sys.stdout", new_callable=io.StringIO) as mock_stdout:
         le.merge(cond_id, amount=1.0, force=True, live=False)
@@ -159,7 +112,7 @@ def test_merge_guard_resolved_condition_refuses(tmp_path):
 
     with patch.dict(os.environ, env_vars, clear=False), \
          patch.object(le, "RUN", tmp_path), \
-         patch.object(le, "_client", return_value=mock_client), \
+         patch.object(le, "client", return_value=mock_client), \
          patch.object(le, "get_payout_denominator", return_value=1):
         with pytest.raises(SystemExit) as exc_info:
             le.merge(cond_id, amount=1.0, live=True)
@@ -184,7 +137,7 @@ def test_merge_guard_insufficient_balance_up_leg(tmp_path):
 
     with patch.dict(os.environ, env_vars, clear=False), \
          patch.object(le, "RUN", tmp_path), \
-         patch.object(le, "_client", return_value=mock_client), \
+         patch.object(le, "client", return_value=mock_client), \
          patch.object(le, "get_payout_denominator", return_value=0):
         with pytest.raises(SystemExit) as exc_info:
             le.merge(cond_id, amount=1.0, live=True)
@@ -212,7 +165,7 @@ def test_merge_guard_insufficient_balance_down_leg(tmp_path):
 
     with patch.dict(os.environ, env_vars, clear=False), \
          patch.object(le, "RUN", tmp_path), \
-         patch.object(le, "_client", return_value=mock_client), \
+         patch.object(le, "client", return_value=mock_client), \
          patch.object(le, "get_payout_denominator", return_value=0):
         with pytest.raises(SystemExit) as exc_info:
             le.merge(cond_id, amount=1.0, live=True)
@@ -238,7 +191,7 @@ def test_merge_dry_run_touches_no_network(tmp_path, capsys):
 
     with patch.dict(os.environ, env_vars, clear=False), \
          patch.object(le, "RUN", tmp_path), \
-         patch.object(le, "_client", return_value=mock_client), \
+         patch.object(le, "client", return_value=mock_client), \
          patch.object(le, "get_payout_denominator", return_value=0), \
          patch("urllib.request.urlopen") as mock_urlopen:
         le.merge(cond_id, amount=1.0, live=False)
@@ -267,7 +220,7 @@ def test_merge_dry_run_reports_guard_failures_and_exits_nonzero(tmp_path, capsys
 
     with patch.dict(os.environ, env_vars, clear=False), \
          patch.object(le, "RUN", tmp_path), \
-         patch.object(le, "_client", return_value=mock_client), \
+         patch.object(le, "client", return_value=mock_client), \
          patch.object(le, "get_payout_denominator", return_value=1), \
          patch("urllib.request.urlopen") as mock_urlopen:
         with pytest.raises(SystemExit) as exc_info:

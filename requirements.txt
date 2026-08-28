@@ -4,3 +4,5 @@ python-dotenv>=1.0
 fastapi>=0.110
 uvicorn[standard]>=0.27
 py-clob-client-v2>=1.1.0
+eth-account>=0.13
+eth-utils>=6.0

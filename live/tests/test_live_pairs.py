@@ -738,7 +738,7 @@ def test_route_to_merge_does_not_leave_the_condition_blocked(
     from engine import live_exec
 
     monkeypatch.setattr(live_exec, "RUN", tmp_path)
-    monkeypatch.setattr(live_exec, "_client", lambda *a, **k: None)
+    monkeypatch.setattr(live_exec, "client", lambda *a, **k: None)
 
     pair_id = _one_sided_pair(registry)
     light = next(o for o in registry.get_active_orders() if o.token_id == TOK_DN)
@@ -763,7 +763,7 @@ def test_a_real_exit_does_hold_the_condition(registry: OrderRegistry, tmp_path,
     from engine import live_exec
 
     monkeypatch.setattr(live_exec, "RUN", tmp_path)
-    monkeypatch.setattr(live_exec, "_client", lambda *a, **k: None)
+    monkeypatch.setattr(live_exec, "client", lambda *a, **k: None)
 
     pair_id = _one_sided_pair(registry)
 
@@ -793,7 +793,7 @@ def test_complete_pair_cmd_runs_end_to_end_and_holds_after_a_cross(
     from engine import live_exec
 
     monkeypatch.setattr(live_exec, "RUN", tmp_path)
-    monkeypatch.setattr(live_exec, "_client", lambda *a, **k: None)
+    monkeypatch.setattr(live_exec, "client", lambda *a, **k: None)
 
     pair_id = _one_sided_pair(registry, filled_size=10.0, fill_price=0.60)
 
@@ -821,7 +821,7 @@ def test_complete_pair_cmd_does_not_hold_the_condition_when_nothing_crossed(
     from engine import live_exec
 
     monkeypatch.setattr(live_exec, "RUN", tmp_path)
-    monkeypatch.setattr(live_exec, "_client", lambda *a, **k: None)
+    monkeypatch.setattr(live_exec, "client", lambda *a, **k: None)
 
     pair_id = _one_sided_pair(registry, filled_size=10.0, fill_price=0.60)
 
@@ -847,7 +847,7 @@ def test_an_unknown_pair_id_refuses_cleanly_on_both_commands(tmp_path, monkeypat
     from engine import live_exec
 
     monkeypatch.setattr(live_exec, "RUN", tmp_path)
-    monkeypatch.setattr(live_exec, "_client", lambda *a, **k: None)
+    monkeypatch.setattr(live_exec, "client", lambda *a, **k: None)
     db = tmp_path / "empty.db"
 
     with pytest.raises(SystemExit, match="EXIT REFUSED"):
@@ -1118,7 +1118,7 @@ def test_quote_writes_both_legs_to_the_registry_under_one_pair_id(
         def get_open_orders(self, *a, **k):
             return []
 
-    monkeypatch.setattr(live_exec, "_client", lambda *a, **k: Client())
+    monkeypatch.setattr(live_exec, "client", lambda *a, **k: Client())
 
     live_exec.quote(COND, price=0.48, size=5.0, live=True, db_path=db)
 
@@ -1171,7 +1171,7 @@ def test_quote_leaves_the_row_pending_when_the_venue_returns_no_id(
         def get_open_orders(self, *a, **k):
             return []
 
-    monkeypatch.setattr(live_exec, "_client", lambda *a, **k: Client())
+    monkeypatch.setattr(live_exec, "client", lambda *a, **k: Client())
 
     live_exec.quote(COND, price=0.48, size=5.0, live=True, db_path=db)
 
@@ -1184,11 +1184,11 @@ def test_quote_leaves_the_row_pending_when_the_venue_returns_no_id(
 def test_venue_order_id_accepts_the_spellings_and_refuses_to_guess():
     from engine import live_exec
 
-    assert live_exec._venue_order_id({"orderID": "a"}) == "a"
-    assert live_exec._venue_order_id({"orderId": "b"}) == "b"
-    assert live_exec._venue_order_id({"order_id": "c"}) == "c"
-    assert live_exec._venue_order_id({"success": True}) is None
-    assert live_exec._venue_order_id(None) is None
+    assert live_exec.venue_order_id({"orderID": "a"}) == "a"
+    assert live_exec.venue_order_id({"orderId": "b"}) == "b"
+    assert live_exec.venue_order_id({"order_id": "c"}) == "c"
+    assert live_exec.venue_order_id({"success": True}) is None
+    assert live_exec.venue_order_id(None) is None
 
 
 def test_quote_says_why_a_market_was_rejected(monkeypatch, tmp_path):

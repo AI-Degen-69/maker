@@ -8,7 +8,7 @@ window (>= 50 shares, within 4.5c of mid).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from engine import config, gate, risk
 from engine.config import MakerConfig
@@ -527,3 +527,63 @@ def _require_two_sided(cfg, inv, intents, why):
     return [], (f"flat inventory and only {lone} is quotable ({missing} "
                 f"blocked); a lone resting leg is a naked position, so the "
                 f"couple is not placed" + (f" -- {why}" if why else ""))
+
+
+class MarketUnavailable(Exception):
+    """The venue has no tradeable market for the condition id."""
+
+
+class MarketQuoteError(Exception):
+    """A venue read (book fetch) failed while evaluating one market's quote."""
+
+
+@dataclass
+class MarketEval:
+    """The outcome of one quote-one-market evaluation, before any planning.
+
+    Raw data only -- the caller decides what to print, log, or submit.
+    `intents` and `why` are whatever the `decide` port returned.
+    """
+    cid: str
+    market: Any
+    up_book: dict
+    down_book: dict
+    inventory: Inventory
+    intents: list
+    why: str
+
+
+def evaluate_market_quote(
+    cid: str,
+    cfg: MakerConfig,
+    clob_host: str,
+    *,
+    fetch_market: Callable[[str], Any],
+    fetch_books: Callable[[str, str], dict],
+    inventory_for: Callable[[Any], Inventory],
+    decide: Callable[..., tuple] = decide_quotes,
+) -> MarketEval:
+    """One market through the quoting pipeline: fetch -> books -> inventory -> decide.
+
+    The sequence live_exec.decide and the fleet's per-market visit used to run
+    in two copies; this is the single copy. Both callers are adapters over the
+    four ports: the CLI wires engine.markets + inventory_from_registry +
+    decide_quotes, the fleet wires its VenueSeam slots. The step is pure of
+    venue imports -- it owns failure *detection* (MarketUnavailable when the
+    market is missing, MarketQuoteError when a book read fails) and the caller
+    owns failure *presentation*.
+    """
+    market = fetch_market(cid)
+    if market is None:
+        raise MarketUnavailable(cid)
+    try:
+        up_book = fetch_books(clob_host, market.up_token)
+        down_book = fetch_books(clob_host, market.down_token)
+    except Exception as e:
+        raise MarketQuoteError(f"book fetch error: {e}") from e
+    inv = inventory_for(market)
+    intents, why = decide(cfg, up_book, down_book, inv, 1e9, None)
+    return MarketEval(
+        cid=cid, market=market, up_book=up_book, down_book=down_book,
+        inventory=inv, intents=intents, why=why,
+    )

@@ -1751,3 +1751,91 @@ def inventory_from_registry(
                     inv.up_cost = max(0.0, inv.up_cost - float(up_c))
                     inv.down_cost = max(0.0, inv.down_cost - float(dn_c))
     return inv
+
+
+# --- fleet-wide aggregates (moved from engine.live_exec) ----------------
+# `registry_naked_usd` and `registry_committed_usd` are pure registry
+# reads -- the fleet's risk caps and the poll loop both need them, so they
+# live next to the registry instead of in live_exec's CLI grab-bag.
+
+
+def registry_naked_usd(registry) -> float:
+    """Dollars at risk on open, one-sided live exposure, from the registry.
+
+    Pairs whose condition already has a close are skipped: a merged pair has
+    no open exposure, and counting its fills would bill risk the venue no
+    longer carries. A partially-exited pair is skipped whole rather than
+    over-stated, which is the safe direction for a risk figure.
+    """
+    from engine.live_pairs import load_pair, PairExitRefused
+
+    with registry._conn() as conn:
+        closed_cids = {
+            r["condition_id"]
+            for r in conn.execute(
+                "SELECT DISTINCT condition_id FROM closes WHERE condition_id IS NOT NULL"
+            ).fetchall()
+        }
+        rows = conn.execute(
+            "SELECT DISTINCT condition_id, pair_id FROM orders "
+            "WHERE pair_id IS NOT NULL"
+        ).fetchall()
+
+    total = 0.0
+    for r in rows:
+        if r["condition_id"] in closed_cids:
+            continue
+        try:
+            pair = load_pair(registry, r["pair_id"])
+        except PairExitRefused:
+            continue
+        naked_sh = pair.get("naked") or 0.0
+        if naked_sh > 0:
+            total += naked_sh * (pair.get("fill_cost") or 0.0)
+    return total
+
+
+def registry_committed_usd(registry) -> float:
+    """Dollars committed fleet-wide, from the registry.
+
+    Inventory cost (every filled share's cost basis whose pair is still open)
+    plus the notional resting in unfilled offers. Both are spoken for right
+    now: the venue holds collateral against an open bid, and a fill converts
+    that promise into inventory without asking -- the same two terms the
+    simulation's `fleet_committed_cost` sums, and the same gap that let $767
+    of naked exposure hide behind $9,588 of committed capital in 2026-07-30.
+
+    Pairs whose condition already has a close are skipped whole: merged or
+    exited inventory is no longer committed. A filled SELL reduces cost basis
+    (money came back), so it subtracts; a resting SELL commits no new capital
+    and is excluded.
+    """
+    with registry._conn() as conn:
+        closed_cids = {
+            r["condition_id"]
+            for r in conn.execute(
+                "SELECT DISTINCT condition_id FROM closes WHERE condition_id IS NOT NULL"
+            ).fetchall()
+        }
+        inventory = conn.execute(
+            """
+            SELECT COALESCE(SUM(
+                CASE WHEN o.side = 'BUY' THEN f.size * f.price
+                     ELSE -f.size * f.price END
+            ), 0.0)
+            FROM fills f
+            JOIN orders o ON f.order_uuid = o.id
+            WHERE o.condition_id NOT IN (
+                SELECT DISTINCT condition_id FROM closes
+                WHERE condition_id IS NOT NULL
+            )
+            """
+        ).fetchone()[0]
+
+    resting = 0.0
+    for o in registry.get_active_orders():
+        if o.side != "BUY" or o.condition_id in closed_cids:
+            continue
+        resting += o.price * max(0.0, o.original_size - registry.get_size_matched(o.id))
+
+    return float(inventory) + resting

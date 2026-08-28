@@ -16,7 +16,8 @@ from pathlib import Path
 import pytest
 
 from engine import account as acct
-from engine.order_registry import OrderRegistry
+from engine import venue
+from engine.order_registry import OrderRegistry, registry_naked_usd
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +277,7 @@ def test_sweep_records_what_the_venue_reported(tmp_path, monkeypatch):
     from engine import live_exec
 
     monkeypatch.setenv("POLY_FUNDER", "0xee3b")
-    monkeypatch.setattr(live_exec, "_fetch_live_balance", lambda who: 101.88)
+    monkeypatch.setattr(live_exec, "fetch_live_balance", lambda who: 101.88)
     monkeypatch.setattr(acct, "fetch_positions_value", lambda f, t=15.0: 0.0)
     monkeypatch.setattr(acct, "fetch_open_positions", lambda f, t=15.0: [])
     monkeypatch.setattr(acct, "fetch_closed_positions",
@@ -308,7 +309,7 @@ def test_sweep_records_a_partial_read_rather_than_inventing_a_total(tmp_path, mo
     from engine import live_exec
 
     monkeypatch.setenv("POLY_FUNDER", "0xee3b")
-    monkeypatch.setattr(live_exec, "_fetch_live_balance", lambda who: None)
+    monkeypatch.setattr(live_exec, "fetch_live_balance", lambda who: None)
     monkeypatch.setattr(acct, "fetch_positions_value", lambda f, t=15.0: 61.5)
     monkeypatch.setattr(acct, "fetch_open_positions", lambda f, t=15.0: [])
     monkeypatch.setattr(acct, "fetch_closed_positions", lambda f, t=15.0: [])
@@ -342,14 +343,14 @@ def test_closed_positions_count_round_trips(tmp_path):
 
 
 def test_client_is_built_once_per_process(monkeypatch):
-    """Every _client() call used to POST /auth/api-key then GET
+    """Every client() call used to POST /auth/api-key then GET
     /auth/derive-api-key. Derivation is the most rate-limit-sensitive call in
     the API, and repeated derivations preceded a venue-side stall on this
     account: signed requests hung past 30s while unsigned ones returned in 0.1s.
     """
     from engine import live_exec
 
-    live_exec._CLIENT_CACHE.clear()
+    venue._CLIENT_CACHE.clear()
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
     monkeypatch.setenv("POLY_FUNDER", "0xee3b")
 
@@ -368,11 +369,11 @@ def test_client_is_built_once_per_process(monkeypatch):
     import py_clob_client_v2.client as clob_mod
     monkeypatch.setattr(clob_mod, "ClobClient", FakeClient)
 
-    first = live_exec._client()
-    second = live_exec._client()
+    first = live_exec.client()
+    second = live_exec.client()
     assert first is second
     assert built["n"] == 1
-    live_exec._CLIENT_CACHE.clear()
+    venue._CLIENT_CACHE.clear()
 
 
 def test_a_different_funder_gets_its_own_client(monkeypatch):
@@ -380,7 +381,7 @@ def test_a_different_funder_gets_its_own_client(monkeypatch):
     client authenticated for a different one."""
     from engine import live_exec
 
-    live_exec._CLIENT_CACHE.clear()
+    venue._CLIENT_CACHE.clear()
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
 
     class FakeClient:
@@ -396,11 +397,11 @@ def test_a_different_funder_gets_its_own_client(monkeypatch):
     import py_clob_client_v2.client as clob_mod
     monkeypatch.setattr(clob_mod, "ClobClient", FakeClient)
 
-    a = live_exec._client(funder="0xaaa")
-    b = live_exec._client(funder="0xbbb")
+    a = live_exec.client(funder="0xaaa")
+    b = live_exec.client(funder="0xbbb")
     assert a is not b
     assert a.funder == "0xaaa" and b.funder == "0xbbb"
-    live_exec._CLIENT_CACHE.clear()
+    venue._CLIENT_CACHE.clear()
 
 
 def test_stored_credentials_skip_derivation_entirely(monkeypatch):
@@ -410,7 +411,7 @@ def test_stored_credentials_skip_derivation_entirely(monkeypatch):
     seconds later, purely because each derived its own key."""
     from engine import live_exec
 
-    live_exec._CLIENT_CACHE.clear()
+    venue._CLIENT_CACHE.clear()
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
     monkeypatch.setenv("POLY_FUNDER", "0xee3b")
     monkeypatch.setenv("POLY_API_KEY", "k")
@@ -433,10 +434,10 @@ def test_stored_credentials_skip_derivation_entirely(monkeypatch):
     import py_clob_client_v2.client as clob_mod
     monkeypatch.setattr(clob_mod, "ClobClient", FakeClient)
 
-    c = live_exec._client()
+    c = live_exec.client()
     assert derived["n"] == 0
     assert c.creds.api_key == "k"
-    live_exec._CLIENT_CACHE.clear()
+    venue._CLIENT_CACHE.clear()
 
 
 @pytest.mark.parametrize("missing", ["POLY_API_KEY", "POLY_API_SECRET",
@@ -445,13 +446,13 @@ def test_a_partial_credential_set_falls_back_to_derivation(monkeypatch, missing)
     """A half-configured .env would otherwise build a client that fails every
     signed request with an error indistinguishable from a venue outage.
 
-    Asserted through `_client()`, not just `_api_creds_from_env()`: the point is
+    Asserted through `client()`, not just `api_creds_from_env()`: the point is
     that derivation still happens, and a test that only checks the helper
-    returns None would pass even if `_client()` stopped deriving on None.
+    returns None would pass even if `client()` stopped deriving on None.
     """
     from engine import live_exec
 
-    live_exec._CLIENT_CACHE.clear()
+    venue._CLIENT_CACHE.clear()
     monkeypatch.setenv("POLY_PRIVATE_KEY", "0x" + "11" * 32)
     monkeypatch.setenv("POLY_FUNDER", "0xee3b")
     monkeypatch.setenv("POLY_API_KEY", "k")
@@ -475,11 +476,11 @@ def test_a_partial_credential_set_falls_back_to_derivation(monkeypatch, missing)
     import py_clob_client_v2.client as clob_mod
     monkeypatch.setattr(clob_mod, "ClobClient", FakeClient)
 
-    assert live_exec._api_creds_from_env() is None
-    c = live_exec._client()
+    assert live_exec.api_creds_from_env() is None
+    c = live_exec.client()
     assert derived["n"] == 1
     assert c.creds == "derived-creds"
-    live_exec._CLIENT_CACHE.clear()
+    venue._CLIENT_CACHE.clear()
 
 
 def test_credentials_are_read_from_the_environment(monkeypatch):
@@ -488,7 +489,7 @@ def test_credentials_are_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("POLY_API_KEY", "abc")
     monkeypatch.setenv("POLY_API_SECRET", "def")
     monkeypatch.setenv("POLY_API_PASSPHRASE", "ghi")
-    creds = live_exec._api_creds_from_env()
+    creds = live_exec.api_creds_from_env()
     assert (creds.api_key, creds.api_secret, creds.api_passphrase) == ("abc", "def", "ghi")
 
 
@@ -561,22 +562,22 @@ def test_registry_naked_usd_counts_open_pairs_only(tmp_path):
                               method="merge", shares=5.0, cost_basis=5.0,
                               proceeds=5.0, realized_pnl=0.0, run_id="run-a"))
 
-    assert live_exec._registry_naked_usd(reg) == pytest.approx(3.0 * 0.62)
+    assert registry_naked_usd(reg) == pytest.approx(3.0 * 0.62)
 
 
 def test_float_mark_logs_only_when_the_venue_measured(tmp_path):
     """A partial venue read must not fabricate a 0.0 float mark."""
     from engine import live_exec
-    from engine.order_registry import OrderRegistry
+    from engine.order_registry import OrderRegistry, registry_naked_usd
 
     reg = OrderRegistry(db_path=tmp_path / "live.db")
 
-    live_exec._log_float_mark_if_measured(
+    live_exec.log_float_mark_if_measured(
         reg, {"unrealized_usd": None, "committed_usd": 4.7}
     )
     assert reg.get_all_float_marks() == []
 
-    live_exec._log_float_mark_if_measured(
+    live_exec.log_float_mark_if_measured(
         reg, {"unrealized_usd": 0.30, "committed_usd": 4.7}
     )
     rows = reg.get_all_float_marks()

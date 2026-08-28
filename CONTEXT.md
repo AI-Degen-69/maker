@@ -15,6 +15,7 @@ The shared domain language for this repo. When a ticket, plan, test, or hypothes
 - **Fill** — a resting order that traded. **Verified fill** — one backed by a trade-tape print; **unverified** — inferred from a book delta.
 - **Markout** — the P&L per share measured from fill price to a later mid, the maker's edge instrument.
 - **Spread capture** — the theoretical income of a spread market: volume × spread × capture fraction, converted to the same $/day pot the allocator compares.
+- **Settlement** — gasless redemption and merging of resolved conditional-token positions on-chain. ABI encoding, alt-bn128 collection/position id derivation, and EIP-712 batch signing live in `live/engine/settlement.py`; the relayer submit path stays in `live_exec` with the CLI verbs.
 
 ## Architecture (design decisions, 2026-08-10)
 

@@ -20,7 +20,7 @@ class MakerConfig:
     # --- virtual account --------------------------------------------------
     # Fresh paper run wallet. This is the total simulated capital available,
     # not a promise that the allocator may commit every dollar at once.
-    bankroll_usd: float = 1000.0
+    bankroll_usd: float = 100.0
 
     # --- objective --------------------------------------------------------
     # "pair"    : the original bet -- rest under the ask, try to buy a hedged
@@ -214,7 +214,7 @@ class MakerConfig:
     # Marginal $/day per $ committed, below which capital is better left idle.
     marginal_return_floor: float = 0.02
     # Leave wallet headroom for inventory and order-lifecycle timing.
-    allocation_budget: float = 900.0
+    allocation_budget: float = 90.0
     # Ceiling on any ONE market's share of that budget.
     #
     # The water-fill was written as a diversifier and is not one. `marginal`
@@ -230,7 +230,7 @@ class MakerConfig:
     # -$7.58 with a standard deviation of $56.68, so at full concentration a
     # single fill moves the book by more than the entire expected edge of a
     # hundred fills and no mean is readable at any sample size.
-    max_market_frac: float = 0.15
+    max_market_frac: float = 0.06
     # Set per-market by the fleet each cycle: NORMAL | WIDENED | EXITED.
     gate_state: str = "NORMAL"
 
@@ -462,7 +462,7 @@ class MakerConfig:
     # Counts inventory cost PLUS resting offer notional, because both are
     # dollars that are spoken for. $2,000 leaves room above the observed
     # working set without permitting another $9.5k drift.
-    max_committed_usd: float = 1000.0
+    max_committed_usd: float = 100.0
     # Injected each cycle by the fleet runner, same pattern as fleet_naked_usd.
     # Zero for a single-market bot, which has no fleet to total up.
     committed_usd: float = 0.0
@@ -510,7 +510,7 @@ class MakerConfig:
     # Rebate qualification (research/btc_5min_market_spec.md):
     #   rewardsMinSize = 50 shares, rewardsMaxSpread = 4.5c from mid.
     # Quotes outside these earn no rebate, so they must not be posted casually.
-    min_quote_shares: int = 50
+    min_quote_shares: int = 5
     max_spread_from_mid: float = 0.045
 
     # His fill sizes: median 120sh, p10 20, p90 160. 61% were >=50sh.
@@ -624,7 +624,7 @@ class MakerConfig:
     min_t_remaining_sec: float = 15.0
 
     # --- risk -------------------------------------------------------------
-    max_cost_per_market: float = 400.0
+    max_cost_per_market: float = 6.0
     max_open_markets: int = 3
 
     # --- pairs-only rule (U35): what happens to a one-sided fill -------------

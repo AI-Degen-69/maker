@@ -34,13 +34,34 @@ if ($stopped -gt 0) {
 # 2. Check for unowned stray processes (excluding bankroll bots)
 $strays = @(Find-HunterStrays)
 if ($strays.Count -gt 0) {
-    Write-ProfileWarning -Message "Stray Processes:" -Detail "Found $($strays.Count) unowned hunter process(es). Run hunter-stop -Strays to clean up."
+    Write-ProfileWarning -Message "Stray Processes:" -Detail "Found $($strays.Count) unowned hunter process(es)."
 }
 
-# 3. Check for port 8800 conflict
-if (netstat -ano | Select-String ":8800\s+.*LISTENING") {
-    Write-ProfileError -Message "Port 8800 Conflict:" -Detail "Port 8800 is occupied by another process." -Suggestion "Run hunter-stop -Strays or free port 8800."
-    throw "Port 8800 occupied."
+# 3. Check for port 8800 conflict and auto-kill strays that hold it
+$portOccupied = netstat -ano | Select-String ":8800\s+.*LISTENING"
+if ($portOccupied) {
+    if ($strays.Count -gt 0) {
+        Write-ProfileInfo -Message "Port 8800 occupied by strays. Auto-killing..."
+        foreach ($p in $strays) {
+            Stop-HunterTree -ProcessId $p.ProcessId -Label "(stray)"
+            Start-Sleep -Milliseconds 300
+        }
+        Start-Sleep -Seconds 2
+        $portOccupied = netstat -ano | Select-String ":8800\s+.*LISTENING"
+        if ($portOccupied) {
+            Write-ProfileError -Message "Port 8800 Conflict:" -Detail "Port 8800 is still occupied after killing strays."
+            throw "Port 8800 occupied."
+        }
+        Write-ProfileSuccess -Message "Strays killed. Port 8800 freed."
+    } else {
+        Write-ProfileError -Message "Port 8800 Conflict:" -Detail "Port 8800 is occupied by a non-hunter process."
+        throw "Port 8800 occupied."
+    }
+} elseif ($strays.Count -gt 0) {
+    Write-ProfileInfo -Message "Killing strays anyway..."
+    foreach ($p in $strays) {
+        Stop-HunterTree -ProcessId $p.ProcessId -Label "(stray)"
+    }
 }
 
 # 4. Archive prior database if -FreshRun requested
